@@ -16,10 +16,23 @@ pub struct DaemonState {
 }
 
 pub fn load(dir: &Path) -> DaemonState {
-    std::fs::read_to_string(dir.join("state.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    let path = dir.join("state.json");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // Missing file is the normal first-run case: stay silent.
+        Err(_) => return DaemonState::default(),
+    };
+    match serde_json::from_str(&contents) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[scuttlebutt] failed to parse {}: {e}; delivery cursors reset, \
+                 all agents will be re-introduced",
+                path.display()
+            );
+            DaemonState::default()
+        }
+    }
 }
 
 pub fn save(dir: &Path, s: &DaemonState) -> Result<()> {
@@ -46,10 +59,26 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_yields_default() {
+    fn missing_file_yields_default_silently() {
         let dir = tempfile::tempdir().unwrap();
+        // No state.json at all is the normal first-run case.
+        assert!(!dir.path().join("state.json").exists());
         assert!(load(dir.path()).cursors.is_empty());
+    }
+
+    #[test]
+    fn corrupt_file_yields_default() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("state.json"), "garbage").unwrap();
+        assert!(load(dir.path()).cursors.is_empty());
+        // A shape change (e.g. fail_counts value type) is corrupt from an
+        // old state.json's point of view too: still yields Default rather
+        // than propagating the parse error.
+        std::fs::write(
+            dir.path().join("state.json"),
+            r#"{"cursors":{},"introduced":[],"fail_counts":{"reviewer":3}}"#,
+        )
+        .unwrap();
         assert!(load(dir.path()).cursors.is_empty());
     }
 }
