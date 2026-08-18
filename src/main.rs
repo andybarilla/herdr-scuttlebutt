@@ -1,7 +1,45 @@
+mod cli;
 mod herd;
 mod log_store;
 mod paths;
 
-fn main() {
-    println!("scuttlebutt");
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "scuttlebutt", about = "Chat room for herdr agents")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Post a message to the room
+    Post {
+        text: String,
+        /// Post as this name instead of resolving from the calling pane
+        #[arg(long = "as")]
+        as_name: Option<String>,
+    },
+    /// Print room messages
+    Read {
+        /// Only messages with id greater than this
+        #[arg(long)]
+        since: Option<u64>,
+        /// Max messages when --since is not given
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// List room members
+    Agents,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let herd = herd::RealHerd;
+    match args.cmd {
+        Cmd::Post { text, as_name } => cli::cmd_post(&herd, as_name.as_deref(), &text),
+        Cmd::Read { since, limit } => cli::cmd_read(since, limit),
+        Cmd::Agents => cli::cmd_agents(&herd),
+    }
 }
