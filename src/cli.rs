@@ -46,10 +46,37 @@ fn current_grouping() -> Result<Grouping> {
     Ok(groups::load(&crate::paths::base_dir()?))
 }
 
-/// Resolves the group for a CLI invocation from the process's own cwd.
-fn group_for_invocation(explicit: Option<&str>) -> Result<Option<String>> {
+/// Resolves the group for a CLI invocation from the process's own cwd. The
+/// `Grouping` comes back with it because callers that list agents must scope
+/// the listing to the resolved group, which needs the rules.
+fn group_for_invocation(explicit: Option<&str>) -> Result<(Option<String>, Grouping)> {
     let cwd = std::env::current_dir()?;
-    resolve_group(explicit, &cwd, &current_grouping()?)
+    let grouping = current_grouping()?;
+    let resolved = resolve_group(explicit, &cwd, &grouping)?;
+    Ok((resolved, grouping))
+}
+
+/// The agents a caller in `resolved` may see. Under active grouping the
+/// roster is scoped: herdr agent names routinely encode client and issue
+/// identity, so an unscoped listing leaks one company's work to another's
+/// agent. Under `Grouping::Inactive` it stays unscoped — scoping there would
+/// collapse "no config" into "config that places nobody" inside the very
+/// listing whose job is showing membership.
+pub fn visible_agents<'a>(
+    agents: &'a [AgentInfo],
+    resolved: Option<&str>,
+    grouping: &Grouping,
+) -> Vec<&'a AgentInfo> {
+    match grouping {
+        Grouping::Inactive => agents.iter().collect(),
+        Grouping::Broken(_) => Vec::new(),
+        Grouping::Active(rules) => agents
+            .iter()
+            .filter(|a| {
+                resolved.is_some() && groups::group_for(Path::new(&a.cwd), rules) == resolved
+            })
+            .collect(),
+    }
 }
 
 pub fn cmd_groups(herd: &dyn HerdControl) -> Result<()> {
@@ -61,7 +88,19 @@ pub fn cmd_groups(herd: &dyn HerdControl) -> Result<()> {
             println!("groups config BROKEN — no agent is enrolled: {msg}");
         }
         Grouping::Active(rules) => {
-            let agents = herd.list_agents().unwrap_or_default();
+            let agents = match herd.list_agents() {
+                Ok(a) => a,
+                Err(e) => {
+                    // Distinguish "nobody is enrolled" from "I could not ask":
+                    // this is the auditing surface, and an empty roster that
+                    // really means herdr is down must not read as isolation.
+                    println!(
+                        "cannot list agents ({e}) — membership below is unknown; \
+                         only the configured prefixes are shown"
+                    );
+                    Vec::new()
+                }
+            };
             for name in rules.names() {
                 let paths: Vec<String> = rules
                     .prefixes_for(name)
@@ -121,7 +160,7 @@ pub fn cmd_post(
     as_flag: Option<&str>,
     text: &str,
 ) -> Result<()> {
-    let resolved = group_for_invocation(group)?;
+    let (resolved, _) = group_for_invocation(group)?;
     let dir = crate::paths::room_dir(resolved.as_deref())?;
     let pane = std::env::var("HERDR_PANE_ID").ok();
     // Only hit the herd (a live `herdr agent list` call) when we actually need
@@ -140,7 +179,7 @@ pub fn cmd_post(
 }
 
 pub fn cmd_read(group: Option<&str>, since: Option<u64>, limit: usize) -> Result<()> {
-    let resolved = group_for_invocation(group)?;
+    let (resolved, _) = group_for_invocation(group)?;
     let dir = crate::paths::room_dir(resolved.as_deref())?;
     let mut msgs = log_store::read_since(&dir, since.unwrap_or(0))?;
     if since.is_none() && msgs.len() > limit {
@@ -151,8 +190,9 @@ pub fn cmd_read(group: Option<&str>, since: Option<u64>, limit: usize) -> Result
 }
 
 pub fn cmd_agents(group: Option<&str>, herd: &dyn HerdControl) -> Result<()> {
-    group_for_invocation(group)?;
-    for a in herd.list_agents()? {
+    let (resolved, grouping) = group_for_invocation(group)?;
+    let agents = herd.list_agents()?;
+    for a in visible_agents(&agents, resolved.as_deref(), &grouping) {
         println!("{}\t{}\t{}", a.name, a.status, a.pane_id);
     }
     println!("human\t-\t-");
@@ -221,6 +261,48 @@ mod tests {
             status: "idle".into(),
             cwd: String::new(),
         }]
+    }
+
+    fn grouped_agents() -> Vec<AgentInfo> {
+        vec![
+            AgentInfo {
+                name: "issue-590".into(),
+                pane_id: "w1:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/alare/api".into(),
+            },
+            AgentInfo {
+                name: "acme-secret-issue".into(),
+                pane_id: "w2:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/acme/web".into(),
+            },
+            AgentInfo {
+                name: "stray".into(),
+                pane_id: "w3:p1".into(),
+                status: "idle".into(),
+                cwd: "/tmp/scratch".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn listing_is_scoped_to_the_callers_group() {
+        let all = grouped_agents();
+        let seen: Vec<&str> = visible_agents(&all, Some("alare"), &active())
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(seen, vec!["issue-590"]);
+    }
+
+    #[test]
+    fn listing_stays_unscoped_when_grouping_is_inactive() {
+        let all = grouped_agents();
+        assert_eq!(
+            visible_agents(&all, None, &Grouping::Inactive).len(),
+            all.len()
+        );
     }
 
     #[test]

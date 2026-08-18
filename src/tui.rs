@@ -174,6 +174,23 @@ fn title_for(resolved: Option<&str>) -> String {
     }
 }
 
+/// The members pane's roster, scoped to the resolved group. Both the initial
+/// seed and the periodic refresh go through here: the pane sits beside a title
+/// naming the group, so an unscoped roster would show one company's agent
+/// names in another company's room. A failed listing leaves the pane empty
+/// rather than tearing the TUI down.
+fn scoped_members(
+    herd: &dyn HerdControl,
+    resolved: Option<&str>,
+    grouping: &crate::groups::Grouping,
+) -> Vec<AgentInfo> {
+    let all = herd.list_agents().unwrap_or_default();
+    crate::cli::visible_agents(&all, resolved, grouping)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 pub fn run(group: Option<&str>) -> Result<()> {
     let grouping = crate::groups::load(&crate::paths::base_dir()?);
     let resolved = crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping)?;
@@ -182,7 +199,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
-        members: herd.list_agents().unwrap_or_default(),
+        members: scoped_members(&herd, resolved.as_deref(), &grouping),
         title,
         ..App::default()
     };
@@ -205,9 +222,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
                 app.messages.append(&mut fresh);
             }
             if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
-                if let Ok(m) = herd.list_agents() {
-                    app.members = m;
-                }
+                app.members = scoped_members(&herd, resolved.as_deref(), &grouping);
                 last_member_refresh = std::time::Instant::now();
             }
 
@@ -397,6 +412,52 @@ mod tests {
             "first row is {first_row_width} cells wide: {:?}",
             rows[0]
         );
+    }
+
+    struct FakeHerd(Vec<AgentInfo>);
+    impl HerdControl for FakeHerd {
+        fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+            Ok(self.0.clone())
+        }
+        fn prompt(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn at(name: &str, cwd: &str) -> AgentInfo {
+        AgentInfo {
+            name: name.into(),
+            pane_id: "w1:p1".into(),
+            status: "idle".into(),
+            cwd: cwd.into(),
+        }
+    }
+
+    fn two_groups() -> crate::groups::Grouping {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/w/alare\"]\nacme = [\"/w/acme\"]\n",
+        )
+        .unwrap();
+        let g = crate::groups::load(dir.path());
+        std::mem::forget(dir);
+        g
+    }
+
+    #[test]
+    fn members_pane_shows_only_the_callers_group() {
+        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")]);
+        let members = scoped_members(&herd, Some("alare"), &two_groups());
+        let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["issue-590"]);
+    }
+
+    #[test]
+    fn members_pane_is_unscoped_when_grouping_is_inactive() {
+        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")]);
+        let members = scoped_members(&herd, None, &crate::groups::Grouping::Inactive);
+        assert_eq!(members.len(), 2);
     }
 
     #[test]
