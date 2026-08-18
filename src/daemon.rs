@@ -69,16 +69,24 @@ pub fn run(dir: &Path) -> Result<()> {
     if let Some(pid) = read_live_pid(dir) {
         anyhow::bail!("daemon already running (pid {pid})");
     }
-    std::fs::write(dir.join("daemon.pid"), std::process::id().to_string())?;
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
+    std::fs::write(dir.join("daemon.pid"), std::process::id().to_string())?;
     log_line(dir, "daemon started");
     let herd = crate::herd::RealHerd;
     let mut state = crate::state::load(dir);
     while !term.load(Ordering::Relaxed) {
         tick_and_save(&mut state, &herd, dir);
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Sleep for the 2s tick interval in 100ms slices, checking the term
+        // flag between slices, so a signal arriving mid-interval is acted on
+        // within ~100ms instead of waiting out the full 2s.
+        for _ in 0..20 {
+            if term.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
     log_line(dir, "daemon stopped");
     let _ = std::fs::remove_file(dir.join("daemon.pid"));
@@ -484,7 +492,8 @@ mod tests {
     #[test]
     fn read_live_pid_ignores_stale_pid() {
         let dir = tempfile::tempdir().unwrap();
-        // pid 4194304 is above the default linux pid_max; nothing alive there
+        // pid 4194304 sits at the 64-bit linux pid_max cap; nothing is
+        // realistically alive there
         std::fs::write(dir.path().join("daemon.pid"), "4194304").unwrap();
         assert_eq!(read_live_pid(dir.path()), None);
     }
