@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Default)]
 pub struct App {
@@ -17,6 +18,9 @@ pub struct App {
     /// Last post failure, surfaced in the input-line title. A transient write
     /// failure must not tear the chat pane down.
     pub post_error: Option<String>,
+    /// Message-pane title, always naming the resolved group so the human
+    /// can never mistake which room's input line they are typing into.
+    pub title: String,
 }
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
@@ -65,13 +69,21 @@ fn should_reseed(mem_last_id: u64, file_last_id: u64) -> bool {
     file_last_id < mem_last_id
 }
 
-/// Splits `text` into rows of at most `width` columns, with only
+/// Display width of `s` in terminal cells, not chars: a CJK or emoji
+/// character occupies two cells but counts as one `char`.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Splits `text` into rows of at most `width` display cells, with only
 /// `first_width` available on the first row (the `from: ` prefix shares it).
 /// Breaks on spaces where it can and hard-breaks a word too long for a row.
 /// Always returns at least one row.
 ///
-/// Counts `char`s, not display cells: a CJK or emoji-heavy line can still
-/// wrap a row early. Fixing that needs a unicode-width dependency.
+/// Measures display cells via `unicode_width`, not `char`s: a CJK or emoji
+/// character occupies two cells, so counting chars would let such a row
+/// overflow the pane and be truncated by the renderer with no way to scroll
+/// to the lost half.
 fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut budget = first_width.max(1);
@@ -82,7 +94,7 @@ fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
     for word in text.split(' ') {
         let mut word = word;
         loop {
-            let wlen = word.chars().count();
+            let wlen = display_width(word);
             let sep = usize::from(cur_len > 0);
             if cur_len + sep + wlen <= budget {
                 if sep == 1 {
@@ -101,8 +113,22 @@ fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
             }
             // a single word longer than a whole row: hard-break it, or we
             // would loop forever (reachable at narrow pane widths)
-            let head: String = word.chars().take(budget).collect();
-            word = &word[head.len()..];
+            let mut head = String::new();
+            let mut head_width = 0usize;
+            let mut consumed = 0usize;
+            for c in word.chars() {
+                let w = c.width().unwrap_or(0);
+                if head_width + w > budget && !head.is_empty() {
+                    break;
+                }
+                head.push(c);
+                head_width += w;
+                consumed += c.len_utf8();
+                if head_width >= budget {
+                    break;
+                }
+            }
+            word = &word[consumed..];
             rows.push(head);
             budget = width;
         }
@@ -121,7 +147,7 @@ fn message_rows(m: &Message, width: usize) -> Vec<Line<'static>> {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     };
     let prefix = format!("{}: ", m.from);
-    let prefix_len = prefix.chars().count();
+    let prefix_len = display_width(&prefix);
     let mut rows = wrap_text(&m.text, width.saturating_sub(prefix_len), width).into_iter();
     let first = rows.next().unwrap_or_default();
     std::iter::once(Line::from(vec![
@@ -139,12 +165,19 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
     bottom.saturating_sub(scroll_from_bottom.min(bottom))
 }
 
-pub fn run() -> Result<()> {
-    let dir = crate::paths::room_dir(None)?;
+pub fn run(group: Option<&str>) -> Result<()> {
+    let grouping = crate::groups::load(&crate::paths::base_dir()?);
+    let resolved = crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping)?;
+    let dir = crate::paths::room_dir(resolved.as_deref())?;
+    let title = match resolved.as_deref() {
+        Some(g) => format!(" scuttlebutt · {g} "),
+        None => " scuttlebutt ".to_string(),
+    };
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
         members: herd.list_agents().unwrap_or_default(),
+        title,
         ..App::default()
     };
 
@@ -217,7 +250,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let start = scroll_start(rows.len(), visible, app.scroll_from_bottom as usize);
     f.render_widget(
         Paragraph::new(rows[start.min(rows.len())..].to_vec())
-            .block(Block::default().borders(Borders::ALL).title(" scuttlebutt ")),
+            .block(Block::default().borders(Borders::ALL).title(app.title.as_str())),
         top[0],
     );
 
@@ -444,6 +477,21 @@ mod tests {
     #[test]
     fn wrap_text_of_empty_string_is_one_row() {
         assert_eq!(wrap_text("", 10, 10), vec![""]);
+    }
+
+    #[test]
+    fn wraps_on_display_width_not_char_count() {
+        // each CJK char is two cells wide, so four of them fill an 8-cell row
+        let rows = wrap_text("一二三四五六", 8, 8);
+        assert_eq!(rows, vec!["一二三四".to_string(), "五六".to_string()]);
+    }
+
+    #[test]
+    fn wide_text_is_never_truncated() {
+        let text = "一二三四五六七八九十";
+        let rows = wrap_text(text, 8, 8);
+        let rejoined: String = rows.concat();
+        assert_eq!(rejoined, text);
     }
 
     #[test]

@@ -61,7 +61,11 @@ enum Cmd {
     /// Stop the daemon
     DaemonStop,
     /// Open the chat TUI
-    Tui,
+    Tui {
+        /// Target this group instead of resolving from the calling cwd
+        #[arg(long)]
+        group: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +95,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
-        Cmd::Tui => tui::run(),
+        Cmd::Tui { group } => tui::run(group.as_deref()),
     }
 }
