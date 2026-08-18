@@ -36,7 +36,13 @@ enum Cmd {
     /// List room members
     Agents,
     /// Run the delivery daemon in the foreground
-    Daemon,
+    Daemon {
+        /// Only enroll agents matching this comma-separated glob list
+        /// (e.g. `gossip-*,reviewer`). Falls back to $SCUTTLEBUTT_AGENTS.
+        /// With neither set, every named agent is enrolled.
+        #[arg(long)]
+        agents: Option<String>,
+    },
     /// Show daemon status
     DaemonStatus,
     /// Stop the daemon
@@ -52,7 +58,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Post { text, as_name } => cli::cmd_post(&herd, as_name.as_deref(), &text),
         Cmd::Read { since, limit } => cli::cmd_read(since, limit),
         Cmd::Agents => cli::cmd_agents(&herd),
-        Cmd::Daemon => daemon::run(&paths::room_dir()?),
+        Cmd::Daemon { agents } => {
+            let pattern = agents
+                .or_else(|| std::env::var("SCUTTLEBUTT_AGENTS").ok())
+                .unwrap_or_default();
+            daemon::run(&paths::room_dir()?, &daemon::AgentFilter::parse(&pattern))
+        }
         Cmd::DaemonStatus => {
             daemon::status(&paths::room_dir()?);
             Ok(())

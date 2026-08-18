@@ -13,6 +13,12 @@ pub struct DaemonState {
     /// Consecutive ticks an enrolled agent has been absent from `herdr agent list`.
     #[serde(default)]
     pub absences: HashMap<String, u32>,
+    /// Consecutive ticks a not-yet-introduced agent has been deliverable.
+    #[serde(default)]
+    pub deliverable_streak: HashMap<String, u32>,
+    /// Consecutive intro prompt failures per agent.
+    #[serde(default)]
+    pub intro_fails: HashMap<String, u32>,
 }
 
 pub fn load(dir: &Path) -> DaemonState {
