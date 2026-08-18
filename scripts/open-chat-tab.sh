@@ -8,4 +8,5 @@ exec "$herdr_bin" plugin pane open \
   --plugin andybarilla.scuttlebutt \
   --entrypoint chat \
   --placement tab \
-  --focus
+  --focus \
+  --cwd "$PWD"

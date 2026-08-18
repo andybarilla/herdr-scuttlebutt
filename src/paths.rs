@@ -27,8 +27,19 @@ pub fn base_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(dir))
 }
 
-pub fn room_dir() -> Result<PathBuf> {
+pub fn session_dir() -> Result<PathBuf> {
     let dir = base_dir()?.join(session_key());
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The directory holding one room's `room.jsonl` and `state.json`. `None` is
+/// the ungrouped layout (grouping inactive) and keeps v1's paths exactly.
+pub fn room_dir(group: Option<&str>) -> Result<PathBuf> {
+    let dir = match group {
+        Some(g) => session_dir()?.join(g),
+        None => session_dir()?,
+    };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -37,15 +48,51 @@ pub fn room_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// These tests mutate process-global env vars that every path helper
+    /// reads, so they cannot run concurrently with each other: without this
+    /// they interleave and one test asserts against another's SCUTTLEBUTT_DIR.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn session_key_sanitizes_socket_path() {
+        let _env = env_guard();
         std::env::set_var("HERDR_SOCKET_PATH", "/home/andy/.config/herdr/herdr.sock");
         assert_eq!(session_key(), "-home-andy--config-herdr-herdr-sock");
     }
 
     #[test]
     fn base_dir_prefers_env_override() {
+        let _env = env_guard();
         std::env::set_var("SCUTTLEBUTT_DIR", "/tmp/sb-test");
         assert_eq!(base_dir().unwrap(), PathBuf::from("/tmp/sb-test"));
+    }
+
+    #[test]
+    fn room_dir_appends_group_when_given() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/s.sock");
+        let ungrouped = room_dir(None).unwrap();
+        let grouped = room_dir(Some("alare")).unwrap();
+        assert_eq!(grouped, ungrouped.join("alare"));
+        assert!(grouped.is_dir());
+        std::env::remove_var("SCUTTLEBUTT_DIR");
+        std::env::remove_var("HERDR_SOCKET_PATH");
+    }
+
+    #[test]
+    fn session_dir_ignores_group() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/s.sock");
+        assert_eq!(session_dir().unwrap(), room_dir(None).unwrap());
+        std::env::remove_var("SCUTTLEBUTT_DIR");
+        std::env::remove_var("HERDR_SOCKET_PATH");
     }
 }

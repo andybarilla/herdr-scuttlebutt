@@ -9,4 +9,5 @@ exec "$herdr_bin" plugin pane open \
   --entrypoint chat \
   --placement split \
   --direction right \
-  --focus
+  --focus \
+  --cwd "$PWD"

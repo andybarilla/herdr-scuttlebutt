@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Default)]
 pub struct App {
@@ -17,6 +18,9 @@ pub struct App {
     /// Last post failure, surfaced in the input-line title. A transient write
     /// failure must not tear the chat pane down.
     pub post_error: Option<String>,
+    /// Message-pane title, always naming the resolved group so the human
+    /// can never mistake which room's input line they are typing into.
+    pub title: String,
 }
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
@@ -65,13 +69,21 @@ fn should_reseed(mem_last_id: u64, file_last_id: u64) -> bool {
     file_last_id < mem_last_id
 }
 
-/// Splits `text` into rows of at most `width` columns, with only
+/// Display width of `s` in terminal cells, not chars: a CJK or emoji
+/// character occupies two cells but counts as one `char`.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Splits `text` into rows of at most `width` display cells, with only
 /// `first_width` available on the first row (the `from: ` prefix shares it).
 /// Breaks on spaces where it can and hard-breaks a word too long for a row.
 /// Always returns at least one row.
 ///
-/// Counts `char`s, not display cells: a CJK or emoji-heavy line can still
-/// wrap a row early. Fixing that needs a unicode-width dependency.
+/// Measures display cells via `unicode_width`, not `char`s: a CJK or emoji
+/// character occupies two cells, so counting chars would let such a row
+/// overflow the pane and be truncated by the renderer with no way to scroll
+/// to the lost half.
 fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut budget = first_width.max(1);
@@ -82,7 +94,7 @@ fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
     for word in text.split(' ') {
         let mut word = word;
         loop {
-            let wlen = word.chars().count();
+            let wlen = display_width(word);
             let sep = usize::from(cur_len > 0);
             if cur_len + sep + wlen <= budget {
                 if sep == 1 {
@@ -101,8 +113,22 @@ fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
             }
             // a single word longer than a whole row: hard-break it, or we
             // would loop forever (reachable at narrow pane widths)
-            let head: String = word.chars().take(budget).collect();
-            word = &word[head.len()..];
+            let mut head = String::new();
+            let mut head_width = 0usize;
+            let mut consumed = 0usize;
+            for c in word.chars() {
+                let w = c.width().unwrap_or(0);
+                if head_width + w > budget && !head.is_empty() {
+                    break;
+                }
+                head.push(c);
+                head_width += w;
+                consumed += c.len_utf8();
+                if head_width >= budget {
+                    break;
+                }
+            }
+            word = &word[consumed..];
             rows.push(head);
             budget = width;
         }
@@ -121,7 +147,7 @@ fn message_rows(m: &Message, width: usize) -> Vec<Line<'static>> {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     };
     let prefix = format!("{}: ", m.from);
-    let prefix_len = prefix.chars().count();
+    let prefix_len = display_width(&prefix);
     let mut rows = wrap_text(&m.text, width.saturating_sub(prefix_len), width).into_iter();
     let first = rows.next().unwrap_or_default();
     std::iter::once(Line::from(vec![
@@ -139,12 +165,45 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
     bottom.saturating_sub(scroll_from_bottom.min(bottom))
 }
 
-pub fn run() -> Result<()> {
-    let dir = crate::paths::room_dir()?;
+/// Message-pane title. Always names the resolved group, so it is the
+/// visible safeguard against typing into the wrong company's room.
+fn title_for(resolved: Option<&str>) -> String {
+    match resolved {
+        Some(g) => format!(" scuttlebutt · {g} "),
+        None => " scuttlebutt ".to_string(),
+    }
+}
+
+/// The members pane's roster, scoped to the resolved group. Both the initial
+/// seed and the periodic refresh go through here: the pane sits beside a title
+/// naming the group, so an unscoped roster would show one company's agent
+/// names in another company's room. `None` on a failed listing, so the
+/// refresh can keep the last known roster instead of blanking the pane for a
+/// transient `herdr agent list` failure.
+fn scoped_members(
+    herd: &dyn HerdControl,
+    resolved: Option<&str>,
+    grouping: &crate::groups::Grouping,
+) -> Option<Vec<AgentInfo>> {
+    let all = herd.list_agents().ok()?;
+    Some(
+        crate::cli::visible_agents(&all, resolved, grouping)
+            .into_iter()
+            .cloned()
+            .collect(),
+    )
+}
+
+pub fn run(group: Option<&str>) -> Result<()> {
+    let grouping = crate::groups::load(&crate::paths::base_dir()?);
+    let resolved = crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping)?;
+    let dir = crate::paths::room_dir(resolved.as_deref())?;
+    let title = title_for(resolved.as_deref());
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
-        members: herd.list_agents().unwrap_or_default(),
+        members: scoped_members(&herd, resolved.as_deref(), &grouping).unwrap_or_default(),
+        title,
         ..App::default()
     };
 
@@ -166,7 +225,7 @@ pub fn run() -> Result<()> {
                 app.messages.append(&mut fresh);
             }
             if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
-                if let Ok(m) = herd.list_agents() {
+                if let Some(m) = scoped_members(&herd, resolved.as_deref(), &grouping) {
                     app.members = m;
                 }
                 last_member_refresh = std::time::Instant::now();
@@ -217,7 +276,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let start = scroll_start(rows.len(), visible, app.scroll_from_bottom as usize);
     f.render_widget(
         Paragraph::new(rows[start.min(rows.len())..].to_vec())
-            .block(Block::default().borders(Borders::ALL).title(" scuttlebutt ")),
+            .block(Block::default().borders(Borders::ALL).title(app.title.as_str())),
         top[0],
     );
 
@@ -345,6 +404,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wide_sender_name_prefix_is_measured_in_display_cells() {
+        // "田中" is 2 chars but 4 display cells; the "田中: " prefix must
+        // consume its true width from the first-row budget, or the row
+        // overflows the pane's inner width.
+        let m = msg("田中", "abcdef");
+        let rows = message_rows(&m, 10);
+        let first_row_width: usize = rows[0].spans.iter().map(|s| display_width(&s.content)).sum();
+        assert!(
+            first_row_width <= 10,
+            "first row is {first_row_width} cells wide: {:?}",
+            rows[0]
+        );
+    }
+
+    struct FakeHerd(Vec<AgentInfo>, bool);
+    impl HerdControl for FakeHerd {
+        fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+            if self.1 {
+                anyhow::bail!("herdr is down");
+            }
+            Ok(self.0.clone())
+        }
+        fn prompt(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn at(name: &str, cwd: &str) -> AgentInfo {
+        AgentInfo {
+            name: name.into(),
+            pane_id: "w1:p1".into(),
+            status: "idle".into(),
+            cwd: cwd.into(),
+        }
+    }
+
+    fn two_groups() -> crate::groups::Grouping {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/w/alare\"]\nacme = [\"/w/acme\"]\n",
+        )
+        .unwrap();
+        let g = crate::groups::load(dir.path());
+        std::mem::forget(dir);
+        g
+    }
+
+    #[test]
+    fn members_pane_shows_only_the_callers_group() {
+        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")], false);
+        let members = scoped_members(&herd, Some("alare"), &two_groups()).unwrap();
+        let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["issue-590"]);
+    }
+
+    #[test]
+    fn members_pane_is_unscoped_when_grouping_is_inactive() {
+        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")], false);
+        let members =
+            scoped_members(&herd, None, &crate::groups::Grouping::Inactive).unwrap();
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn failed_listing_leaves_the_roster_untouched() {
+        // a transient `herdr agent list` failure must not blank the pane
+        let herd = FakeHerd(vec![], true);
+        assert!(scoped_members(&herd, Some("alare"), &two_groups()).is_none());
+    }
+
+    #[test]
+    fn title_for_names_the_group() {
+        assert!(title_for(Some("alare")).contains("alare"));
+    }
+
+    #[test]
+    fn title_for_ungrouped_has_no_stray_group_label() {
+        let title = title_for(None);
+        assert!(!title.contains("·"));
+        assert!(title.contains("scuttlebutt"));
+    }
+
     /// Renders `draw` into an off-screen terminal and returns the rows as
     /// strings, so a test can assert what a user would actually see.
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
@@ -444,6 +587,21 @@ mod tests {
     #[test]
     fn wrap_text_of_empty_string_is_one_row() {
         assert_eq!(wrap_text("", 10, 10), vec![""]);
+    }
+
+    #[test]
+    fn wraps_on_display_width_not_char_count() {
+        // each CJK char is two cells wide, so four of them fill an 8-cell row
+        let rows = wrap_text("一二三四五六", 8, 8);
+        assert_eq!(rows, vec!["一二三四".to_string(), "五六".to_string()]);
+    }
+
+    #[test]
+    fn wide_text_is_never_truncated() {
+        let text = "一二三四五六七八九十";
+        let rows = wrap_text(text, 8, 8);
+        let rejoined: String = rows.concat();
+        assert_eq!(rejoined, text);
     }
 
     #[test]
