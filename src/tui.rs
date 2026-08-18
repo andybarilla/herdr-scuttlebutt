@@ -345,21 +345,73 @@ mod tests {
         }
     }
 
+    /// Renders `draw` into an off-screen terminal and returns the rows as
+    /// strings, so a test can assert what a user would actually see.
+    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     #[test]
-    fn newest_row_of_a_wrapped_message_is_visible_at_the_bottom() {
+    fn newest_message_is_visible_without_scrolling() {
         // The bug: counting one row per message undershoots the bottom
-        // offset, so the tail of a wrapped message sits below the viewport
-        // and Down saturates before reaching it.
-        let messages = [
-            msg("bob", "short"),
-            msg("bob", "aaaa bbbb cccc dddd eeee ffff gggg hhhh"),
-        ];
-        let width = 20;
-        let visible = 3;
-        let total: usize = messages.iter().map(|m| message_rows(m, width).len()).sum();
-        assert!(total > messages.len(), "test needs a wrapping message");
-        let start = scroll_start(total, visible, 0);
-        assert_eq!(start + visible, total, "last row must be on screen");
+        // offset, so the tail of a wrapped message renders below the
+        // viewport and Down saturates before it can be reached. Asserted
+        // against the rendered buffer, because scroll arithmetic alone is
+        // self-consistent whether or not it agrees with the renderer.
+        let mut app = App {
+            messages: (0..6)
+                .map(|i| msg("bob", &format!("filler message number {i} padded out a bit")))
+                .collect(),
+            ..App::default()
+        };
+        app.messages
+            .push(msg("bob", "one two three four five six seven NEWEST"));
+
+        let screen = render(&app, 60, 12).join("\n");
+        assert!(
+            screen.contains("NEWEST"),
+            "newest message is off-screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_then_back_down_returns_to_the_newest_message() {
+        let mut app = App {
+            messages: (0..8)
+                .map(|i| msg("bob", &format!("filler message number {i} padded out a bit")))
+                .collect(),
+            ..App::default()
+        };
+        app.messages
+            .push(msg("bob", "one two three four five six seven NEWEST"));
+
+        for _ in 0..3 {
+            handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert!(!render(&app, 60, 12).join("\n").contains("NEWEST"));
+        for _ in 0..3 {
+            handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert!(render(&app, 60, 12).join("\n").contains("NEWEST"));
+    }
+
+    #[test]
+    fn post_error_is_surfaced_in_the_input_title() {
+        let app = App {
+            post_error: Some("disk on fire".into()),
+            ..App::default()
+        };
+        assert!(render(&app, 60, 12).join("\n").contains("disk on fire"));
     }
 
     #[test]
