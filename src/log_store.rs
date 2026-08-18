@@ -1,5 +1,4 @@
 use anyhow::Result;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -30,7 +29,7 @@ pub fn append(dir: &Path, from: &str, text: &str) -> Result<Message> {
         .read(true)
         .append(true)
         .open(room_file(dir))?;
-    file.lock_exclusive()?;
+    fs2::FileExt::lock_exclusive(&file)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let content = String::from_utf8_lossy(&bytes).into_owned();
@@ -96,6 +95,35 @@ mod tests {
     fn last_id_is_zero_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(last_id(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_appends_assign_every_id_exactly_once() {
+        // The flock in `append` is the whole correctness claim of the store:
+        // read-last-id + write must be atomic across processes/threads.
+        // Asserting the id set is exactly 1..=N (not merely "no duplicates")
+        // is what catches a lost update, where two writers read the same
+        // last id and one line overwrites the other's id space.
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(THREADS as usize);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let barrier = &barrier;
+                let path = dir.path();
+                s.spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        append(path, &format!("agent{t}"), &format!("msg{t}-{i}")).unwrap();
+                    }
+                });
+            }
+        });
+        let ids: std::collections::BTreeSet<u64> =
+            read_since(dir.path(), 0).unwrap().iter().map(|m| m.id).collect();
+        let expected: std::collections::BTreeSet<u64> = (1..=THREADS * PER_THREAD).collect();
+        assert_eq!(ids, expected);
     }
 
     #[test]
