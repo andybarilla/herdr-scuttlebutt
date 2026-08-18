@@ -99,6 +99,17 @@ pub fn load(base: &Path) -> Grouping {
                     path.display()
                 ));
             }
+            if normalized
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Grouping::Broken(format!(
+                    "{}: group {name:?} has a prefix containing `..` ({p:?}); \
+                     prefixes are matched literally against absolute working \
+                     directories and one with `..` can never match",
+                    path.display()
+                ));
+            }
             if !normalized.is_absolute() {
                 return Grouping::Broken(format!(
                     "{}: group {name:?} has a relative prefix {p:?}; \
@@ -336,6 +347,34 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(load(dir.path()), Grouping::Broken(_)));
+    }
+
+    #[test]
+    fn parent_dir_prefix_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/w/../alare\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Grouping::Broken(_)));
+    }
+
+    #[test]
+    fn current_dir_component_in_prefix_is_accepted() {
+        // `components()` elides `.`, so /a/./b really is /a/b
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/w/./alare\"]\n",
+        )
+        .unwrap();
+        match load(dir.path()) {
+            Grouping::Active(r) => {
+                assert_eq!(group_for(Path::new("/w/alare/api"), &r), Some("alare"))
+            }
+            other => panic!("expected Active, got {other:?}"),
+        }
     }
 
     #[test]
