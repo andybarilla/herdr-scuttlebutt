@@ -24,6 +24,9 @@ enum Cmd {
         /// Post as this name instead of resolving from the calling pane
         #[arg(long = "as")]
         as_name: Option<String>,
+        /// Target this group instead of resolving from the calling cwd
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Print room messages
     Read {
@@ -33,9 +36,18 @@ enum Cmd {
         /// Max messages when --since is not given
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Target this group instead of resolving from the calling cwd
+        #[arg(long)]
+        group: Option<String>,
     },
     /// List room members
-    Agents,
+    Agents {
+        /// Target this group instead of resolving from the calling cwd
+        #[arg(long)]
+        group: Option<String>,
+    },
+    /// List groups and their members
+    Groups,
     /// Run the delivery daemon in the foreground
     Daemon {
         /// Only enroll agents matching this comma-separated glob list
@@ -56,9 +68,18 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let herd = herd::RealHerd;
     match args.cmd {
-        Cmd::Post { text, as_name } => cli::cmd_post(&herd, as_name.as_deref(), &text),
-        Cmd::Read { since, limit } => cli::cmd_read(since, limit),
-        Cmd::Agents => cli::cmd_agents(&herd),
+        Cmd::Post {
+            text,
+            as_name,
+            group,
+        } => cli::cmd_post(group.as_deref(), &herd, as_name.as_deref(), &text),
+        Cmd::Read {
+            since,
+            limit,
+            group,
+        } => cli::cmd_read(group.as_deref(), since, limit),
+        Cmd::Agents { group } => cli::cmd_agents(group.as_deref(), &herd),
+        Cmd::Groups => cli::cmd_groups(&herd),
         Cmd::Daemon { agents } => {
             let pattern = agents
                 .or_else(|| std::env::var("SCUTTLEBUTT_AGENTS").ok())
