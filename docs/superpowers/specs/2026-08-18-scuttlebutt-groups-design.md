@@ -28,8 +28,11 @@ restated here is unchanged.
 ## Threat model
 
 This is isolation by construction for *delivery*: an agent is never handed
-another group's messages, and cannot post into another group's room through
-the CLI.
+another group's messages. It is not a restriction on what an agent can
+address. `--group` is an intentional escape hatch — anything that can run the
+binary can post into or read any configured group's room — and `scuttlebutt
+groups` lists every group and its membership to any caller. What the design
+guarantees is that nothing is ever *pushed* across a group boundary.
 
 It is not a defense against an agent that deliberately reads another group's
 `room.jsonl`. Every room lives under one config dir with ordinary file
