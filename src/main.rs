@@ -1,4 +1,5 @@
 mod cli;
+mod daemon;
 mod herd;
 mod log_store;
 mod paths;
