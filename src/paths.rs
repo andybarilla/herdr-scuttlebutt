@@ -48,20 +48,32 @@ pub fn room_dir(group: Option<&str>) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// These tests mutate process-global env vars that every path helper
+    /// reads, so they cannot run concurrently with each other: without this
+    /// they interleave and one test asserts against another's SCUTTLEBUTT_DIR.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn session_key_sanitizes_socket_path() {
+        let _env = env_guard();
         std::env::set_var("HERDR_SOCKET_PATH", "/home/andy/.config/herdr/herdr.sock");
         assert_eq!(session_key(), "-home-andy--config-herdr-herdr-sock");
     }
 
     #[test]
     fn base_dir_prefers_env_override() {
+        let _env = env_guard();
         std::env::set_var("SCUTTLEBUTT_DIR", "/tmp/sb-test");
         assert_eq!(base_dir().unwrap(), PathBuf::from("/tmp/sb-test"));
     }
 
     #[test]
     fn room_dir_appends_group_when_given() {
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
         std::env::set_var("HERDR_SOCKET_PATH", "/tmp/s.sock");
@@ -75,6 +87,7 @@ mod tests {
 
     #[test]
     fn session_dir_ignores_group() {
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
         std::env::set_var("HERDR_SOCKET_PATH", "/tmp/s.sock");
