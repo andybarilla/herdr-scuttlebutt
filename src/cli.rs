@@ -151,8 +151,7 @@ pub fn cmd_read(group: Option<&str>, since: Option<u64>, limit: usize) -> Result
 }
 
 pub fn cmd_agents(group: Option<&str>, herd: &dyn HerdControl) -> Result<()> {
-    let resolved = group_for_invocation(group)?;
-    crate::paths::room_dir(resolved.as_deref())?;
+    group_for_invocation(group)?;
     for a in herd.list_agents()? {
         println!("{}\t{}\t{}", a.name, a.status, a.pane_id);
     }
