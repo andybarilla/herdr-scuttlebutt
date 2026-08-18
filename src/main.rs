@@ -4,6 +4,7 @@ mod herd;
 mod log_store;
 mod paths;
 mod state;
+mod tui;
 
 use clap::{Parser, Subcommand};
 
@@ -40,6 +41,8 @@ enum Cmd {
     DaemonStatus,
     /// Stop the daemon
     DaemonStop,
+    /// Open the chat TUI
+    Tui,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,5 +58,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::room_dir()?),
+        Cmd::Tui => tui::run(),
     }
 }
