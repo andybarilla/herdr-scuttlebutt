@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 #[derive(Default)]
 pub struct App {
@@ -14,6 +14,9 @@ pub struct App {
     pub members: Vec<AgentInfo>,
     pub scroll_from_bottom: u16,
     pub quit: bool,
+    /// Last post failure, surfaced in the input-line title. A transient write
+    /// failure must not tear the chat pane down.
+    pub post_error: Option<String>,
 }
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
@@ -62,6 +65,80 @@ fn should_reseed(mem_last_id: u64, file_last_id: u64) -> bool {
     file_last_id < mem_last_id
 }
 
+/// Splits `text` into rows of at most `width` columns, with only
+/// `first_width` available on the first row (the `from: ` prefix shares it).
+/// Breaks on spaces where it can and hard-breaks a word too long for a row.
+/// Always returns at least one row.
+///
+/// Counts `char`s, not display cells: a CJK or emoji-heavy line can still
+/// wrap a row early. Fixing that needs a unicode-width dependency.
+fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut budget = first_width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+
+    for word in text.split(' ') {
+        let mut word = word;
+        loop {
+            let wlen = word.chars().count();
+            let sep = usize::from(cur_len > 0);
+            if cur_len + sep + wlen <= budget {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+                cur_len += sep + wlen;
+                break;
+            }
+            if cur_len > 0 {
+                // retry this word on a fresh row
+                rows.push(std::mem::take(&mut cur));
+                cur_len = 0;
+                budget = width;
+                continue;
+            }
+            // a single word longer than a whole row: hard-break it, or we
+            // would loop forever (reachable at narrow pane widths)
+            let head: String = word.chars().take(budget).collect();
+            word = &word[head.len()..];
+            rows.push(head);
+            budget = width;
+        }
+    }
+    rows.push(cur);
+    rows
+}
+
+/// Renders one message as the rows it actually occupies at `width` columns.
+/// `Paragraph::scroll` applies after wrapping, so the scroll arithmetic has
+/// to count rendered rows, not messages.
+fn message_rows(m: &Message, width: usize) -> Vec<Line<'static>> {
+    let who_style = if m.from == "human" {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    };
+    let prefix = format!("{}: ", m.from);
+    let prefix_len = prefix.chars().count();
+    let mut rows = wrap_text(&m.text, width.saturating_sub(prefix_len), width).into_iter();
+    let first = rows.next().unwrap_or_default();
+    std::iter::once(Line::from(vec![
+        Span::styled(prefix, who_style),
+        Span::raw(first),
+    ]))
+    .chain(rows.map(|r| Line::from(Span::raw(r))))
+    .collect()
+}
+
+/// Index of the first row to render. `scroll_from_bottom` is clamped to the
+/// bottom offset so the newest row is always reachable.
+fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usize) -> usize {
+    let bottom = total_rows.saturating_sub(visible_rows);
+    bottom.saturating_sub(scroll_from_bottom.min(bottom))
+}
+
 pub fn run() -> Result<()> {
     let dir = crate::paths::room_dir()?;
     let herd = RealHerd;
@@ -101,7 +178,10 @@ pub fn run() -> Result<()> {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         if let Some(text) = handle_key(&mut app, key.code, key.modifiers) {
-                            log_store::append(&dir, "human", &text)?;
+                            app.post_error = match log_store::append(&dir, "human", &text) {
+                                Ok(_) => None,
+                                Err(e) => Some(e.to_string()),
+                            };
                         }
                     }
                 }
@@ -123,30 +203,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Min(20), Constraint::Length(24)])
         .split(outer[0]);
 
-    let lines: Vec<Line> = app
+    // Pre-wrap to the pane's inner width and scroll by rendered row. Letting
+    // Paragraph wrap instead would make one long message count as a single
+    // row here while occupying several on screen, pushing the newest
+    // messages below the viewport where Down cannot reach them.
+    let inner_width = top[0].width.saturating_sub(2) as usize;
+    let rows: Vec<Line> = app
         .messages
         .iter()
-        .map(|m| {
-            let who_style = if m.from == "human" {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            };
-            Line::from(vec![
-                Span::styled(format!("{}: ", m.from), who_style),
-                Span::raw(m.text.clone()),
-            ])
-        })
+        .flat_map(|m| message_rows(m, inner_width))
         .collect();
-    let total = lines.len() as u16;
-    let visible = top[0].height.saturating_sub(2);
-    let bottom_offset = total.saturating_sub(visible);
-    let scroll = bottom_offset.saturating_sub(app.scroll_from_bottom.min(bottom_offset));
+    let visible = top[0].height.saturating_sub(2) as usize;
+    let start = scroll_start(rows.len(), visible, app.scroll_from_bottom as usize);
     f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" scuttlebutt "))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(rows[start.min(rows.len())..].to_vec())
+            .block(Block::default().borders(Borders::ALL).title(" scuttlebutt ")),
         top[0],
     );
 
@@ -175,9 +246,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         top[1],
     );
 
+    let input_title = match &app.post_error {
+        Some(e) => format!(" post failed: {e} "),
+        None => " message (Enter to send, Esc to quit) ".to_string(),
+    };
     f.render_widget(
         Paragraph::new(app.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(" message (Enter to send, Esc to quit) ")),
+            .block(Block::default().borders(Borders::ALL).title(input_title)),
         outer[1],
     );
 }
@@ -242,6 +317,81 @@ mod tests {
         assert!(!should_reseed(2, 5));
         assert!(!should_reseed(2, 2));
         assert!(!should_reseed(0, 0));
+    }
+
+    fn msg(from: &str, text: &str) -> Message {
+        Message {
+            id: 1,
+            ts: "t".into(),
+            from: from.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn short_message_is_one_row() {
+        assert_eq!(message_rows(&msg("bob", "hi"), 40).len(), 1);
+    }
+
+    #[test]
+    fn long_message_occupies_several_rows() {
+        // "bob: " is 5 columns, leaving 15 on the first row of a 20-wide pane.
+        let m = msg("bob", "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj");
+        let rows = message_rows(&m, 20);
+        assert!(rows.len() >= 3, "expected multiple rows, got {}", rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let w: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 20, "row {i} is {w} wide: {row:?}");
+        }
+    }
+
+    #[test]
+    fn newest_row_of_a_wrapped_message_is_visible_at_the_bottom() {
+        // The bug: counting one row per message undershoots the bottom
+        // offset, so the tail of a wrapped message sits below the viewport
+        // and Down saturates before reaching it.
+        let messages = [
+            msg("bob", "short"),
+            msg("bob", "aaaa bbbb cccc dddd eeee ffff gggg hhhh"),
+        ];
+        let width = 20;
+        let visible = 3;
+        let total: usize = messages.iter().map(|m| message_rows(m, width).len()).sum();
+        assert!(total > messages.len(), "test needs a wrapping message");
+        let start = scroll_start(total, visible, 0);
+        assert_eq!(start + visible, total, "last row must be on screen");
+    }
+
+    #[test]
+    fn scroll_start_clamps_to_the_top_and_bottom() {
+        assert_eq!(scroll_start(10, 3, 0), 7);
+        assert_eq!(scroll_start(10, 3, 2), 5);
+        // scrolling further up than there is history stops at the first row
+        assert_eq!(scroll_start(10, 3, 999), 0);
+        // everything fits: no scrolling at all
+        assert_eq!(scroll_start(2, 10, 0), 0);
+        assert_eq!(scroll_start(2, 10, 5), 0);
+        assert_eq!(scroll_start(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn wrap_text_hard_breaks_an_overlong_word() {
+        let rows = wrap_text("abcdefghij", 4, 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_text_survives_zero_width() {
+        // A 1-column pane leaves no room after the prefix; this must
+        // terminate rather than spin.
+        let rows = wrap_text("hello world", 0, 0);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r.chars().count() <= 1));
+    }
+
+    #[test]
+    fn wrap_text_of_empty_string_is_one_row() {
+        assert_eq!(wrap_text("", 10, 10), vec![""]);
     }
 
     #[test]
