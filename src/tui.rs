@@ -51,6 +51,17 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Opti
     }
 }
 
+/// Decide whether the in-memory tail cursor is stale relative to the log
+/// file's own last id. If the file's last id is lower than our cursor, the
+/// log was truncated or replaced (e.g. a test fixture reset, or a future
+/// "clear room" feature) and ids restarted from 1; tailing from the old
+/// cursor would filter out every subsequent message forever. In that case
+/// the caller should discard its in-memory messages and re-seed from the
+/// start of the file.
+fn should_reseed(mem_last_id: u64, file_last_id: u64) -> bool {
+    file_last_id < mem_last_id
+}
+
 pub fn run() -> Result<()> {
     let dir = crate::paths::room_dir()?;
     let herd = RealHerd;
@@ -66,8 +77,17 @@ pub fn run() -> Result<()> {
         while !app.quit {
             // tail new messages every loop; members on a slow tick
             let last = app.messages.last().map(|m| m.id).unwrap_or(0);
-            let mut fresh = log_store::read_since(&dir, last)?;
-            app.messages.append(&mut fresh);
+            let file_last = log_store::last_id(&dir)?;
+            if should_reseed(last, file_last) {
+                // room.jsonl was truncated or replaced (ids restarted lower
+                // than our cursor); discard the stale in-memory tail and
+                // re-seed from the start of the file instead of filtering
+                // every future message out forever.
+                app.messages = log_store::read_since(&dir, 0)?;
+            } else {
+                let mut fresh = log_store::read_since(&dir, last)?;
+                app.messages.append(&mut fresh);
+            }
             if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
                 if let Ok(m) = herd.list_agents() {
                     app.members = m;
@@ -195,6 +215,13 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_whitespace_only_input_is_noop() {
+        let mut a = app();
+        a.input = "   ".into();
+        assert_eq!(handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE), None);
+    }
+
+    #[test]
     fn ctrl_c_and_esc_quit() {
         let mut a = app();
         handle_key(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -202,6 +229,19 @@ mod tests {
         let mut b = app();
         handle_key(&mut b, KeyCode::Esc, KeyModifiers::NONE);
         assert!(b.quit);
+    }
+
+    #[test]
+    fn should_reseed_when_file_last_id_is_lower_than_cursor() {
+        // room.jsonl was truncated/replaced and ids restarted lower.
+        assert!(should_reseed(5, 2));
+    }
+
+    #[test]
+    fn should_not_reseed_on_normal_growth() {
+        assert!(!should_reseed(2, 5));
+        assert!(!should_reseed(2, 2));
+        assert!(!should_reseed(0, 0));
     }
 
     #[test]
