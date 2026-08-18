@@ -165,14 +165,20 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
     bottom.saturating_sub(scroll_from_bottom.min(bottom))
 }
 
+/// Message-pane title. Always names the resolved group, so it is the
+/// visible safeguard against typing into the wrong company's room.
+fn title_for(resolved: Option<&str>) -> String {
+    match resolved {
+        Some(g) => format!(" scuttlebutt · {g} "),
+        None => " scuttlebutt ".to_string(),
+    }
+}
+
 pub fn run(group: Option<&str>) -> Result<()> {
     let grouping = crate::groups::load(&crate::paths::base_dir()?);
     let resolved = crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping)?;
     let dir = crate::paths::room_dir(resolved.as_deref())?;
-    let title = match resolved.as_deref() {
-        Some(g) => format!(" scuttlebutt · {g} "),
-        None => " scuttlebutt ".to_string(),
-    };
+    let title = title_for(resolved.as_deref());
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
@@ -376,6 +382,33 @@ mod tests {
             let w: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
             assert!(w <= 20, "row {i} is {w} wide: {row:?}");
         }
+    }
+
+    #[test]
+    fn wide_sender_name_prefix_is_measured_in_display_cells() {
+        // "田中" is 2 chars but 4 display cells; the "田中: " prefix must
+        // consume its true width from the first-row budget, or the row
+        // overflows the pane's inner width.
+        let m = msg("田中", "abcdef");
+        let rows = message_rows(&m, 10);
+        let first_row_width: usize = rows[0].spans.iter().map(|s| display_width(&s.content)).sum();
+        assert!(
+            first_row_width <= 10,
+            "first row is {first_row_width} cells wide: {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn title_for_names_the_group() {
+        assert!(title_for(Some("alare")).contains("alare"));
+    }
+
+    #[test]
+    fn title_for_ungrouped_has_no_stray_group_label() {
+        let title = title_for(None);
+        assert!(!title.contains("·"));
+        assert!(title.contains("scuttlebutt"));
     }
 
     /// Renders `draw` into an off-screen terminal and returns the rows as
