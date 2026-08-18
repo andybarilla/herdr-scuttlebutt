@@ -29,7 +29,7 @@ pub fn read_live_pid(dir: &Path) -> Option<u32> {
     pid_alive(pid).then_some(pid)
 }
 
-fn log_line(dir: &Path, line: &str) {
+pub(crate) fn log_line(dir: &Path, line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -39,9 +39,11 @@ fn log_line(dir: &Path, line: &str) {
     }
 }
 
-/// Writes to both stderr and daemon.log, so operators watching either see
-/// the same diagnostics.
-fn report(dir: &Path, line: &str) {
+/// Writes to both stderr and daemon.log. The real launch path
+/// (`scripts/daemon-ctl.sh`) sends stderr to /dev/null, so daemon.log is the
+/// only place these ever land: anything an operator must see goes here, not
+/// through a bare `eprintln!`.
+pub(crate) fn report(dir: &Path, line: &str) {
     eprintln!("{line}");
     log_line(dir, line);
 }
@@ -67,13 +69,19 @@ fn tick_and_save(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) {
 
 pub fn run(dir: &Path) -> Result<()> {
     if let Some(pid) = read_live_pid(dir) {
+        report(dir, &format!("daemon already running (pid {pid})"));
         anyhow::bail!("daemon already running (pid {pid})");
     }
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
-    std::fs::write(dir.join("daemon.pid"), std::process::id().to_string())?;
-    log_line(dir, "daemon started");
+    if let Err(e) = std::fs::write(dir.join("daemon.pid"), std::process::id().to_string()) {
+        // Without a pidfile, daemon-status/daemon-stop cannot find us; fail
+        // loudly rather than running unmanageable.
+        report(dir, &format!("failed to write daemon.pid: {e}"));
+        return Err(e.into());
+    }
+    log_line(dir, &format!("daemon started; room dir {}", dir.display()));
     let herd = crate::herd::RealHerd;
     let mut state = crate::state::load(dir);
     while !term.load(Ordering::Relaxed) {
