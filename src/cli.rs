@@ -28,7 +28,7 @@ pub fn format_messages(msgs: &[Message]) -> String {
 }
 
 pub fn cmd_post(herd: &dyn HerdControl, as_flag: Option<&str>, text: &str) -> Result<()> {
-    let dir = crate::paths::room_dir()?;
+    let dir = crate::paths::room_dir(None)?;
     let pane = std::env::var("HERDR_PANE_ID").ok();
     // Only hit the herd (a live `herdr agent list` call) when we actually need
     // it to resolve a pane -> agent name. `--as` fully determines the sender,
@@ -46,7 +46,7 @@ pub fn cmd_post(herd: &dyn HerdControl, as_flag: Option<&str>, text: &str) -> Re
 }
 
 pub fn cmd_read(since: Option<u64>, limit: usize) -> Result<()> {
-    let dir = crate::paths::room_dir()?;
+    let dir = crate::paths::room_dir(None)?;
     let mut msgs = log_store::read_since(&dir, since.unwrap_or(0))?;
     if since.is_none() && msgs.len() > limit {
         msgs = msgs.split_off(msgs.len() - limit);
@@ -74,6 +74,7 @@ mod tests {
             name: "reviewer".into(),
             pane_id: "w1:p1".into(),
             status: "idle".into(),
+            cwd: String::new(),
         }]
     }
 

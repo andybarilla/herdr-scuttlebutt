@@ -65,13 +65,13 @@ fn main() -> anyhow::Result<()> {
             let pattern = agents
                 .or_else(|| std::env::var("SCUTTLEBUTT_AGENTS").ok())
                 .unwrap_or_default();
-            daemon::run(&paths::room_dir()?, &daemon::AgentFilter::parse(&pattern))
+            daemon::run(&paths::session_dir()?, &daemon::AgentFilter::parse(&pattern))
         }
         Cmd::DaemonStatus => {
-            daemon::status(&paths::room_dir()?);
+            daemon::status(&paths::session_dir()?);
             Ok(())
         }
-        Cmd::DaemonStop => daemon::stop(&paths::room_dir()?),
+        Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
         Cmd::Tui => tui::run(),
     }
 }

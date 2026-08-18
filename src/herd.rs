@@ -5,6 +5,7 @@ pub struct AgentInfo {
     pub name: String,
     pub pane_id: String,
     pub status: String,
+    pub cwd: String,
 }
 
 pub trait HerdControl {
@@ -24,6 +25,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<AgentInfo>> {
                 name: a["name"].as_str()?.to_string(),
                 pane_id: a["pane_id"].as_str().unwrap_or_default().to_string(),
                 status: a["agent_status"].as_str().unwrap_or("unknown").to_string(),
+                cwd: a["cwd"].as_str().unwrap_or_default().to_string(),
             })
         })
         .collect())
@@ -64,7 +66,7 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{"id":"cli:agent:list","result":{"agents":[
-        {"agent":"claude","agent_status":"idle","name":"issue-590","pane_id":"w35:p1","tab_id":"w35:t1","workspace_id":"w35"},
+        {"agent":"claude","agent_status":"idle","cwd":"/home/andy/.herdr/worktrees/alare/issue-590","name":"issue-590","pane_id":"w35:p1","tab_id":"w35:t1","workspace_id":"w35"},
         {"agent":"claude","agent_status":"working","name":"issue-758","pane_id":"w3A:p1","tab_id":"w3A:t1","workspace_id":"w3A"},
         {"agent":"claude","agent_status":"idle","pane_id":"w3E:p2","tab_id":"w3E:t2","workspace_id":"w3E"}
     ],"type":"agent_list"}}"#;
@@ -83,5 +85,17 @@ mod tests {
     #[test]
     fn rejects_malformed_json() {
         assert!(parse_agent_list("not json").is_err());
+    }
+
+    #[test]
+    fn parses_agent_cwd() {
+        let agents = parse_agent_list(FIXTURE).unwrap();
+        assert_eq!(agents[0].cwd, "/home/andy/.herdr/worktrees/alare/issue-590");
+    }
+
+    #[test]
+    fn missing_cwd_is_empty_not_an_error() {
+        let agents = parse_agent_list(FIXTURE).unwrap();
+        assert_eq!(agents[1].cwd, "");
     }
 }

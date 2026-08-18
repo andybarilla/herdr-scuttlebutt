@@ -459,6 +459,7 @@ mod tests {
                         name: n.into(),
                         pane_id: format!("w1:{n}"),
                         status: s.into(),
+                        cwd: String::new(),
                     })
                     .collect(),
                 prompts: RefCell::new(vec![]),

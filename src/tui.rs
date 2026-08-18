@@ -140,7 +140,7 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
 }
 
 pub fn run() -> Result<()> {
-    let dir = crate::paths::room_dir()?;
+    let dir = crate::paths::room_dir(None)?;
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
