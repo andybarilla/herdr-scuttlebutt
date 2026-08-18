@@ -1,7 +1,5 @@
 mod cli;
 mod daemon;
-// Unwired until a later task consumes it (path resolution, daemon, CLI, TUI).
-#[allow(dead_code)]
 mod groups;
 mod herd;
 mod log_store;
