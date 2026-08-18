@@ -2,9 +2,109 @@ use crate::herd::{AgentInfo, HerdControl};
 use crate::log_store;
 use crate::state::DaemonState;
 use anyhow::Result;
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub const MAX_BATCH_FAILURES: u32 = 5;
+
+fn pid_alive(pid: u32) -> bool {
+    // signal 0: existence check, no signal actually delivered
+    unsafe { libc_kill(pid as i32, 0) == 0 }
+}
+
+// tiny extern to avoid pulling in the libc crate for one call
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+pub fn read_live_pid(dir: &Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(dir.join("daemon.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    pid_alive(pid).then_some(pid)
+}
+
+fn log_line(dir: &Path, line: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+    {
+        let _ = writeln!(f, "{} {line}", chrono::Utc::now().to_rfc3339());
+    }
+}
+
+/// Writes to both stderr and daemon.log, so operators watching either see
+/// the same diagnostics.
+fn report(dir: &Path, line: &str) {
+    eprintln!("{line}");
+    log_line(dir, line);
+}
+
+/// Runs one tick and, only on success, persists the resulting state. A
+/// failed tick (e.g. `herdr agent list` erroring partway through) must not
+/// be saved: `tick` can advance some agents' cursors before returning Err,
+/// and persisting that half-applied state would silently drop messages for
+/// agents whose delivery never happened this round. The next successful
+/// tick re-derives from the last known-good state instead.
+fn tick_and_save(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) {
+    match tick(state, herd, dir) {
+        Ok(()) => {
+            if let Err(e) = crate::state::save(dir, state) {
+                report(dir, &format!("state save error: {e}"));
+            }
+        }
+        Err(e) => {
+            report(dir, &format!("tick error: {e}"));
+        }
+    }
+}
+
+pub fn run(dir: &Path) -> Result<()> {
+    if let Some(pid) = read_live_pid(dir) {
+        anyhow::bail!("daemon already running (pid {pid})");
+    }
+    std::fs::write(dir.join("daemon.pid"), std::process::id().to_string())?;
+    let term = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
+    log_line(dir, "daemon started");
+    let herd = crate::herd::RealHerd;
+    let mut state = crate::state::load(dir);
+    while !term.load(Ordering::Relaxed) {
+        tick_and_save(&mut state, &herd, dir);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    log_line(dir, "daemon stopped");
+    let _ = std::fs::remove_file(dir.join("daemon.pid"));
+    Ok(())
+}
+
+pub fn status(dir: &Path) {
+    match read_live_pid(dir) {
+        Some(pid) => println!("running (pid {pid})"),
+        None => println!("not running"),
+    }
+}
+
+pub fn stop(dir: &Path) -> Result<()> {
+    match read_live_pid(dir) {
+        Some(pid) => {
+            unsafe { libc_kill(pid as i32, 15) }; // SIGTERM
+            println!("sent SIGTERM to pid {pid}");
+            Ok(())
+        }
+        None => {
+            println!("not running");
+            Ok(())
+        }
+    }
+}
 
 pub fn intro_text(name: &str, members: &[AgentInfo], exe: &str) -> String {
     let others: Vec<&str> = members
@@ -87,7 +187,7 @@ pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Resu
                     state.introduced.insert(a.name.clone());
                 }
                 Err(e) => {
-                    eprintln!("[scuttlebutt] intro to {} failed: {e}", a.name);
+                    report(dir, &format!("[scuttlebutt] intro to {} failed: {e}", a.name));
                 }
             }
             // Status was read at the top of this tick; deliver the batch on
@@ -127,15 +227,21 @@ pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Resu
                 }
                 entry.0 += 1;
                 let fails = entry.0;
-                eprintln!(
-                    "[scuttlebutt] delivery to {} failed ({}/{MAX_BATCH_FAILURES}): {e}",
-                    a.name, fails
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] delivery to {} failed ({}/{MAX_BATCH_FAILURES}): {e}",
+                        a.name, fails
+                    ),
                 );
                 if fails >= MAX_BATCH_FAILURES {
-                    eprintln!(
-                        "[scuttlebutt] SKIPPING batch up to #{max_id} for {} after \
-                         {MAX_BATCH_FAILURES} failures",
-                        a.name
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] SKIPPING batch up to #{max_id} for {} after \
+                             {MAX_BATCH_FAILURES} failures",
+                            a.name
+                        ),
                     );
                     state.cursors.insert(a.name.clone(), max_id);
                     state.fail_counts.remove(&a.name);
@@ -157,6 +263,7 @@ mod tests {
         agents: Vec<AgentInfo>,
         prompts: RefCell<Vec<(String, String)>>,
         fail_prompts: bool,
+        fail_agents: bool,
     }
 
     impl FakeHerd {
@@ -172,12 +279,16 @@ mod tests {
                     .collect(),
                 prompts: RefCell::new(vec![]),
                 fail_prompts: false,
+                fail_agents: false,
             }
         }
     }
 
     impl HerdControl for FakeHerd {
         fn list_agents(&self) -> anyhow::Result<Vec<AgentInfo>> {
+            if self.fail_agents {
+                anyhow::bail!("herdr agent list failed");
+            }
             Ok(self.agents.clone())
         }
         fn prompt(&self, name: &str, text: &str) -> anyhow::Result<()> {
@@ -360,5 +471,43 @@ mod tests {
         tick(&mut state, &herd, dir.path()).unwrap();
         assert_eq!(state.cursors["reviewer"], 1);
         assert_eq!(state.fail_counts.get("reviewer"), None);
+    }
+
+    #[test]
+    fn read_live_pid_detects_own_process() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_live_pid(dir.path()), None);
+        std::fs::write(dir.path().join("daemon.pid"), std::process::id().to_string()).unwrap();
+        assert_eq!(read_live_pid(dir.path()), Some(std::process::id()));
+    }
+
+    #[test]
+    fn read_live_pid_ignores_stale_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        // pid 4194304 is above the default linux pid_max; nothing alive there
+        std::fs::write(dir.path().join("daemon.pid"), "4194304").unwrap();
+        assert_eq!(read_live_pid(dir.path()), None);
+    }
+
+    #[test]
+    fn tick_and_save_skips_save_when_tick_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        herd.fail_agents = true;
+        let mut state = DaemonState::default();
+        state.cursors.insert("reviewer".into(), 5);
+        tick_and_save(&mut state, &herd, dir.path());
+        // tick errored before touching state; nothing should be persisted,
+        // so a half-applied tick can never be written to state.json.
+        assert!(!dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn tick_and_save_persists_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = FakeHerd::new(vec![]);
+        let mut state = DaemonState::default();
+        tick_and_save(&mut state, &herd, dir.path());
+        assert!(dir.path().join("state.json").exists());
     }
 }

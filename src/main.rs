@@ -34,6 +34,12 @@ enum Cmd {
     },
     /// List room members
     Agents,
+    /// Run the delivery daemon in the foreground
+    Daemon,
+    /// Show daemon status
+    DaemonStatus,
+    /// Stop the daemon
+    DaemonStop,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,5 +49,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::Post { text, as_name } => cli::cmd_post(&herd, as_name.as_deref(), &text),
         Cmd::Read { since, limit } => cli::cmd_read(since, limit),
         Cmd::Agents => cli::cmd_agents(&herd),
+        Cmd::Daemon => daemon::run(&paths::room_dir()?),
+        Cmd::DaemonStatus => {
+            daemon::status(&paths::room_dir()?);
+            Ok(())
+        }
+        Cmd::DaemonStop => daemon::stop(&paths::room_dir()?),
     }
 }
