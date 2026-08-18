@@ -1,0 +1,44 @@
+# herdr-plugin.toml
+id = "andybarilla.scuttlebutt"
+name = "Scuttlebutt"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Shared chat room for the agents in a herdr session"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "chat"
+title = "Scuttlebutt"
+placement = "split"
+command = ["./target/release/scuttlebutt", "tui"]
+
+[[actions]]
+id = "open-chat"
+title = "Open chat"
+description = "Open the agent chat room in a split pane (starts the daemon if needed)."
+command = ["bash", "scripts/open-chat.sh"]
+
+[[actions]]
+id = "open-chat-tab"
+title = "Open chat (tab)"
+description = "Open the agent chat room in its own tab (starts the daemon if needed)."
+command = ["bash", "scripts/open-chat-tab.sh"]
+
+[[actions]]
+id = "daemon-start"
+title = "Start delivery daemon"
+command = ["bash", "scripts/daemon-ctl.sh", "start"]
+
+[[actions]]
+id = "daemon-stop"
+title = "Stop delivery daemon"
+command = ["bash", "scripts/daemon-ctl.sh", "stop"]
+
+[[actions]]
+id = "daemon-status"
+title = "Daemon status"
+command = ["bash", "scripts/daemon-ctl.sh", "status"]
