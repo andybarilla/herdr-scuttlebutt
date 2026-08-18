@@ -2,6 +2,7 @@ mod cli;
 mod herd;
 mod log_store;
 mod paths;
+mod state;
 
 use clap::{Parser, Subcommand};
 
