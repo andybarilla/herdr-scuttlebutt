@@ -7,7 +7,12 @@ use std::path::Path;
 pub struct DaemonState {
     pub cursors: HashMap<String, u64>,
     pub introduced: HashSet<String>,
-    pub fail_counts: HashMap<String, u32>,
+    /// (consecutive failure count, batch max message id) per agent.
+    #[serde(default)]
+    pub fail_counts: HashMap<String, (u32, u64)>,
+    /// Consecutive ticks an enrolled agent has been absent from `herdr agent list`.
+    #[serde(default)]
+    pub absences: HashMap<String, u32>,
 }
 
 pub fn load(dir: &Path) -> DaemonState {

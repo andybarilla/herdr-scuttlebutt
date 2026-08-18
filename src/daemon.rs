@@ -32,6 +32,10 @@ fn deliverable(status: &str) -> bool {
     status == "idle" || status == "done"
 }
 
+/// Consecutive absences from `herdr agent list` tolerated before an agent's
+/// state (cursor, intro flag, fail count) is purged.
+const MAX_ABSENCES: u32 = 3;
+
 pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Result<()> {
     let agents = herd.list_agents()?;
     let tail = log_store::last_id(dir)?;
@@ -39,15 +43,39 @@ pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Resu
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "scuttlebutt".to_string());
 
-    // enroll new, drop vanished
-    for a in &agents {
-        state.cursors.entry(a.name.clone()).or_insert(tail);
-    }
     let live: std::collections::HashSet<String> =
         agents.iter().map(|a| a.name.clone()).collect();
-    state.cursors.retain(|k, _| live.contains(k));
-    state.introduced.retain(|k| live.contains(k));
-    state.fail_counts.retain(|k, _| live.contains(k));
+
+    // enroll new agents (cursor starts at tail: no history dump) and clear
+    // any absence streak for agents that are present again.
+    for a in &agents {
+        state.cursors.entry(a.name.clone()).or_insert(tail);
+        state.absences.remove(&a.name);
+    }
+
+    // agents we have any state for but that are missing from this listing:
+    // tolerate transient absences, purge only after MAX_ABSENCES in a row.
+    let known: std::collections::HashSet<String> = state
+        .cursors
+        .keys()
+        .cloned()
+        .chain(state.introduced.iter().cloned())
+        .chain(state.fail_counts.keys().cloned())
+        .chain(state.absences.keys().cloned())
+        .collect();
+    for name in known {
+        if live.contains(&name) {
+            continue;
+        }
+        let count = state.absences.entry(name.clone()).or_insert(0);
+        *count += 1;
+        if *count >= MAX_ABSENCES {
+            state.cursors.remove(&name);
+            state.introduced.remove(&name);
+            state.fail_counts.remove(&name);
+            state.absences.remove(&name);
+        }
+    }
 
     for a in &agents {
         if !deliverable(&a.status) {
@@ -60,9 +88,12 @@ pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Resu
                 }
                 Err(e) => {
                     eprintln!("[scuttlebutt] intro to {} failed: {e}", a.name);
-                    continue;
                 }
             }
+            // Status was read at the top of this tick; deliver the batch on
+            // a later tick against a freshly-read status instead of
+            // double-prompting the agent while it's still busy with intro.
+            continue;
         }
         let cursor = state.cursors[&a.name];
         let pending = log_store::read_since(dir, cursor)?;
@@ -85,13 +116,22 @@ pub fn tick(state: &mut DaemonState, herd: &dyn HerdControl, dir: &Path) -> Resu
                 state.fail_counts.remove(&a.name);
             }
             Err(e) => {
-                let fails = state.fail_counts.entry(a.name.clone()).or_insert(0);
-                *fails += 1;
+                let entry = state
+                    .fail_counts
+                    .entry(a.name.clone())
+                    .or_insert((0, max_id));
+                if entry.1 != max_id {
+                    // A new message landed since the last failure: this is a
+                    // different batch, so the failure streak restarts.
+                    *entry = (0, max_id);
+                }
+                entry.0 += 1;
+                let fails = entry.0;
                 eprintln!(
                     "[scuttlebutt] delivery to {} failed ({}/{MAX_BATCH_FAILURES}): {e}",
                     a.name, fails
                 );
-                if *fails >= MAX_BATCH_FAILURES {
+                if fails >= MAX_BATCH_FAILURES {
                     eprintln!(
                         "[scuttlebutt] SKIPPING batch up to #{max_id} for {} after \
                          {MAX_BATCH_FAILURES} failures",
@@ -204,15 +244,64 @@ mod tests {
     }
 
     #[test]
+    fn mixed_batch_filters_own_messages_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "reviewer", "my own post").unwrap();
+        append(dir.path(), "human", "from someone else").unwrap();
+        tick(&mut state, &herd, dir.path()).unwrap();
+        let prompts = herd.prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].1.contains("from someone else"));
+        assert!(!prompts[0].1.contains("my own post"));
+        assert_eq!(state.cursors["reviewer"], 2);
+    }
+
+    #[test]
+    fn deliverable_includes_idle_and_done_excludes_others() {
+        assert!(deliverable("idle"));
+        assert!(deliverable("done"));
+        assert!(!deliverable("working"));
+        assert!(!deliverable("blocked"));
+        assert!(!deliverable("unknown"));
+    }
+
+    #[test]
     fn vanished_agent_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let herd = FakeHerd::new(vec![]);
         let mut state = DaemonState::default();
         state.cursors.insert("ghost".into(), 3);
         state.introduced.insert("ghost".into());
-        tick(&mut state, &herd, dir.path()).unwrap();
+        // MAX_ABSENCES consecutive misses purge the agent's state.
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &herd, dir.path()).unwrap();
+        }
         assert!(state.cursors.is_empty());
         assert!(state.introduced.is_empty());
+    }
+
+    #[test]
+    fn transient_absence_keeps_state_and_skips_reintroduction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 5);
+
+        // reviewer is missing from the listing for a single tick
+        let herd_absent = FakeHerd::new(vec![]);
+        tick(&mut state, &herd_absent, dir.path()).unwrap();
+        assert_eq!(state.cursors.get("reviewer"), Some(&5));
+        assert!(state.introduced.contains("reviewer"));
+
+        // reviewer reappears before hitting the absence cap: no re-intro
+        let herd_back = FakeHerd::new(vec![("reviewer", "idle")]);
+        tick(&mut state, &herd_back, dir.path()).unwrap();
+        assert!(herd_back.prompts.borrow().is_empty());
+        assert_eq!(state.cursors.get("reviewer"), Some(&5));
     }
 
     #[test]
@@ -224,12 +313,39 @@ mod tests {
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..(MAX_BATCH_FAILURES - 1) {
             tick(&mut state, &herd, dir.path()).unwrap();
         }
-        // after 5 consecutive failures the batch is skipped
+        // not yet at the cap: the batch is still pending, cursor unmoved
+        assert_eq!(state.cursors["reviewer"], 0);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+
+        tick(&mut state, &herd, dir.path()).unwrap();
+        // after the 5th consecutive failure the batch is skipped
         assert_eq!(state.cursors["reviewer"], 1);
         assert_eq!(state.fail_counts.get("reviewer"), None);
+    }
+
+    #[test]
+    fn new_message_resets_fail_streak_for_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        herd.fail_prompts = true;
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "one").unwrap();
+        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+            tick(&mut state, &herd, dir.path()).unwrap();
+        }
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+
+        // a new message grows the batch: this is not the same batch anymore
+        append(dir.path(), "human", "two").unwrap();
+        tick(&mut state, &herd, dir.path()).unwrap();
+        // streak restarted at 1, well under the cap, so nothing was skipped
+        assert_eq!(state.cursors["reviewer"], 0);
+        assert_eq!(state.fail_counts["reviewer"].0, 1);
     }
 
     #[test]
@@ -239,7 +355,7 @@ mod tests {
         let mut state = DaemonState::default();
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
-        state.fail_counts.insert("reviewer".into(), 3);
+        state.fail_counts.insert("reviewer".into(), (3, 1));
         append(dir.path(), "human", "hello").unwrap();
         tick(&mut state, &herd, dir.path()).unwrap();
         assert_eq!(state.cursors["reviewer"], 1);
