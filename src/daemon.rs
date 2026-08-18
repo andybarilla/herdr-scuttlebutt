@@ -1393,6 +1393,8 @@ mod tests {
                 &room_dir,
             );
         }
+        let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
+        assert!(log.contains("enrolling in acme"), "{log}");
         assert!(
             herd.prompts.borrow().iter().any(|(n, _)| n == "b1"),
             "b1 was never enrolled after acme was added: {:?}",
