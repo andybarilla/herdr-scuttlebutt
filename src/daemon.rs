@@ -72,14 +72,17 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
-/// Collapses newlines to spaces. Message bodies and sender names are
-/// rendered into a line-oriented prompt envelope (`[#id] from: text`), and
+/// Collapses C0 control characters to spaces. Message bodies and sender names
+/// are rendered into a line-oriented prompt envelope (`[#id] from: text`), and
 /// JSON storage preserves a `\n` that `format!` then re-expands — so without
 /// this a body could start a line at column 0 and forge extra entries or a
-/// whole fake `[scuttlebutt]` block in every other agent's prompt.
+/// whole fake `[scuttlebutt]` block in every other agent's prompt. The range
+/// rather than just `\n`/`\r` because the envelope is handed to `herdr agent
+/// prompt`, which types it into a live terminal: an ESC in the body would
+/// otherwise be replayed there as an escape sequence.
 fn one_line(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
         .collect()
 }
 
@@ -218,12 +221,18 @@ impl HerdControl for ScopedHerd<'_> {
 /// the real session layout; `run` passes `paths::room_dir`.
 fn run_once(
     herd: &dyn HerdControl,
-    grouping: &Grouping,
+    load_grouping: &dyn Fn() -> Grouping,
     filter: &AgentFilter,
     session: &Path,
-    announced: &mut bool,
+    last_shape: &mut Option<String>,
     room_dir: &dyn Fn(Option<&str>) -> Result<PathBuf>,
 ) {
+    // Reloaded every pass, because everything else reads groups.toml fresh:
+    // a daemon on a startup snapshot would keep enrolling nobody after the
+    // config is fixed, while `scuttlebutt groups` reports it healthy. A
+    // half-written file reads as `Broken` for one tick, which is fail-closed
+    // and costs nothing — no cursor advances.
+    let grouping = &load_grouping();
     let all = match herd.list_agents() {
         Ok(all) => all,
         Err(e) => {
@@ -235,10 +244,23 @@ fn run_once(
     // admitted agents.
     let admitted: Vec<AgentInfo> = all.into_iter().filter(|a| filter.admits(&a.name)).collect();
     let (buckets, skipped) = partition(&admitted, grouping);
-    // Announce on the first listing that holds anyone: an empty first tick
-    // (agents not started yet) must not consume the announcement and leave the
-    // enrolment set unlogged.
-    if !*announced && !admitted.is_empty() {
+    // Log the mapping whenever the shape of the grouping changes — the config
+    // is reloaded every pass, so a group can appear or vanish and a broken
+    // config can be fixed mid-run. Announcing only on the first listing that
+    // holds anyone: an empty first tick (agents not started yet) must not
+    // consume the announcement and leave the enrolment set unlogged.
+    let shape = match grouping {
+        Grouping::Inactive => "inactive".to_string(),
+        Grouping::Active(r) => format!("active:{}", r.names().join(",")),
+        Grouping::Broken(msg) => format!("broken:{msg}"),
+    };
+    if !admitted.is_empty() && last_shape.as_deref() != Some(shape.as_str()) {
+        if let Grouping::Broken(msg) = grouping {
+            report(
+                session,
+                &format!("GROUPS CONFIG BROKEN — enrolling nobody: {msg}"),
+            );
+        }
         for (g, members) in &buckets {
             let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
             log_line(
@@ -257,7 +279,7 @@ fn run_once(
             };
             log_line(session, &format!("skipping {}: {why}", a.name));
         }
-        *announced = true;
+        *last_shape = Some(shape);
     }
     for (group, members) in buckets {
         let dir = match room_dir(group.as_deref()) {
@@ -339,14 +361,14 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     let herd = crate::herd::RealHerd;
     // Name the enrolment set up front: starting this in a busy session
     // otherwise reveals its blast radius only through prompted agents.
-    let mut announced = false;
+    let mut last_shape = None;
     while !term.load(Ordering::Relaxed) {
         run_once(
             &herd,
-            &grouping,
+            &|| groups::load(&base),
             filter,
             session,
-            &mut announced,
+            &mut last_shape,
             &|g| crate::paths::room_dir(g),
         );
         // Sleep for the 2s tick interval in 100ms slices, checking the term
@@ -435,6 +457,10 @@ const MAX_ABSENCES: u32 = 3;
 /// from being permanently marked introduced without ever seeing the intro.
 const REQUIRED_SIGHTINGS: u32 = 2;
 
+/// `filter` is vestigial in production: `run_once` applies the agent filter
+/// once, before partitioning, so the only production call site passes
+/// `AgentFilter::default()`. It survives because the tests drive `tick`
+/// directly. There is no second filter pass.
 pub fn tick(
     state: &mut DaemonState,
     herd: &dyn HerdControl,
@@ -858,6 +884,9 @@ mod tests {
     fn one_line_collapses_newlines() {
         assert_eq!(one_line("a\nb"), "a b");
         assert_eq!(one_line("a\r\nb"), "a  b");
+        // an ESC would otherwise reach another agent's terminal verbatim
+        assert_eq!(one_line("a\x1b[31mb"), "a [31mb");
+        assert_eq!(one_line("a\tb"), "a b");
         assert_eq!(one_line("plain"), "plain");
     }
 
@@ -1114,6 +1143,17 @@ mod tests {
     }
 
     #[test]
+    fn partition_skips_agents_with_no_cwd() {
+        // herdr omits `cwd` for some panes and `parse_agent_list` maps that to
+        // "", so this is real input, not a hypothetical.
+        let agents = vec![agent_at("nocwd", "", "idle")];
+        let (buckets, skipped) = partition(&agents, &two_group_rules());
+        assert!(buckets.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "nocwd");
+    }
+
+    #[test]
     fn partition_inactive_puts_everyone_in_one_ungrouped_bucket() {
         let agents = vec![
             agent_at("a1", "/w/alare/api", "idle"),
@@ -1257,8 +1297,7 @@ mod tests {
             fail_prompts: false,
             fail_agents: false,
         };
-        let grouping = two_group_rules();
-        let mut announced = false;
+        let mut last_shape = None;
         let filter = AgentFilter::default();
 
         // Enrol and introduce: cursors start at each room's tail, so the
@@ -1266,10 +1305,10 @@ mod tests {
         for _ in 0..REQUIRED_SIGHTINGS {
             run_once(
                 &herd,
-                &grouping,
+                &two_group_rules,
                 &filter,
                 &session,
-                &mut announced,
+                &mut last_shape,
                 &room_dir,
             );
         }
@@ -1277,10 +1316,10 @@ mod tests {
         append(&room_dir(Some("acme")).unwrap(), "human", "acme secret").unwrap();
         run_once(
             &herd,
-            &grouping,
+            &two_group_rules,
             &filter,
             &session,
-            &mut announced,
+            &mut last_shape,
             &room_dir,
         );
 
@@ -1305,6 +1344,63 @@ mod tests {
     }
 
     #[test]
+    fn config_change_takes_effect_on_the_next_pass() {
+        // the daemon must not run on a startup snapshot: a group added to
+        // groups.toml has to start receiving without a restart.
+        let base = tempfile::tempdir().unwrap();
+        let cfg = base.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let write_cfg = |body: &str| std::fs::write(cfg.join("groups.toml"), body).unwrap();
+        write_cfg("[groups]\nalare = [\"/w/alare\"]\n");
+        let rooms = base.path().to_path_buf();
+        let room_dir = |g: Option<&str>| -> Result<std::path::PathBuf> {
+            let d = rooms.join(g.unwrap_or("ungrouped"));
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        };
+        let herd = FakeHerd {
+            agents: vec![
+                agent_at("a1", "/w/alare/api", "idle"),
+                agent_at("b1", "/w/acme/web", "idle"),
+            ],
+            prompts: RefCell::new(vec![]),
+            fail_prompts: false,
+            fail_agents: false,
+        };
+        let cfg_dir = cfg.clone();
+        let load = move || crate::groups::load(&cfg_dir);
+        let mut last_shape = None;
+        for _ in 0..REQUIRED_SIGHTINGS {
+            run_once(
+                &herd,
+                &load,
+                &AgentFilter::default(),
+                base.path(),
+                &mut last_shape,
+                &room_dir,
+            );
+        }
+        assert!(!herd.prompts.borrow().iter().any(|(n, _)| n == "b1"));
+
+        write_cfg("[groups]\nalare = [\"/w/alare\"]\nacme = [\"/w/acme\"]\n");
+        for _ in 0..REQUIRED_SIGHTINGS {
+            run_once(
+                &herd,
+                &load,
+                &AgentFilter::default(),
+                base.path(),
+                &mut last_shape,
+                &room_dir,
+            );
+        }
+        assert!(
+            herd.prompts.borrow().iter().any(|(n, _)| n == "b1"),
+            "b1 was never enrolled after acme was added: {:?}",
+            herd.prompts.borrow()
+        );
+    }
+
+    #[test]
     fn routing_with_a_broken_config_prompts_nobody() {
         let base = tempfile::tempdir().unwrap();
         let rooms = base.path().to_path_buf();
@@ -1319,15 +1415,14 @@ mod tests {
             fail_prompts: false,
             fail_agents: false,
         };
-        let grouping = Grouping::Broken("bad".into());
-        let mut announced = false;
+        let mut last_shape = None;
         for _ in 0..REQUIRED_SIGHTINGS + 1 {
             run_once(
                 &herd,
-                &grouping,
+                &|| Grouping::Broken("bad".into()),
                 &AgentFilter::default(),
                 base.path(),
-                &mut announced,
+                &mut last_shape,
                 &room_dir,
             );
         }
