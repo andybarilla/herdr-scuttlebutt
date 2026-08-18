@@ -79,6 +79,7 @@ pub fn load(base: &Path) -> Grouping {
         ));
     }
     let mut rules = Vec::new();
+    let mut seen: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (name, prefixes) in raw.groups {
         if !valid_group_name(&name) {
             return Grouping::Broken(format!(
@@ -97,6 +98,24 @@ pub fn load(base: &Path) -> Grouping {
                      a rule that matches every path would merge every agent into one group",
                     path.display()
                 ));
+            }
+            if !normalized.is_absolute() {
+                return Grouping::Broken(format!(
+                    "{}: group {name:?} has a relative prefix {p:?}; \
+                     prefixes are matched against absolute working directories \
+                     and a relative one can never match",
+                    path.display()
+                ));
+            }
+            if let Some(owner) = seen.get(&normalized) {
+                if owner != &name {
+                    return Grouping::Broken(format!(
+                        "{}: prefix {p:?} is claimed by both {owner:?} and {name:?}",
+                        path.display()
+                    ));
+                }
+            } else {
+                seen.insert(normalized.clone(), name.clone());
             }
             rules.push((name.clone(), normalized));
         }
@@ -284,5 +303,49 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(load(dir.path()), Grouping::Broken(_)));
+    }
+
+    #[test]
+    fn duplicate_prefix_across_groups_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/home/a/dev/x\"]\nbeta = [\"/home/a/dev/x\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Grouping::Broken(_)));
+    }
+
+    #[test]
+    fn duplicate_prefix_within_same_group_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"/home/a/dev/x\", \"/home/a/dev/x\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Grouping::Active(_)));
+    }
+
+    #[test]
+    fn relative_prefix_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"dev/alare\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Grouping::Broken(_)));
+    }
+
+    #[test]
+    fn tilde_prefix_is_still_active() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nalare = [\"~/dev/alare\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Grouping::Active(_)));
     }
 }
