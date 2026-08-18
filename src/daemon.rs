@@ -109,6 +109,12 @@ pub fn read_live_pid(dir: &Path) -> Option<u32> {
 /// dir, and deriving from it would scatter delivery failures into
 /// `<session>/<group>/daemon.log` where nobody tails them. `run` sets this once
 /// at startup; unset (CLI, tests) the caller's dir is used.
+///
+/// This is process-global and can only be set once, so NO unit test may call
+/// `daemon::run`: the first that did would redirect every later `report` in the
+/// same `cargo test` process and break `state.rs`'s `daemon.log` assertions in a
+/// way that looks unrelated. `run_once` never touches it, and is the seam tests
+/// drive instead.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub(crate) fn log_line(dir: &Path, line: &str) {
@@ -193,7 +199,7 @@ pub fn partition<'a>(
 /// knowledge of grouping: it still sees "the agents" and prompts through the
 /// real herd.
 struct ScopedHerd<'a> {
-    inner: &'a crate::herd::RealHerd,
+    inner: &'a dyn HerdControl,
     members: Vec<AgentInfo>,
 }
 
@@ -203,6 +209,83 @@ impl HerdControl for ScopedHerd<'_> {
     }
     fn prompt(&self, name: &str, text: &str) -> Result<()> {
         self.inner.prompt(name, text)
+    }
+}
+
+/// One pass of the delivery loop: list agents once, apply the filter once,
+/// split them into per-group buckets and run `tick` against each bucket's own
+/// room. `room_dir` is injected so the routing can be driven in tests without
+/// the real session layout; `run` passes `paths::room_dir`.
+fn run_once(
+    herd: &dyn HerdControl,
+    grouping: &Grouping,
+    filter: &AgentFilter,
+    session: &Path,
+    announced: &mut bool,
+    room_dir: &dyn Fn(Option<&str>) -> Result<PathBuf>,
+) {
+    let all = match herd.list_agents() {
+        Ok(all) => all,
+        Err(e) => {
+            report(session, &format!("agent list error: {e}"));
+            return;
+        }
+    };
+    // The filter applies once, here: every bucket below is already narrowed to
+    // admitted agents.
+    let admitted: Vec<AgentInfo> = all.into_iter().filter(|a| filter.admits(&a.name)).collect();
+    let (buckets, skipped) = partition(&admitted, grouping);
+    // Announce on the first listing that holds anyone: an empty first tick
+    // (agents not started yet) must not consume the announcement and leave the
+    // enrolment set unlogged.
+    if !*announced && !admitted.is_empty() {
+        for (g, members) in &buckets {
+            let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+            log_line(
+                session,
+                &format!(
+                    "enrolling in {}: {}",
+                    g.as_deref().unwrap_or("(ungrouped room)"),
+                    names.join(", ")
+                ),
+            );
+        }
+        for a in &skipped {
+            let why = match grouping {
+                Grouping::Broken(_) => "the groups config is broken".to_string(),
+                _ => format!("cwd {} matches no group", a.cwd),
+            };
+            log_line(session, &format!("skipping {}: {why}", a.name));
+        }
+        *announced = true;
+    }
+    for (group, members) in buckets {
+        let dir = match room_dir(group.as_deref()) {
+            Ok(d) => d,
+            Err(e) => {
+                report(session, &format!("room dir error: {e}"));
+                continue;
+            }
+        };
+        // Reloaded every pass because the live group set changes between
+        // passes: a bucket can appear, vanish and reappear as agents move, so
+        // there is no single in-memory state to carry. Consequence: while
+        // `state::save` keeps failing (disk full, permissions) each pass
+        // re-derives from the last state that reached disk, so the same batch
+        // is delivered again every pass and `fail_counts` never survives to
+        // reach the 5-failure cap.
+        let mut st = crate::state::load(&dir);
+        let scoped = ScopedHerd {
+            inner: herd,
+            members,
+        };
+        tick_and_save(
+            &mut st,
+            &scoped,
+            &dir,
+            &AgentFilter::default(),
+            group.as_deref(),
+        );
     }
 }
 
@@ -258,65 +341,14 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     // otherwise reveals its blast radius only through prompted agents.
     let mut announced = false;
     while !term.load(Ordering::Relaxed) {
-        match herd.list_agents() {
-            Ok(all) => {
-                // The filter applies once, here: every bucket below is already
-                // narrowed to admitted agents.
-                let admitted: Vec<AgentInfo> =
-                    all.into_iter().filter(|a| filter.admits(&a.name)).collect();
-                let (buckets, skipped) = partition(&admitted, &grouping);
-                // Announce on the first listing that holds anyone: an empty
-                // first tick (agents not started yet) must not consume the
-                // announcement and leave the enrolment set unlogged.
-                if !announced && !admitted.is_empty() {
-                    for (g, members) in &buckets {
-                        let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
-                        log_line(
-                            session,
-                            &format!(
-                                "enrolling in {}: {}",
-                                g.as_deref().unwrap_or("(ungrouped room)"),
-                                names.join(", ")
-                            ),
-                        );
-                    }
-                    for a in &skipped {
-                        let why = match &grouping {
-                            Grouping::Broken(_) => "the groups config is broken".to_string(),
-                            _ => format!("cwd {} matches no group", a.cwd),
-                        };
-                        log_line(session, &format!("skipping {}: {why}", a.name));
-                    }
-                    announced = true;
-                }
-                for (group, members) in buckets {
-                    let dir = match crate::paths::room_dir(group.as_deref()) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            report(session, &format!("room dir error: {e}"));
-                            continue;
-                        }
-                    };
-                    // State is reloaded per tick because the set of live groups
-                    // changes as agents come and go; it also makes
-                    // tick_and_save's "re-derive from the last known-good
-                    // state" actually true after a failed tick.
-                    let mut st = crate::state::load(&dir);
-                    let scoped = ScopedHerd {
-                        inner: &herd,
-                        members,
-                    };
-                    tick_and_save(
-                        &mut st,
-                        &scoped,
-                        &dir,
-                        &AgentFilter::default(),
-                        group.as_deref(),
-                    );
-                }
-            }
-            Err(e) => report(session, &format!("agent list error: {e}")),
-        }
+        run_once(
+            &herd,
+            &grouping,
+            filter,
+            session,
+            &mut announced,
+            &|g| crate::paths::room_dir(g),
+        );
         // Sleep for the 2s tick interval in 100ms slices, checking the term
         // flag between slices, so a signal arriving mid-interval is acted on
         // within ~100ms instead of waiting out the full 2s.
@@ -1197,5 +1229,109 @@ mod tests {
         assert!(herd_a.prompts.borrow()[0].1.contains("alare secret"));
         assert!(herd_b.prompts.borrow().is_empty());
         assert_eq!(crate::log_store::read_since(&acme, 0).unwrap().len(), 0);
+    }
+
+    /// The feature's central property, exercised through the real routing path
+    /// (`partition` -> `ScopedHerd` -> `tick`) rather than by handing `tick`
+    /// two dirs by hand. One herd, two agents in different groups, two rooms:
+    /// neither agent may ever see the other room's message. Resolving both
+    /// buckets to one dir turns this red.
+    #[test]
+    fn routing_keeps_each_group_to_its_own_room() {
+        let base = tempfile::tempdir().unwrap();
+        let session = base.path().join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let rooms = base.path().to_path_buf();
+        let room_dir = |g: Option<&str>| -> Result<std::path::PathBuf> {
+            let d = rooms.join(g.unwrap_or("ungrouped"));
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        };
+
+        let herd = FakeHerd {
+            agents: vec![
+                agent_at("a1", "/w/alare/api", "idle"),
+                agent_at("b1", "/w/acme/web", "idle"),
+            ],
+            prompts: RefCell::new(vec![]),
+            fail_prompts: false,
+            fail_agents: false,
+        };
+        let grouping = two_group_rules();
+        let mut announced = false;
+        let filter = AgentFilter::default();
+
+        // Enrol and introduce: cursors start at each room's tail, so the
+        // messages must be posted after this.
+        for _ in 0..REQUIRED_SIGHTINGS {
+            run_once(
+                &herd,
+                &grouping,
+                &filter,
+                &session,
+                &mut announced,
+                &room_dir,
+            );
+        }
+        append(&room_dir(Some("alare")).unwrap(), "human", "alare secret").unwrap();
+        append(&room_dir(Some("acme")).unwrap(), "human", "acme secret").unwrap();
+        run_once(
+            &herd,
+            &grouping,
+            &filter,
+            &session,
+            &mut announced,
+            &room_dir,
+        );
+
+        let prompts = herd.prompts.borrow();
+        let text_for = |name: &str| -> String {
+            prompts
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let a1 = text_for("a1");
+        let b1 = text_for("b1");
+        assert!(a1.contains("alare secret"), "a1 saw: {a1}");
+        assert!(!a1.contains("acme secret"), "a1 saw: {a1}");
+        assert!(b1.contains("acme secret"), "b1 saw: {b1}");
+        assert!(!b1.contains("alare secret"), "b1 saw: {b1}");
+        // each agent's intro names its own group only
+        assert!(a1.contains("the alare group") && !a1.contains("the acme group"));
+        assert!(b1.contains("the acme group") && !b1.contains("the alare group"));
+    }
+
+    #[test]
+    fn routing_with_a_broken_config_prompts_nobody() {
+        let base = tempfile::tempdir().unwrap();
+        let rooms = base.path().to_path_buf();
+        let room_dir = |g: Option<&str>| -> Result<std::path::PathBuf> {
+            let d = rooms.join(g.unwrap_or("ungrouped"));
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        };
+        let herd = FakeHerd {
+            agents: vec![agent_at("a1", "/w/alare/api", "idle")],
+            prompts: RefCell::new(vec![]),
+            fail_prompts: false,
+            fail_agents: false,
+        };
+        let grouping = Grouping::Broken("bad".into());
+        let mut announced = false;
+        for _ in 0..REQUIRED_SIGHTINGS + 1 {
+            run_once(
+                &herd,
+                &grouping,
+                &AgentFilter::default(),
+                base.path(),
+                &mut announced,
+                &room_dir,
+            );
+        }
+        assert!(herd.prompts.borrow().is_empty());
+        assert!(!rooms.join("ungrouped").exists());
     }
 }
