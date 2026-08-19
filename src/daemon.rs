@@ -165,6 +165,16 @@ fn tick_and_save(
     }
 }
 
+/// What the daemon has already said about the current config: which rooms it
+/// announced and which agents it reported excluded. Reset when the config
+/// changes.
+#[derive(Default)]
+pub struct Announced {
+    config_shape: Option<String>,
+    rooms: std::collections::HashSet<Option<String>>,
+    skipped: std::collections::HashSet<String>,
+}
+
 /// Per-group buckets ordered by group name; the `None` key is the ungrouped
 /// room used when grouping is inactive.
 type Buckets = Vec<(Option<String>, Vec<AgentInfo>)>;
@@ -227,7 +237,7 @@ fn run_once(
     load_grouping: &dyn Fn() -> Grouping,
     filter: &AgentFilter,
     session: &Path,
-    last_shape: &mut Option<String>,
+    announced: &mut Announced,
     room_dir: &dyn Fn(Option<&str>) -> Result<PathBuf>,
     orgs: &mut crate::git_org::OrgCache,
 ) {
@@ -258,43 +268,47 @@ fn run_once(
         Grouping::Active(r) => format!("active:{}", r.names().join(",")),
         Grouping::Broken(msg) => format!("broken:{msg}"),
     };
-    // The live room set is part of the shape, not just the config: org-derived
-    // rooms appear when their first agent starts, under a config that never
-    // changed, and an unannounced room is one nobody knows to open.
-    let shape = format!(
-        "{config_shape}|{}",
-        buckets
-            .iter()
-            .map(|(g, _)| g.as_deref().unwrap_or("(ungrouped room)"))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    if !admitted.is_empty() && last_shape.as_deref() != Some(shape.as_str()) {
-        if let Grouping::Broken(msg) = grouping {
-            report(
-                session,
-                &format!("GROUPS CONFIG BROKEN — enrolling nobody: {msg}"),
-            );
+    // Announce each room and each exclusion once, rather than re-logging the
+    // whole enrolment set whenever it changes: rooms appear and vanish all day
+    // as agents start and finish, and org-derived rooms appear under a config
+    // that never changed. A config change resets the bookkeeping, because then
+    // every membership is worth restating. Nothing is announced off an empty
+    // listing (agents not started yet), which would otherwise consume the
+    // announcement and leave the enrolment set unlogged.
+    if !admitted.is_empty() {
+        if announced.config_shape.as_deref() != Some(config_shape.as_str()) {
+            if let Grouping::Broken(msg) = grouping {
+                report(
+                    session,
+                    &format!("GROUPS CONFIG BROKEN — enrolling nobody: {msg}"),
+                );
+            }
+            announced.config_shape = Some(config_shape);
+            announced.rooms.clear();
+            announced.skipped.clear();
         }
         for (g, members) in &buckets {
-            let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
-            log_line(
-                session,
-                &format!(
-                    "enrolling in {}: {}",
-                    g.as_deref().unwrap_or("(ungrouped room)"),
-                    names.join(", ")
-                ),
-            );
+            if announced.rooms.insert(g.clone()) {
+                let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+                log_line(
+                    session,
+                    &format!(
+                        "enrolling in {}: {}",
+                        g.as_deref().unwrap_or("(ungrouped room)"),
+                        names.join(", ")
+                    ),
+                );
+            }
         }
         for a in &skipped {
-            let why = match grouping {
-                Grouping::Broken(_) => "the groups config is broken".to_string(),
-                _ => format!("cwd {} matches no group", a.cwd),
-            };
-            log_line(session, &format!("skipping {}: {why}", a.name));
+            if announced.skipped.insert(a.name.clone()) {
+                let why = match grouping {
+                    Grouping::Broken(_) => "the groups config is broken".to_string(),
+                    _ => format!("cwd {} matches no group", a.cwd),
+                };
+                log_line(session, &format!("skipping {}: {why}", a.name));
+            }
         }
-        *last_shape = Some(shape);
     }
     for (group, members) in buckets {
         let dir = match room_dir(group.as_deref()) {
@@ -377,16 +391,14 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     // Outlives the loop so a repo's origin is read once per cwd, not once per
     // agent per 2s tick.
     let mut orgs = crate::git_org::OrgCache::default();
-    // Name the enrolment set up front: starting this in a busy session
-    // otherwise reveals its blast radius only through prompted agents.
-    let mut last_shape = None;
+    let mut announced = Announced::default();
     while !term.load(Ordering::Relaxed) {
         run_once(
             &herd,
             &|| groups::load(&base),
             filter,
             session,
-            &mut last_shape,
+            &mut announced,
             &|g| crate::paths::room_dir(g),
             &mut orgs,
         );
@@ -1419,7 +1431,7 @@ mod tests {
             fail_prompts: false,
             fail_agents: false,
         };
-        let mut last_shape = None;
+        let mut announced = Announced::default();
         let filter = AgentFilter::default();
 
         // Enrol and introduce: cursors start at each room's tail, so the
@@ -1430,7 +1442,7 @@ mod tests {
                 &two_group_rules,
                 &filter,
                 &session,
-                &mut last_shape,
+                &mut announced,
                 &room_dir,
                 &mut orgs(no_org),
             );
@@ -1442,7 +1454,7 @@ mod tests {
             &two_group_rules,
             &filter,
             &session,
-            &mut last_shape,
+            &mut announced,
             &room_dir,
             &mut orgs(no_org),
         );
@@ -1493,14 +1505,14 @@ mod tests {
         };
         let cfg_dir = cfg.clone();
         let load = move || crate::groups::load(&cfg_dir);
-        let mut last_shape = None;
+        let mut announced = Announced::default();
         for _ in 0..REQUIRED_SIGHTINGS {
             run_once(
                 &herd,
                 &load,
                 &AgentFilter::default(),
                 base.path(),
-                &mut last_shape,
+                &mut announced,
                 &room_dir,
                 &mut orgs(no_org),
             );
@@ -1514,7 +1526,7 @@ mod tests {
                 &load,
                 &AgentFilter::default(),
                 base.path(),
-                &mut last_shape,
+                &mut announced,
                 &room_dir,
                 &mut orgs(no_org),
             );
@@ -1540,7 +1552,7 @@ mod tests {
             std::fs::create_dir_all(&d)?;
             Ok(d)
         };
-        let mut last_shape = None;
+        let mut announced = Announced::default();
         let mut cache = orgs(fake_org);
         let mut run = |herd: &FakeHerd| {
             run_once(
@@ -1548,7 +1560,7 @@ mod tests {
                 &|| Grouping::Inactive,
                 &AgentFilter::default(),
                 base.path(),
-                &mut last_shape,
+                &mut announced,
                 &room_dir,
                 &mut cache,
             );
@@ -1574,6 +1586,44 @@ mod tests {
     }
 
     #[test]
+    fn a_room_that_comes_back_is_not_re_announced() {
+        // rooms appear and vanish as agents start and finish; re-logging the
+        // whole enrolment set each time buries the log in repeats
+        let base = tempfile::tempdir().unwrap();
+        let rooms = base.path().to_path_buf();
+        let room_dir = |g: Option<&str>| -> Result<std::path::PathBuf> {
+            let d = rooms.join(g.unwrap_or("ungrouped"));
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        };
+        let mut announced = Announced::default();
+        let mut cache = orgs(fake_org);
+        let mut run = |cwds: &[(&str, &str)]| {
+            let herd = FakeHerd {
+                agents: cwds.iter().map(|(n, c)| agent_at(n, c, "idle")).collect(),
+                prompts: RefCell::new(vec![]),
+                fail_prompts: false,
+                fail_agents: false,
+            };
+            run_once(
+                &herd,
+                &|| Grouping::Inactive,
+                &AgentFilter::default(),
+                base.path(),
+                &mut announced,
+                &room_dir,
+                &mut cache,
+            );
+        };
+        run(&[("a1", "/w/alare/api")]);
+        run(&[("a1", "/w/alare/api"), ("b1", "/w/acme/web")]);
+        run(&[("a1", "/w/alare/api")]);
+        let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
+        assert_eq!(log.matches("enrolling in alare").count(), 1, "{log}");
+        assert_eq!(log.matches("enrolling in acme").count(), 1, "{log}");
+    }
+
+    #[test]
     fn routing_with_a_broken_config_prompts_nobody() {
         let base = tempfile::tempdir().unwrap();
         let rooms = base.path().to_path_buf();
@@ -1588,14 +1638,14 @@ mod tests {
             fail_prompts: false,
             fail_agents: false,
         };
-        let mut last_shape = None;
+        let mut announced = Announced::default();
         for _ in 0..REQUIRED_SIGHTINGS + 1 {
             run_once(
                 &herd,
                 &|| Grouping::Broken("bad".into()),
                 &AgentFilter::default(),
                 base.path(),
-                &mut last_shape,
+                &mut announced,
                 &room_dir,
                 &mut orgs(no_org),
             );

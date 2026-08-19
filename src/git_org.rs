@@ -254,6 +254,29 @@ mod tests {
     }
 
     #[test]
+    fn every_derived_name_is_a_legal_group_name() {
+        // derived names become directory names and are compared against
+        // configured groups, so they must satisfy the same rule
+        for url in [
+            "git@github.com:AcmeCorp/api.git",
+            "https://gitlab.com/AcmeCorp/web",
+            "ssh://git@host:22/Owner/sub/repo.git",
+            "https://user:token@github.com/Acme_Corp/x.git",
+            "https://host/Acme.Corp/x.git",
+            "git@host:~andy/thing.git",
+            "https://host/../x.git",
+            "https://host/Ä/x.git",
+        ] {
+            if let Some(name) = org_from_url(url) {
+                assert!(
+                    crate::groups::valid_group_name(&name),
+                    "{url} derived illegal name {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_local_path_remote_has_no_owner() {
         assert_eq!(org_from_url("/srv/git/bare.git"), None);
         assert_eq!(org_from_url("../sibling"), None);
