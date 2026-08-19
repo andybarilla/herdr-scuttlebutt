@@ -61,6 +61,9 @@ enum Cmd {
     DaemonStatus,
     /// Stop the daemon
     DaemonStop,
+    /// Print the focused workspace's checkout path (used by the pane scripts)
+    #[command(hide = true)]
+    SessionCwd,
     /// Open the chat TUI
     Tui {
         /// Target this group instead of resolving from the calling cwd
@@ -99,6 +102,10 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
+        Cmd::SessionCwd => {
+            println!("{}", herd::focused_cwd()?);
+            Ok(())
+        }
         Cmd::Tui { group } => tui::run(group.as_deref()),
     }
 }

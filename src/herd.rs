@@ -31,6 +31,35 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<AgentInfo>> {
         .collect())
 }
 
+/// The checkout path of the focused workspace, from `herdr workspace list`.
+/// Plugin actions run from the plugin's own directory, so this — not `$PWD` —
+/// is where the human actually is when they open the chat pane.
+pub fn parse_focused_cwd(json: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(json).context("parsing workspace list JSON")?;
+    let workspaces = v["result"]["workspaces"]
+        .as_array()
+        .context("missing .result.workspaces")?;
+    workspaces
+        .iter()
+        .find(|w| w["focused"].as_bool().unwrap_or(false))
+        .and_then(|w| w["worktree"]["checkout_path"].as_str())
+        .map(str::to_string)
+        .context("no focused workspace with a checkout path")
+}
+
+pub fn focused_cwd() -> Result<String> {
+    let out = std::process::Command::new("herdr")
+        .args(["workspace", "list"])
+        .output()
+        .context("running `herdr workspace list`")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "herdr workspace list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parse_focused_cwd(&String::from_utf8(out.stdout)?)
+}
+
 pub struct RealHerd;
 
 impl HerdControl for RealHerd {
@@ -97,5 +126,35 @@ mod tests {
     fn missing_cwd_is_empty_not_an_error() {
         let agents = parse_agent_list(FIXTURE).unwrap();
         assert_eq!(agents[1].cwd, "");
+    }
+
+    const WORKSPACES: &str = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[
+        {"focused":false,"workspace_id":"w2C","worktree":{"checkout_path":"/home/andy/dev/alare-leadership/alare"}},
+        {"focused":true,"workspace_id":"w38","worktree":{"checkout_path":"/home/andy/dev/printersrow/kern-app"}}
+    ]}}"#;
+
+    #[test]
+    fn parses_the_focused_workspace_cwd() {
+        assert_eq!(
+            parse_focused_cwd(WORKSPACES).unwrap(),
+            "/home/andy/dev/printersrow/kern-app"
+        );
+    }
+
+    #[test]
+    fn no_focused_workspace_is_an_error_not_a_silent_first_entry() {
+        let json = WORKSPACES.replace("\"focused\":true", "\"focused\":false");
+        assert!(parse_focused_cwd(&json).is_err());
+    }
+
+    #[test]
+    fn focused_workspace_without_a_worktree_is_an_error() {
+        let json = r#"{"result":{"workspaces":[{"focused":true,"workspace_id":"w1"}]}}"#;
+        assert!(parse_focused_cwd(json).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_workspace_json() {
+        assert!(parse_focused_cwd("not json").is_err());
     }
 }
