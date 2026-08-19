@@ -1,5 +1,6 @@
 mod cli;
 mod daemon;
+mod git_org;
 mod groups;
 mod herd;
 mod log_store;
@@ -88,7 +89,10 @@ fn main() -> anyhow::Result<()> {
             let pattern = agents
                 .or_else(|| std::env::var("SCUTTLEBUTT_AGENTS").ok())
                 .unwrap_or_default();
-            daemon::run(&paths::session_dir()?, &daemon::AgentFilter::parse(&pattern))
+            daemon::run(
+                &paths::session_dir()?,
+                &daemon::AgentFilter::parse(&pattern),
+            )
         }
         Cmd::DaemonStatus => {
             daemon::status(&paths::session_dir()?);

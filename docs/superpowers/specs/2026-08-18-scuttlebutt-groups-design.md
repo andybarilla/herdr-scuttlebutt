@@ -10,19 +10,23 @@ restated here is unchanged.
 
 ## Decisions
 
-- **Grouping**: explicit config file mapping group names to path prefixes.
-  No auto-derivation from path structure — an unlisted path must be
-  unambiguously ungrouped rather than silently assigned a guessed group.
+- **Grouping**: explicit config file mapping group names to path prefixes,
+  falling back to the repository's `origin` organization for a cwd no prefix
+  claims. Nothing is derived from path structure — a guessed group from
+  directory names would be silent and wrong; an org comes from the repo
+  itself.
 - **Separation**: hard. Each group gets its own room file and its own
   delivery state. Not one room with instructions to ignore other groups:
   delivery injects a message into the agent's context before the agent can
   apply any rule, so an instruction cannot prevent disclosure.
-- **Ungrouped agents**: excluded entirely — not enrolled, no intro, no
-  delivery. Fails closed.
+- **Ungrouped agents** (no prefix, no repo origin): excluded entirely under
+  an active config — not enrolled, no intro, no delivery. Fails closed. With
+  no config they share the single v1 room instead, so a non-repo agent does
+  not go dark just because someone else's repo created an org room.
 - **Daemon**: one process for all groups, routing each agent to its group.
 - **TUI**: one pane per group.
-- **No config**: falls back to today's single-room behavior, so an existing
-  install is unaffected and grouping is opt-in.
+- **No config**: each agent's group is its repo's origin organization; agents
+  outside a repo share today's single room.
 - **Malformed config**: fails closed — no enrollment, loud error.
 
 ## Threat model
@@ -58,8 +62,8 @@ Three config states, deliberately distinguished:
 
 | State | Behavior |
 |---|---|
-| File absent | Grouping inactive. Single room at today's paths, every named agent enrolled. |
-| File present and valid | Grouping active. Per-group rooms; ungrouped agents excluded. |
+| File absent | Groups derived from repo origins; agents outside a repo share the single room at today's paths. |
+| File present and valid | Prefixes first, repo origin for anything they do not claim; agents with neither excluded. |
 | File present and malformed | Fail closed: no enrollment, no delivery, loud error naming the parse failure. |
 
 The malformed case must not degrade into the absent case. Falling back to a
@@ -69,10 +73,11 @@ which is the exact outcome this feature prevents.
 ## Group resolution
 
 ```rust
-pub fn group_for(cwd: &Path, rules: &GroupRules) -> Option<&str>
+pub fn group_for(cwd: &Path, rules: &GroupRules) -> Option<&str>          // prefixes
+pub fn resolve(cwd, &Grouping, &mut OrgCache) -> Option<String>           // prefixes, then origin
 ```
 
-Pure, no filesystem access.
+`group_for` is pure, no filesystem access.
 
 - **Longest prefix wins.** TOML table iteration order is not dependable, so
   first-match-wins would be nondeterministic. Longest-prefix is
@@ -83,7 +88,35 @@ Pure, no filesystem access.
   slashes are stripped. `canonicalize()` is not used — it touches the
   filesystem and fails for a worktree that has since been deleted, and the
   daemon must be able to classify an agent whose directory is gone.
-- No match returns `None`.
+- No match falls through to the origin organization; if that yields nothing
+  too, the result is `None`.
+
+### Origin fallback
+
+`git -C <cwd> config --get remote.origin.url`, then the first path segment
+after the host: `git@github.com:AcmeCorp/api.git` and
+`https://gitlab.com/AcmeCorp/web` both give `acmecorp`. The name is
+lowercased, anything outside `[a-z0-9_-]` becomes `-`, and leading characters
+are dropped until one that may start a group name. A local-path remote has no
+owner and yields `None`, as does a directory in no repo, with no `origin`, or
+gone from disk.
+
+Two forges with the same owner name share a room. That is deliberate: the
+same organization on GitHub and GitLab is the same company.
+
+A derived name equal to a configured group name is that group's room. A
+config entry is therefore also the way to rename an org's room or to merge
+several orgs into one.
+
+Results are cached per cwd for 5 minutes — the daemon resolves every agent on
+every 2s tick, and without the cache each tick spawns one `git` per agent.
+The TTL exists because worktrees are created and deleted under a
+long-running daemon.
+
+**`--group` under no config.** Org groups are not enumerable — a room exists
+as soon as an agent with that origin starts — so an explicit `--group` is
+checked for legality, not membership. A typo opens an empty room rather than
+erroring; every TUI pane titles its room, which is where that shows up.
 
 The input is the `cwd` field from `herdr agent list`. `AgentInfo` gains a
 `cwd: String` field and `parse_agent_list` gains one line to read it.
@@ -92,7 +125,7 @@ directory and is the correct source.)
 
 ## Storage layout
 
-Grouping active:
+Any group, prefix- or origin-derived:
 
 ```
 <base>/<session>/<group>/room.jsonl
@@ -101,7 +134,8 @@ Grouping active:
 <base>/<session>/daemon.log
 ```
 
-Grouping inactive — unchanged from v1:
+Ungrouped agents — the v1 layout, used by whatever resolves to no group
+while there is no config:
 
 ```
 <base>/<session>/room.jsonl
@@ -114,15 +148,16 @@ Grouping inactive — unchanged from v1:
 present. The pidfile and log stay session-level because there is one daemon.
 
 No migration. An existing `<base>/<session>/room.jsonl` is left in place and
-remains the room used while grouping is inactive; activating grouping starts
-fresh per-group rooms beside it.
+remains the room for agents in no group; org- and prefix-derived rooms start
+fresh beside it.
 
 ## Daemon
 
 One `herdr agent list` per tick, as today. Then:
 
-1. Resolve each agent's group from its `cwd`.
-2. Drop agents that resolve to `None` (grouping active only).
+1. Resolve each agent's group from its `cwd`: prefix, else repo origin.
+2. Drop agents that resolve to `None` (grouping active only; with no config
+   they form the shared room).
 3. Partition the remaining agents by group.
 4. For each group, run the existing tick logic against that group's room and
    state file — enroll, introduce once, deliver batches to idle agents,

@@ -50,7 +50,7 @@ pub fn expand_tilde(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-fn valid_group_name(name: &str) -> bool {
+pub fn valid_group_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
@@ -153,9 +153,100 @@ pub fn group_for<'a>(cwd: &Path, rules: &'a GroupRules) -> Option<&'a str> {
         .map(|(name, _)| name.as_str())
 }
 
+/// The group a working directory belongs to: a configured prefix if one
+/// matches, otherwise the repository's `origin` organization. A `Broken`
+/// config derives nothing — falling back to org-derived rooms there would
+/// enroll everyone from a config we could not read.
+pub fn resolve(
+    cwd: &Path,
+    grouping: &Grouping,
+    orgs: &mut crate::git_org::OrgCache,
+) -> Option<String> {
+    match grouping {
+        Grouping::Broken(_) => None,
+        Grouping::Inactive => orgs.get(cwd),
+        Grouping::Active(rules) => match group_for(cwd, rules) {
+            Some(g) => Some(g.to_string()),
+            None => orgs.get(cwd),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn org_acme(_cwd: &Path) -> Option<String> {
+        Some("acme".to_string())
+    }
+
+    fn no_org(_cwd: &Path) -> Option<String> {
+        None
+    }
+
+    fn cache(lookup: fn(&Path) -> Option<String>) -> crate::git_org::OrgCache {
+        crate::git_org::OrgCache::with_lookup(lookup, std::time::Duration::from_secs(300))
+    }
+
+    #[test]
+    fn a_configured_prefix_beats_the_repo_org() {
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        assert_eq!(
+            resolve(Path::new("/w/alare/api"), &g, &mut cache(org_acme)).as_deref(),
+            Some("alare")
+        );
+    }
+
+    #[test]
+    fn an_unmatched_cwd_falls_back_to_the_repo_org() {
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        assert_eq!(
+            resolve(Path::new("/w/other"), &g, &mut cache(org_acme)).as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn an_unmatched_cwd_outside_a_repo_stays_ungrouped() {
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        assert_eq!(resolve(Path::new("/w/other"), &g, &mut cache(no_org)), None);
+    }
+
+    #[test]
+    fn inactive_grouping_resolves_from_the_repo_org() {
+        assert_eq!(
+            resolve(
+                Path::new("/w/other"),
+                &Grouping::Inactive,
+                &mut cache(org_acme)
+            )
+            .as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn inactive_grouping_outside_a_repo_is_the_shared_room() {
+        assert_eq!(
+            resolve(
+                Path::new("/w/other"),
+                &Grouping::Inactive,
+                &mut cache(no_org)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_broken_config_never_derives_a_group() {
+        // fail closed: a config we cannot read must enroll nobody, and an
+        // org-derived room would quietly enroll everyone instead
+        let g = Grouping::Broken("bad".into());
+        assert_eq!(
+            resolve(Path::new("/w/alare"), &g, &mut cache(org_acme)),
+            None
+        );
+    }
 
     fn rules(pairs: &[(&str, &[&str])]) -> GroupRules {
         let mut v = Vec::new();
@@ -301,7 +392,10 @@ mod tests {
     #[test]
     fn tilde_expands_to_home() {
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(expand_tilde("~/dev/x"), PathBuf::from(format!("{home}/dev/x")));
+        assert_eq!(
+            expand_tilde("~/dev/x"),
+            PathBuf::from(format!("{home}/dev/x"))
+        );
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
     }
 

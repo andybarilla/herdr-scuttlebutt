@@ -120,8 +120,11 @@ mod tests {
                 });
             }
         });
-        let ids: std::collections::BTreeSet<u64> =
-            read_since(dir.path(), 0).unwrap().iter().map(|m| m.id).collect();
+        let ids: std::collections::BTreeSet<u64> = read_since(dir.path(), 0)
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
         let expected: std::collections::BTreeSet<u64> = (1..=THREADS * PER_THREAD).collect();
         assert_eq!(ids, expected);
     }

@@ -142,9 +142,13 @@ fn wrap_text(text: &str, first_width: usize, width: usize) -> Vec<String> {
 /// to count rendered rows, not messages.
 fn message_rows(m: &Message, width: usize) -> Vec<Line<'static>> {
     let who_style = if m.from == "human" {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     };
     let prefix = format!("{}: ", m.from);
     let prefix_len = display_width(&prefix);
@@ -184,10 +188,11 @@ fn scoped_members(
     herd: &dyn HerdControl,
     resolved: Option<&str>,
     grouping: &crate::groups::Grouping,
+    orgs: &mut crate::git_org::OrgCache,
 ) -> Option<Vec<AgentInfo>> {
     let all = herd.list_agents().ok()?;
     Some(
-        crate::cli::visible_agents(&all, resolved, grouping)
+        crate::cli::visible_agents(&all, resolved, grouping, orgs)
             .into_iter()
             .cloned()
             .collect(),
@@ -196,13 +201,16 @@ fn scoped_members(
 
 pub fn run(group: Option<&str>) -> Result<()> {
     let grouping = crate::groups::load(&crate::paths::base_dir()?);
-    let resolved = crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping)?;
+    let mut orgs = crate::git_org::OrgCache::default();
+    let resolved =
+        crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping, &mut orgs)?;
     let dir = crate::paths::room_dir(resolved.as_deref())?;
     let title = title_for(resolved.as_deref());
     let herd = RealHerd;
     let mut app = App {
         messages: log_store::read_since(&dir, 0)?,
-        members: scoped_members(&herd, resolved.as_deref(), &grouping).unwrap_or_default(),
+        members: scoped_members(&herd, resolved.as_deref(), &grouping, &mut orgs)
+            .unwrap_or_default(),
         title,
         ..App::default()
     };
@@ -225,7 +233,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
                 app.messages.append(&mut fresh);
             }
             if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
-                if let Some(m) = scoped_members(&herd, resolved.as_deref(), &grouping) {
+                if let Some(m) = scoped_members(&herd, resolved.as_deref(), &grouping, &mut orgs) {
                     app.members = m;
                 }
                 last_member_refresh = std::time::Instant::now();
@@ -275,8 +283,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let visible = top[0].height.saturating_sub(2) as usize;
     let start = scroll_start(rows.len(), visible, app.scroll_from_bottom as usize);
     f.render_widget(
-        Paragraph::new(rows[start.min(rows.len())..].to_vec())
-            .block(Block::default().borders(Borders::ALL).title(app.title.as_str())),
+        Paragraph::new(rows[start.min(rows.len())..].to_vec()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.title.as_str()),
+        ),
         top[0],
     );
 
@@ -397,7 +408,11 @@ mod tests {
         // "bob: " is 5 columns, leaving 15 on the first row of a 20-wide pane.
         let m = msg("bob", "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj");
         let rows = message_rows(&m, 20);
-        assert!(rows.len() >= 3, "expected multiple rows, got {}", rows.len());
+        assert!(
+            rows.len() >= 3,
+            "expected multiple rows, got {}",
+            rows.len()
+        );
         for (i, row) in rows.iter().enumerate() {
             let w: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
             assert!(w <= 20, "row {i} is {w} wide: {row:?}");
@@ -411,7 +426,11 @@ mod tests {
         // overflows the pane's inner width.
         let m = msg("田中", "abcdef");
         let rows = message_rows(&m, 10);
-        let first_row_width: usize = rows[0].spans.iter().map(|s| display_width(&s.content)).sum();
+        let first_row_width: usize = rows[0]
+            .spans
+            .iter()
+            .map(|s| display_width(&s.content))
+            .sum();
         assert!(
             first_row_width <= 10,
             "first row is {first_row_width} cells wide: {:?}",
@@ -453,19 +472,63 @@ mod tests {
         g
     }
 
+    fn no_org(_cwd: &std::path::Path) -> Option<String> {
+        None
+    }
+
+    /// `/w/<org>/...` belongs to `<org>`; anything else is outside a repo.
+    fn fake_org(cwd: &std::path::Path) -> Option<String> {
+        let s = cwd.to_string_lossy();
+        let rest = s.strip_prefix("/w/")?;
+        Some(rest.split('/').next()?.to_string())
+    }
+
+    fn orgs(lookup: fn(&std::path::Path) -> Option<String>) -> crate::git_org::OrgCache {
+        crate::git_org::OrgCache::with_lookup(lookup, std::time::Duration::from_secs(300))
+    }
+
     #[test]
     fn members_pane_shows_only_the_callers_group() {
-        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")], false);
-        let members = scoped_members(&herd, Some("alare"), &two_groups()).unwrap();
+        let herd = FakeHerd(
+            vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")],
+            false,
+        );
+        let members =
+            scoped_members(&herd, Some("alare"), &two_groups(), &mut orgs(no_org)).unwrap();
         let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["issue-590"]);
     }
 
     #[test]
-    fn members_pane_is_unscoped_when_grouping_is_inactive() {
-        let herd = FakeHerd(vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")], false);
-        let members =
-            scoped_members(&herd, None, &crate::groups::Grouping::Inactive).unwrap();
+    fn members_pane_is_scoped_to_the_org_room_without_a_config() {
+        let herd = FakeHerd(
+            vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")],
+            false,
+        );
+        let members = scoped_members(
+            &herd,
+            Some("alare"),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(fake_org),
+        )
+        .unwrap();
+        let names: Vec<&str> = members.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["issue-590"]);
+    }
+
+    #[test]
+    fn members_pane_shows_the_shared_room_for_agents_outside_a_repo() {
+        let herd = FakeHerd(
+            vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")],
+            false,
+        );
+        let members = scoped_members(
+            &herd,
+            None,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        )
+        .unwrap();
         assert_eq!(members.len(), 2);
     }
 
@@ -473,7 +536,7 @@ mod tests {
     fn failed_listing_leaves_the_roster_untouched() {
         // a transient `herdr agent list` failure must not blank the pane
         let herd = FakeHerd(vec![], true);
-        assert!(scoped_members(&herd, Some("alare"), &two_groups()).is_none());
+        assert!(scoped_members(&herd, Some("alare"), &two_groups(), &mut orgs(no_org)).is_none());
     }
 
     #[test]
@@ -513,7 +576,12 @@ mod tests {
         // self-consistent whether or not it agrees with the renderer.
         let mut app = App {
             messages: (0..6)
-                .map(|i| msg("bob", &format!("filler message number {i} padded out a bit")))
+                .map(|i| {
+                    msg(
+                        "bob",
+                        &format!("filler message number {i} padded out a bit"),
+                    )
+                })
                 .collect(),
             ..App::default()
         };
@@ -531,7 +599,12 @@ mod tests {
     fn scrolling_up_then_back_down_returns_to_the_newest_message() {
         let mut app = App {
             messages: (0..8)
-                .map(|i| msg("bob", &format!("filler message number {i} padded out a bit")))
+                .map(|i| {
+                    msg(
+                        "bob",
+                        &format!("filler message number {i} padded out a bit"),
+                    )
+                })
                 .collect(),
             ..App::default()
         };

@@ -170,32 +170,35 @@ fn tick_and_save(
 type Buckets = Vec<(Option<String>, Vec<AgentInfo>)>;
 
 /// Splits agents into one bucket per group, plus the agents that belong to no
-/// group. `Inactive` yields a single `None` bucket holding everyone (v1
-/// behavior). `Broken` yields no buckets at all: a config we cannot parse must
-/// never fall back to one shared room, because that would merge groups.
+/// group. Membership comes from `groups::resolve`, so an agent whose cwd no
+/// prefix claims still lands in its repository's org room. `Broken` yields no
+/// buckets at all: a config we cannot parse must never fall back to a room,
+/// because that would merge groups.
+///
+/// The `None` bucket is a real room only while grouping is `Inactive` — that
+/// is v1's single room, and an agent outside any repo must not go dark just
+/// because someone else's repo created an org room. Under an `Active` config
+/// an unresolvable agent is skipped, as before.
 pub fn partition<'a>(
     agents: &'a [AgentInfo],
     grouping: &Grouping,
+    orgs: &mut crate::git_org::OrgCache,
 ) -> (Buckets, Vec<&'a AgentInfo>) {
-    match grouping {
-        Grouping::Inactive => (vec![(None, agents.to_vec())], Vec::new()),
-        Grouping::Broken(_) => (Vec::new(), agents.iter().collect()),
-        Grouping::Active(rules) => {
-            let mut buckets: std::collections::BTreeMap<String, Vec<AgentInfo>> =
-                std::collections::BTreeMap::new();
-            let mut skipped = Vec::new();
-            for a in agents {
-                match groups::group_for(Path::new(&a.cwd), rules) {
-                    Some(g) => buckets.entry(g.to_string()).or_default().push(a.clone()),
-                    None => skipped.push(a),
-                }
-            }
-            (
-                buckets.into_iter().map(|(g, a)| (Some(g), a)).collect(),
-                skipped,
-            )
+    if let Grouping::Broken(_) = grouping {
+        return (Vec::new(), agents.iter().collect());
+    }
+    let shared_room = matches!(grouping, Grouping::Inactive);
+    let mut buckets: std::collections::BTreeMap<Option<String>, Vec<AgentInfo>> =
+        std::collections::BTreeMap::new();
+    let mut skipped = Vec::new();
+    for a in agents {
+        match groups::resolve(Path::new(&a.cwd), grouping, orgs) {
+            Some(g) => buckets.entry(Some(g)).or_default().push(a.clone()),
+            None if shared_room => buckets.entry(None).or_default().push(a.clone()),
+            None => skipped.push(a),
         }
     }
+    (buckets.into_iter().collect(), skipped)
 }
 
 /// Presents one group's members to the unchanged `tick`, so `tick` needs no
@@ -226,6 +229,7 @@ fn run_once(
     session: &Path,
     last_shape: &mut Option<String>,
     room_dir: &dyn Fn(Option<&str>) -> Result<PathBuf>,
+    orgs: &mut crate::git_org::OrgCache,
 ) {
     // Reloaded every pass, because everything else reads groups.toml fresh:
     // a daemon on a startup snapshot would keep enrolling nobody after the
@@ -243,17 +247,28 @@ fn run_once(
     // The filter applies once, here: every bucket below is already narrowed to
     // admitted agents.
     let admitted: Vec<AgentInfo> = all.into_iter().filter(|a| filter.admits(&a.name)).collect();
-    let (buckets, skipped) = partition(&admitted, grouping);
+    let (buckets, skipped) = partition(&admitted, grouping, orgs);
     // Log the mapping whenever the shape of the grouping changes — the config
     // is reloaded every pass, so a group can appear or vanish and a broken
     // config can be fixed mid-run. Announcing only on the first listing that
     // holds anyone: an empty first tick (agents not started yet) must not
     // consume the announcement and leave the enrolment set unlogged.
-    let shape = match grouping {
+    let config_shape = match grouping {
         Grouping::Inactive => "inactive".to_string(),
         Grouping::Active(r) => format!("active:{}", r.names().join(",")),
         Grouping::Broken(msg) => format!("broken:{msg}"),
     };
+    // The live room set is part of the shape, not just the config: org-derived
+    // rooms appear when their first agent starts, under a config that never
+    // changed, and an unannounced room is one nobody knows to open.
+    let shape = format!(
+        "{config_shape}|{}",
+        buckets
+            .iter()
+            .map(|(g, _)| g.as_deref().unwrap_or("(ungrouped room)"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     if !admitted.is_empty() && last_shape.as_deref() != Some(shape.as_str()) {
         if let Grouping::Broken(msg) = grouping {
             report(
@@ -359,6 +374,9 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     log_line(session, &format!("agent filter: {}", filter.describe()));
 
     let herd = crate::herd::RealHerd;
+    // Outlives the loop so a repo's origin is read once per cwd, not once per
+    // agent per 2s tick.
+    let mut orgs = crate::git_org::OrgCache::default();
     // Name the enrolment set up front: starting this in a busy session
     // otherwise reveals its blast radius only through prompted agents.
     let mut last_shape = None;
@@ -370,6 +388,7 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
             session,
             &mut last_shape,
             &|g| crate::paths::room_dir(g),
+            &mut orgs,
         );
         // Sleep for the 2s tick interval in 100ms slices, checking the term
         // flag between slices, so a signal arriving mid-interval is acted on
@@ -478,8 +497,7 @@ pub fn tick(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "scuttlebutt".to_string());
 
-    let live: std::collections::HashSet<String> =
-        agents.iter().map(|a| a.name.clone()).collect();
+    let live: std::collections::HashSet<String> = agents.iter().map(|a| a.name.clone()).collect();
 
     // enroll new agents (cursor starts at tail: no history dump) and clear
     // any absence streak for agents that are present again.
@@ -973,13 +991,27 @@ mod tests {
 
         // reviewer is missing from the listing for a single tick
         let herd_absent = FakeHerd::new(vec![]);
-        tick(&mut state, &herd_absent, dir.path(), &AgentFilter::default(), None).unwrap();
+        tick(
+            &mut state,
+            &herd_absent,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(state.cursors.get("reviewer"), Some(&5));
         assert!(state.introduced.contains("reviewer"));
 
         // reviewer reappears before hitting the absence cap: no re-intro
         let herd_back = FakeHerd::new(vec![("reviewer", "idle")]);
-        tick(&mut state, &herd_back, dir.path(), &AgentFilter::default(), None).unwrap();
+        tick(
+            &mut state,
+            &herd_back,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
         assert!(herd_back.prompts.borrow().is_empty());
         assert_eq!(state.cursors.get("reviewer"), Some(&5));
     }
@@ -1046,7 +1078,11 @@ mod tests {
     fn read_live_pid_detects_own_process() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_live_pid(dir.path()), None);
-        std::fs::write(dir.path().join("daemon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
         assert_eq!(read_live_pid(dir.path()), Some(std::process::id()));
     }
 
@@ -1102,6 +1138,82 @@ mod tests {
         g
     }
 
+    fn no_org(_cwd: &Path) -> Option<String> {
+        None
+    }
+
+    /// `/w/<org>/...` belongs to `<org>`; anything else is outside a repo.
+    fn fake_org(cwd: &Path) -> Option<String> {
+        let s = cwd.to_string_lossy();
+        let rest = s.strip_prefix("/w/")?;
+        Some(rest.split('/').next()?.to_string())
+    }
+
+    fn orgs(lookup: fn(&Path) -> Option<String>) -> crate::git_org::OrgCache {
+        crate::git_org::OrgCache::with_lookup(lookup, std::time::Duration::from_secs(300))
+    }
+
+    fn bucket_names(buckets: Buckets) -> Vec<(Option<String>, Vec<String>)> {
+        let mut v: Vec<(Option<String>, Vec<String>)> = buckets
+            .into_iter()
+            .map(|(g, a)| (g, a.into_iter().map(|x| x.name).collect()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn partition_inactive_buckets_by_repo_org() {
+        let agents = vec![
+            agent_at("a1", "/w/alare/api", "idle"),
+            agent_at("a2", "/w/acme/web", "idle"),
+        ];
+        let (buckets, skipped) = partition(
+            &agents,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(fake_org),
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(
+            bucket_names(buckets),
+            vec![
+                (Some("acme".to_string()), vec!["a2".to_string()]),
+                (Some("alare".to_string()), vec!["a1".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn partition_active_falls_back_to_the_repo_org_for_unmatched_cwds() {
+        let agents = vec![
+            agent_at("a1", "/w/alare/api", "idle"),
+            agent_at("a2", "/w/beta/web", "idle"),
+        ];
+        let (buckets, skipped) = partition(&agents, &two_group_rules(), &mut orgs(fake_org));
+        assert!(skipped.is_empty());
+        assert_eq!(
+            bucket_names(buckets),
+            vec![
+                (Some("alare".to_string()), vec!["a1".to_string()]),
+                (Some("beta".to_string()), vec!["a2".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn partition_broken_config_never_derives_an_org_bucket() {
+        // fail closed: the org fallback must not resurrect a room the unusable
+        // config was supposed to withhold
+        let agents = vec![agent_at("a1", "/w/alare/api", "idle")];
+        let (buckets, skipped) = partition(
+            &agents,
+            &crate::groups::Grouping::Broken("bad".into()),
+            &mut orgs(fake_org),
+        );
+        assert!(buckets.is_empty());
+        assert_eq!(skipped.len(), 1);
+    }
+
     #[test]
     fn partition_buckets_agents_by_group() {
         let agents = vec![
@@ -1109,7 +1221,7 @@ mod tests {
             agent_at("a2", "/w/acme/web", "idle"),
             agent_at("a3", "/w/alare", "idle"),
         ];
-        let (buckets, skipped) = partition(&agents, &two_group_rules());
+        let (buckets, skipped) = partition(&agents, &two_group_rules(), &mut orgs(no_org));
         assert!(skipped.is_empty());
         let mut names: Vec<(String, Vec<String>)> = buckets
             .into_iter()
@@ -1125,7 +1237,10 @@ mod tests {
             names,
             vec![
                 ("acme".to_string(), vec!["a2".to_string()]),
-                ("alare".to_string(), vec!["a1".to_string(), "a3".to_string()]),
+                (
+                    "alare".to_string(),
+                    vec!["a1".to_string(), "a3".to_string()]
+                ),
             ]
         );
     }
@@ -1136,7 +1251,7 @@ mod tests {
             agent_at("a1", "/w/alare/api", "idle"),
             agent_at("stray", "/tmp/scratch", "idle"),
         ];
-        let (buckets, skipped) = partition(&agents, &two_group_rules());
+        let (buckets, skipped) = partition(&agents, &two_group_rules(), &mut orgs(no_org));
         assert_eq!(buckets.len(), 1);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].name, "stray");
@@ -1147,19 +1262,23 @@ mod tests {
         // herdr omits `cwd` for some panes and `parse_agent_list` maps that to
         // "", so this is real input, not a hypothetical.
         let agents = vec![agent_at("nocwd", "", "idle")];
-        let (buckets, skipped) = partition(&agents, &two_group_rules());
+        let (buckets, skipped) = partition(&agents, &two_group_rules(), &mut orgs(no_org));
         assert!(buckets.is_empty());
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].name, "nocwd");
     }
 
     #[test]
-    fn partition_inactive_puts_everyone_in_one_ungrouped_bucket() {
+    fn partition_inactive_shares_one_room_for_agents_outside_a_repo() {
         let agents = vec![
             agent_at("a1", "/w/alare/api", "idle"),
             agent_at("stray", "/tmp/scratch", "idle"),
         ];
-        let (buckets, skipped) = partition(&agents, &crate::groups::Grouping::Inactive);
+        let (buckets, skipped) = partition(
+            &agents,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
         assert!(skipped.is_empty());
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].0, None);
@@ -1169,8 +1288,11 @@ mod tests {
     #[test]
     fn partition_broken_config_enrolls_nobody() {
         let agents = vec![agent_at("a1", "/w/alare/api", "idle")];
-        let (buckets, skipped) =
-            partition(&agents, &crate::groups::Grouping::Broken("bad".into()));
+        let (buckets, skipped) = partition(
+            &agents,
+            &crate::groups::Grouping::Broken("bad".into()),
+            &mut orgs(no_org),
+        );
         assert!(buckets.is_empty());
         assert_eq!(skipped.len(), 1);
     }
@@ -1310,6 +1432,7 @@ mod tests {
                 &session,
                 &mut last_shape,
                 &room_dir,
+                &mut orgs(no_org),
             );
         }
         append(&room_dir(Some("alare")).unwrap(), "human", "alare secret").unwrap();
@@ -1321,6 +1444,7 @@ mod tests {
             &session,
             &mut last_shape,
             &room_dir,
+            &mut orgs(no_org),
         );
 
         let prompts = herd.prompts.borrow();
@@ -1378,6 +1502,7 @@ mod tests {
                 base.path(),
                 &mut last_shape,
                 &room_dir,
+                &mut orgs(no_org),
             );
         }
         assert!(!herd.prompts.borrow().iter().any(|(n, _)| n == "b1"));
@@ -1391,6 +1516,7 @@ mod tests {
                 base.path(),
                 &mut last_shape,
                 &room_dir,
+                &mut orgs(no_org),
             );
         }
         let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
@@ -1400,6 +1526,51 @@ mod tests {
             "b1 was never enrolled after acme was added: {:?}",
             herd.prompts.borrow()
         );
+    }
+
+    #[test]
+    fn a_new_org_room_is_logged_when_it_appears() {
+        // Without a groups.toml the grouping shape never changes, so the
+        // enrolment log has to track the live rooms instead: an org room that
+        // appears when its first agent starts must still be announced.
+        let base = tempfile::tempdir().unwrap();
+        let rooms = base.path().to_path_buf();
+        let room_dir = |g: Option<&str>| -> Result<std::path::PathBuf> {
+            let d = rooms.join(g.unwrap_or("ungrouped"));
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        };
+        let mut last_shape = None;
+        let mut cache = orgs(fake_org);
+        let mut run = |herd: &FakeHerd| {
+            run_once(
+                herd,
+                &|| Grouping::Inactive,
+                &AgentFilter::default(),
+                base.path(),
+                &mut last_shape,
+                &room_dir,
+                &mut cache,
+            );
+        };
+        run(&FakeHerd {
+            agents: vec![agent_at("a1", "/w/alare/api", "idle")],
+            prompts: RefCell::new(vec![]),
+            fail_prompts: false,
+            fail_agents: false,
+        });
+        run(&FakeHerd {
+            agents: vec![
+                agent_at("a1", "/w/alare/api", "idle"),
+                agent_at("b1", "/w/acme/web", "idle"),
+            ],
+            prompts: RefCell::new(vec![]),
+            fail_prompts: false,
+            fail_agents: false,
+        });
+        let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
+        assert!(log.contains("enrolling in alare"), "{log}");
+        assert!(log.contains("enrolling in acme"), "{log}");
     }
 
     #[test]
@@ -1426,6 +1597,7 @@ mod tests {
                 base.path(),
                 &mut last_shape,
                 &room_dir,
+                &mut orgs(no_org),
             );
         }
         assert!(herd.prompts.borrow().is_empty());
