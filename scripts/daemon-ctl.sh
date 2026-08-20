@@ -10,9 +10,28 @@ bin="$script_dir/../target/release/scuttlebutt"
 
 case "$cmd" in
   start)
-    if "$bin" daemon-status | grep -q '^running'; then
-      "$bin" daemon-status
+    status="$("$bin" daemon-status || true)"
+    if grep -q '^running' <<<"$status"; then
+      echo "$status"
       exit 0
+    fi
+    if grep -q '^stale' <<<"$status"; then
+      # A daemon on a replaced binary has to go before the new one starts:
+      # launching alongside it leaves two daemons, both delivering.
+      echo "$status"
+      "$bin" daemon-stop || true
+      for _ in $(seq 100); do
+        if "$bin" daemon-status | grep -q '^not running'; then break; fi
+        sleep 0.1
+      done
+      if ! "$bin" daemon-status | grep -q '^not running'; then
+        # open-chat.sh runs this under `set -e`: failing here would take the
+        # chat pane down over a daemon that is still delivering, just from the
+        # old build. Leave the one daemon alone and say so.
+        echo "stale daemon did not exit; leaving it rather than starting a second one" >&2
+        "$bin" daemon-status
+        exit 0
+      fi
     fi
     nohup "$bin" daemon >/dev/null 2>&1 &
     disown

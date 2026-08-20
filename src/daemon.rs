@@ -97,13 +97,149 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Identifies one specific file instance, so a daemon whose binary was
+/// replaced can be told apart from one running the build on disk.
+/// `/proc/<pid>/exe` would answer this on Linux only, and mere existence of
+/// the recorded path answers it wrongly everywhere: a reinstall writes a new
+/// file at the same path while the process keeps running the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExeFingerprint {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    // A truncating rewrite keeps dev, ino and (for same-length content) size,
+    // so mtime is the only field left to separate the two builds.
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl ExeFingerprint {
+    pub fn of(path: &Path) -> Option<ExeFingerprint> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(ExeFingerprint {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        })
+    }
+}
+
+/// The executable a running daemon started from. Path and fingerprint are only
+/// meaningful together: the fingerprint says which file instance, the path says
+/// where to look for it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedExe {
+    pub path: PathBuf,
+    pub fingerprint: ExeFingerprint,
+}
+
+impl RecordedExe {
+    pub fn of(path: &Path) -> Option<RecordedExe> {
+        Some(RecordedExe {
+            path: path.to_path_buf(),
+            fingerprint: ExeFingerprint::of(path)?,
+        })
+    }
+}
+
+pub struct PidRecord {
+    pub pid: u32,
+    /// `None` for a pidfile written before fingerprinting existed.
+    pub exe: Option<RecordedExe>,
+}
+
+impl PidRecord {
+    pub fn freshness(&self) -> Freshness {
+        let Some(recorded) = &self.exe else {
+            return Freshness::Unknown;
+        };
+        match RecordedExe::of(&recorded.path) {
+            Some(on_disk) if on_disk == *recorded => Freshness::Current,
+            _ => Freshness::Stale,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Current,
+    Stale,
+    /// No fingerprint on record. Reported as running: an upgrade rewrites the
+    /// binary while the old daemon still holds an old-format pidfile, and
+    /// calling that stale would restart the daemon once on every upgrade.
+    Unknown,
+}
+
+/// First line is the bare pid so the fingerprint fields can be added without a
+/// new filename. It is not readable by a version that predates fingerprinting
+/// — that reader parses the whole file as one integer — so downgrading past
+/// this version leaves a running daemon looking dead until its pidfile goes.
+pub fn render_pidfile(pid: u32, exe: Option<&RecordedExe>) -> String {
+    let mut s = format!("{pid}\n");
+    if let Some(e) = exe {
+        let f = &e.fingerprint;
+        s.push_str(&format!(
+            "exe={}\ndev={}\nino={}\nsize={}\nmtime={}\nmtime_nsec={}\n",
+            e.path.display(),
+            f.dev,
+            f.ino,
+            f.size,
+            f.mtime,
+            f.mtime_nsec
+        ));
+    }
+    s
+}
+
+pub fn parse_pidfile(text: &str) -> Option<PidRecord> {
+    let mut lines = text.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let mut fields: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once('=') {
+            fields.insert(k.trim(), v.trim());
+        }
+    }
+    // A partial record cannot be compared against anything, so it reports
+    // unknown; guessing at it would restart a healthy daemon.
+    let exe = (|| {
+        Some(RecordedExe {
+            path: PathBuf::from(fields.get("exe")?),
+            fingerprint: ExeFingerprint {
+                dev: fields.get("dev")?.parse().ok()?,
+                ino: fields.get("ino")?.parse().ok()?,
+                size: fields.get("size")?.parse().ok()?,
+                mtime: fields.get("mtime")?.parse().ok()?,
+                mtime_nsec: fields.get("mtime_nsec")?.parse().ok()?,
+            },
+        })
+    })();
+    Some(PidRecord { pid, exe })
+}
+
+/// Staleness gets its own first word so scripts can branch on it:
+/// `daemon-ctl.sh`'s start branch greps for `^running`.
+pub fn status_line(pid: u32, freshness: Freshness) -> String {
+    match freshness {
+        Freshness::Stale => format!(
+            "stale (pid {pid}): binary replaced or removed since start; \
+             restart to pick up the current build"
+        ),
+        Freshness::Current | Freshness::Unknown => format!("running (pid {pid})"),
+    }
+}
+
+fn read_live_record(dir: &Path) -> Option<PidRecord> {
+    let text = std::fs::read_to_string(dir.join("daemon.pid")).ok()?;
+    let record = parse_pidfile(&text)?;
+    pid_alive(record.pid).then_some(record)
+}
+
 pub fn read_live_pid(dir: &Path) -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(dir.join("daemon.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    pid_alive(pid).then_some(pid)
+    read_live_record(dir).map(|r| r.pid)
 }
 
 /// Where `daemon.log` lives. Rooms are per-group but the log is session-level,
@@ -348,7 +484,25 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
-    if let Err(e) = std::fs::write(session.join("daemon.pid"), std::process::id().to_string()) {
+    // Canonicalized so the fingerprint is of the real file: an install that
+    // repoints a symlink would otherwise leave the recorded path resolving to
+    // the new target while this process keeps running the old one.
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    let recorded = exe.as_deref().and_then(RecordedExe::of);
+    if recorded.is_none() {
+        // Starting without staleness detection beats refusing to start, but
+        // this daemon will report `running` even after a reinstall replaces it,
+        // so it has to be visible somewhere.
+        report(
+            session,
+            "cannot fingerprint own executable; daemon-status cannot tell a \
+             reinstall from a current build for this daemon",
+        );
+    }
+    let pidfile = render_pidfile(std::process::id(), recorded.as_ref());
+    if let Err(e) = std::fs::write(session.join("daemon.pid"), pidfile) {
         // Without a pidfile, daemon-status/daemon-stop cannot find us; fail
         // loudly rather than running unmanageable.
         report(session, &format!("failed to write daemon.pid: {e}"));
@@ -422,8 +576,8 @@ pub fn status(dir: &Path) {
     // turns "daemon and TUI are on different sessions" from a silent no-op
     // into something you can see. Group rooms live underneath it.
     println!("session dir: {}", dir.display());
-    match read_live_pid(dir) {
-        Some(pid) => println!("running (pid {pid})"),
+    match read_live_record(dir) {
+        Some(record) => println!("{}", status_line(record.pid, record.freshness())),
         None => println!("not running"),
     }
 }
@@ -1106,6 +1260,111 @@ mod tests {
         // realistically alive there
         std::fs::write(dir.path().join("daemon.pid"), "4194304").unwrap();
         assert_eq!(read_live_pid(dir.path()), None);
+    }
+
+    /// A pidfile for a daemon started from a freshly written executable, read
+    /// back through the on-disk format the way `status` would.
+    fn recorded_daemon(dir: &Path, body: &str) -> (PathBuf, PidRecord) {
+        let exe = dir.join("scuttlebutt");
+        std::fs::write(&exe, body).unwrap();
+        let rendered = render_pidfile(1, Some(&RecordedExe::of(&exe).unwrap()));
+        (exe, parse_pidfile(&rendered).unwrap())
+    }
+
+    #[test]
+    fn pidfile_roundtrips_pid_and_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("scuttlebutt");
+        std::fs::write(&exe, "build one").unwrap();
+        let recorded = RecordedExe::of(&exe).unwrap();
+        let parsed = parse_pidfile(&render_pidfile(42, Some(&recorded))).unwrap();
+        assert_eq!(parsed.pid, 42);
+        assert_eq!(parsed.exe, Some(recorded));
+    }
+
+    #[test]
+    fn pidfile_without_fingerprint_parses_as_unknown() {
+        // Written by a version that predates fingerprinting. Reporting stale
+        // here would restart the daemon once on every upgrade.
+        let parsed = parse_pidfile("4242\n").unwrap();
+        assert_eq!(parsed.pid, 4242);
+        assert_eq!(parsed.exe, None);
+        assert_eq!(parsed.freshness(), Freshness::Unknown);
+    }
+
+    #[test]
+    fn pidfile_with_partial_fingerprint_parses_as_unknown() {
+        let parsed = parse_pidfile("7\nexe=/nowhere/scuttlebutt\nino=3\n").unwrap();
+        assert_eq!(parsed.pid, 7);
+        assert_eq!(parsed.exe, None);
+    }
+
+    #[test]
+    fn freshness_is_current_when_the_binary_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_exe, rec) = recorded_daemon(dir.path(), "build one");
+        assert_eq!(rec.freshness(), Freshness::Current);
+    }
+
+    #[test]
+    fn freshness_is_stale_when_the_binary_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, rec) = recorded_daemon(dir.path(), "build one");
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(rec.freshness(), Freshness::Stale);
+    }
+
+    #[test]
+    fn freshness_is_stale_when_the_binary_is_replaced_at_the_same_path() {
+        // What a reinstall does: unlink, write a new file at the same path. An
+        // existence check says the binary is fine; the inode differs.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, rec) = recorded_daemon(dir.path(), "build one");
+        std::fs::remove_file(&exe).unwrap();
+        std::fs::write(&exe, "build two").unwrap();
+        assert_eq!(rec.freshness(), Freshness::Stale);
+    }
+
+    #[test]
+    fn freshness_is_stale_when_the_binary_is_rewritten_in_place() {
+        // Truncating write keeps dev and ino, and same-length content keeps
+        // size, so only mtime separates the two builds. Set it rather than
+        // sleeping: a filesystem with coarse mtime granularity would otherwise
+        // decide whether this passes.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, rec) = recorded_daemon(dir.path(), "build one");
+        let mut f = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+        f.write_all(b"build two").unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(rec.freshness(), Freshness::Stale);
+    }
+
+    #[test]
+    fn status_line_names_the_freshness() {
+        assert_eq!(status_line(3, Freshness::Current), "running (pid 3)");
+        assert_eq!(status_line(3, Freshness::Unknown), "running (pid 3)");
+        assert_eq!(
+            status_line(123549, Freshness::Stale),
+            "stale (pid 123549): binary replaced or removed since start; \
+             restart to pick up the current build"
+        );
+    }
+
+    #[test]
+    fn read_live_pid_reads_a_fingerprinted_pidfile() {
+        // `stop` and the single-instance guard both go through this: an old
+        // daemon whose pidfile the new binary cannot parse would look dead,
+        // and `start` would put a second daemon alongside it.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("scuttlebutt");
+        std::fs::write(&exe, "build one").unwrap();
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            render_pidfile(std::process::id(), Some(&RecordedExe::of(&exe).unwrap())),
+        )
+        .unwrap();
+        assert_eq!(read_live_pid(dir.path()), Some(std::process::id()));
     }
 
     #[test]
