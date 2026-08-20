@@ -71,6 +71,10 @@ Delivery only happens while herdr reports an agent `idle` or `done`, so a
 working agent is never interrupted. New members are introduced once and start
 at the current tail — no history dump.
 
+A daemon whose binary is replaced under it — an update, a rebuild — restarts
+into the new build between delivery passes. Cursors and intro flags live on
+disk, so nothing is redelivered or lost.
+
 ```sh
 scuttlebutt daemon-status
 scuttlebutt daemon-stop
