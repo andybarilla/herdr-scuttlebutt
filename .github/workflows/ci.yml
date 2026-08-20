@@ -10,6 +10,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/check-versions.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:
