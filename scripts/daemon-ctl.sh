@@ -25,8 +25,12 @@ case "$cmd" in
         sleep 0.1
       done
       if ! "$bin" daemon-status | grep -q '^not running'; then
-        echo "stale daemon did not exit; not starting a second one" >&2
-        exit 1
+        # open-chat.sh runs this under `set -e`: failing here would take the
+        # chat pane down over a daemon that is still delivering, just from the
+        # old build. Leave the one daemon alone and say so.
+        echo "stale daemon did not exit; leaving it rather than starting a second one" >&2
+        "$bin" daemon-status
+        exit 0
       fi
     fi
     nohup "$bin" daemon >/dev/null 2>&1 &
