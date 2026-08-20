@@ -505,9 +505,6 @@ pub fn tick(
         .filter(|a| filter.admits(&a.name))
         .collect();
     let tail = log_store::last_id(dir)?;
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "scuttlebutt".to_string());
 
     let live: std::collections::HashSet<String> = agents.iter().map(|a| a.name.clone()).collect();
 
@@ -570,6 +567,10 @@ pub fn tick(
             if streak < REQUIRED_SIGHTINGS {
                 continue;
             }
+            // Resolved where the message is built, so the path an agent is
+            // handed was checked as late as possible: a plugin install can
+            // land at any point in the session.
+            let exe = crate::paths::command_path();
             match herd.prompt(&a.name, &intro_text(&a.name, &agents, &exe, group)) {
                 Ok(()) => {
                     state.introduced.insert(a.name.clone());
@@ -1307,6 +1308,28 @@ mod tests {
         );
         assert!(buckets.is_empty());
         assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn intro_advertises_the_plugin_root_binary_over_the_daemons_own() {
+        // Pins resolution to the point the message is built: hoisting it back
+        // out of the loop, or back to daemon start, is what #5 fixed.
+        let _env = crate::paths::env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("target/release/scuttlebutt");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        std::env::set_var("HERDR_PLUGIN_ROOT", root.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        let herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+
+        let prompts = herd.prompts.borrow();
+        assert!(prompts[0].1.contains(&bin.display().to_string()));
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
     }
 
     #[test]

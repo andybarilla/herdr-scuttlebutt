@@ -44,18 +44,46 @@ pub fn room_dir(group: Option<&str>) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The `scuttlebutt` path to advertise to another process.
+///
+/// Prefers the plugin root, which survives a reinstall; the daemon's own
+/// `current_exe()` is the checkout it started from, and a reinstall moves
+/// that aside and deletes it, leaving a path that fails. The check for a
+/// file under the plugin root is load-bearing: preferring that root
+/// unconditionally would trade a path that died for one that may never have
+/// existed, and
+/// `HERDR_PLUGIN_ROOT` is absent from processes not launched by a herdr
+/// plugin action.
+pub fn command_path() -> String {
+    if let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") {
+        // An empty value would make the join relative, and a daemon whose cwd
+        // happens to be a checkout would then advertise a path each agent
+        // resolves against its own cwd.
+        if !root.is_empty() {
+            let bin = PathBuf::from(root).join("target/release/scuttlebutt");
+            if bin.is_file() {
+                return bin.display().to_string();
+            }
+        }
+    }
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "scuttlebutt".to_string())
+}
+
+/// Tests that mutate process-global env vars every path helper reads cannot
+/// run concurrently: without this they interleave and one asserts against
+/// another's SCUTTLEBUTT_DIR. Any test asserting on `command_path`'s output —
+/// including through the daemon's intro text — needs this guard too.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// These tests mutate process-global env vars that every path helper
-    /// reads, so they cannot run concurrently with each other: without this
-    /// they interleave and one test asserts against another's SCUTTLEBUTT_DIR.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn session_key_sanitizes_socket_path() {
@@ -94,5 +122,45 @@ mod tests {
         assert_eq!(session_dir().unwrap(), room_dir(None).unwrap());
         std::env::remove_var("SCUTTLEBUTT_DIR");
         std::env::remove_var("HERDR_SOCKET_PATH");
+    }
+
+    #[test]
+    fn command_path_prefers_an_existing_plugin_root_binary() {
+        let _env = env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("target/release/scuttlebutt");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        std::env::set_var("HERDR_PLUGIN_ROOT", root.path());
+        assert_eq!(command_path(), bin.display().to_string());
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
+    }
+
+    #[test]
+    fn command_path_falls_back_when_the_plugin_root_holds_no_binary() {
+        let _env = env_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("HERDR_PLUGIN_ROOT", root.path());
+        assert_eq!(command_path(), own_exe());
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
+    }
+
+    #[test]
+    fn command_path_falls_back_when_the_plugin_root_is_unset() {
+        let _env = env_guard();
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
+        assert_eq!(command_path(), own_exe());
+    }
+
+    #[test]
+    fn command_path_ignores_an_empty_plugin_root() {
+        let _env = env_guard();
+        std::env::set_var("HERDR_PLUGIN_ROOT", "");
+        assert_eq!(command_path(), own_exe());
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
+    }
+
+    fn own_exe() -> String {
+        std::env::current_exe().unwrap().display().to_string()
     }
 }
