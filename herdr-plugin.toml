@@ -17,7 +17,7 @@ platforms = ["linux", "macos"]
 id = "chat"
 title = "Scuttlebutt"
 placement = "split"
-command = ["./target/release/scuttlebutt", "tui"]
+command = ["bash", "scripts/pane-chat.sh"]
 
 [[actions]]
 id = "open-chat"
