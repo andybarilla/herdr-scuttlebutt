@@ -600,7 +600,7 @@ pub fn stop(dir: &Path) -> Result<()> {
 /// rule that must still hold on message 99 belongs on the recurring channel
 /// (ADR-0001). The reply half addresses a failure no length cap touches:
 /// several agents posting the same correction about the same merged PR.
-pub const DELIVERY_RULE: &str = "Reply only if you have information others don't \u{2014} don't acknowledge or repeat. Under 80 words; longer belongs on the issue.";
+const DELIVERY_RULE: &str = "Reply only if you have information others don't \u{2014} don't acknowledge or repeat. Under 80 words; longer belongs on the issue.";
 
 pub fn intro_text(exe: &str, group: Option<&str>) -> String {
     // Structural separation (one room dir per group) is the real control;
@@ -1611,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn intro_names_the_length_mechanism_not_an_exhortation() {
+    fn intro_names_the_length_mechanism() {
         let text = intro_text("scuttlebutt", None);
         assert!(text.contains("80 words"));
         assert!(text.contains(&crate::cli::MAX_POST_CHARS.to_string()));

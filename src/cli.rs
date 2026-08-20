@@ -178,10 +178,11 @@ pub fn format_messages(msgs: &[Message]) -> String {
         .collect()
 }
 
-/// Ceiling on a posted message, in Unicode scalar values. A ceiling with
-/// headroom over the longest message anyone judged worth its length, not a
-/// target: see ADR-0001 for why the room's guidance is a rejected command
-/// rather than a sentence asking for brevity.
+/// Ceiling on a posted message, in Unicode scalar values. 700 leaves about
+/// 30% headroom over the longest message the room judged worth its length,
+/// while rejecting 90 of the 99 messages measured in #8. ADR-0001 records
+/// why the guidance is a rejected command rather than a sentence asking for
+/// brevity.
 pub const MAX_POST_CHARS: usize = 700;
 
 pub fn cmd_post(
@@ -492,70 +493,92 @@ mod tests {
         }
     }
 
-    /// Points every path helper at a fresh room and returns it. Holds the
-    /// process-wide env lock for the caller's benefit.
-    fn room(guard: &std::sync::MutexGuard<'static, ()>) -> tempfile::TempDir {
-        let _ = guard;
+    /// Points every path helper at a fresh room. The caller holds
+    /// `paths::env_guard` and must keep the returned dir alive.
+    fn room() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
         std::env::set_var("HERDR_SOCKET_PATH", "/tmp/cap-test.sock");
         dir
     }
 
-    fn room_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
-        dir.path()
-            .join("-tmp-cap-test-sock")
-            .join("t")
+    fn unset_room() {
+        std::env::remove_var("SCUTTLEBUTT_DIR");
+        std::env::remove_var("HERDR_SOCKET_PATH");
+    }
+
+    /// Derived through the same helper the command uses, so the negative
+    /// assertions below cannot pass by pointing at a path nothing writes.
+    fn room_file() -> std::path::PathBuf {
+        crate::paths::room_dir(Some("t"))
+            .unwrap()
             .join("room.jsonl")
     }
 
     #[test]
     fn a_message_at_the_limit_is_posted() {
-        let env = crate::paths::env_guard();
-        let dir = room(&env);
+        let _env = crate::paths::env_guard();
+        let _dir = room();
         let text = "a".repeat(MAX_POST_CHARS);
         cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap();
-        let msgs = log_store::read_since(room_file(&dir).parent().unwrap(), 0).unwrap();
+        let msgs = log_store::read_since(room_file().parent().unwrap(), 0).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text.chars().count(), MAX_POST_CHARS);
+        unset_room();
     }
 
     #[test]
-    fn one_char_over_the_limit_is_refused_and_writes_nothing() {
-        let env = crate::paths::env_guard();
-        let dir = room(&env);
+    fn one_char_over_the_limit_is_refused_and_leaves_the_log_untouched() {
+        let _env = crate::paths::env_guard();
+        let _dir = room();
+        cmd_post(Some("t"), &NoHerd, Some("agent"), "already here").unwrap();
+        let before = std::fs::read(room_file()).unwrap();
+
         let text = "a".repeat(MAX_POST_CHARS + 1);
         let err = cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap_err();
         assert_eq!(
             err.to_string(),
             "message is 701 chars; limit is 700. Post a summary under 700 chars and put the detail on the issue."
         );
-        // Not merely empty: `append` creates the file, so its absence is what
-        // proves the check ran before the write rather than after it.
-        assert!(!room_file(&dir).exists());
+        assert_eq!(std::fs::read(room_file()).unwrap(), before);
+        unset_room();
+    }
+
+    #[test]
+    fn a_rejected_first_post_does_not_even_create_the_log() {
+        // `append` opens with `create(true)`, so a file that never appears is
+        // what proves the check ran before the write rather than after it.
+        let _env = crate::paths::env_guard();
+        let _dir = room();
+        let text = "a".repeat(MAX_POST_CHARS + 1);
+        assert!(cmd_post(Some("t"), &NoHerd, Some("agent"), &text).is_err());
+        assert!(!room_file().exists());
+        unset_room();
     }
 
     #[test]
     fn the_limit_counts_characters_not_bytes() {
         // A 700-character message of 4-byte characters is 2800 bytes; a byte
         // count would reject it.
-        let env = crate::paths::env_guard();
-        let dir = room(&env);
+        let _env = crate::paths::env_guard();
+        let _dir = room();
         let text = "\u{1F600}".repeat(MAX_POST_CHARS);
         cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap();
-        let msgs = log_store::read_since(room_file(&dir).parent().unwrap(), 0).unwrap();
+        let msgs = log_store::read_since(room_file().parent().unwrap(), 0).unwrap();
         assert_eq!(msgs[0].text.chars().count(), MAX_POST_CHARS);
+        unset_room();
     }
 
     #[test]
     fn posting_as_human_is_capped_too() {
         // The obvious evasion: the human's TUI is uncapped, so the command
         // must not become uncapped by claiming to be the human.
-        let env = crate::paths::env_guard();
-        let dir = room(&env);
+        let _env = crate::paths::env_guard();
+        let _dir = room();
         let text = "a".repeat(MAX_POST_CHARS + 1);
         assert!(cmd_post(Some("t"), &NoHerd, Some("human"), &text).is_err());
-        assert!(!room_file(&dir).exists());
+        assert!(!room_file().exists());
+        unset_room();
     }
 
     #[test]
