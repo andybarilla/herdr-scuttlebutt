@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
       - id: version
@@ -21,6 +22,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME; fi
           version=$(scripts/check-versions.sh $tag)
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version-guard
@@ -64,18 +66,24 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [version-guard, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: Checksums and commit stamp
+        # scripts/fetch-or-build.sh refuses the prebuilt when the checkout it is
+        # building for sits on any other commit than this one.
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "${{ needs.version-guard.outputs.sha }}" > COMMIT
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/COMMIT
           generate_release_notes: true

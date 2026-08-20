@@ -11,8 +11,12 @@ under `~/dev/printersrow`.
 ## Install
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.1
 ```
+
+The prebuilt binary is only used when the checkout is the commit that release
+was built from, so installing from the default branch generally builds from
+source with `cargo build --release`.
 
 Or, working on it locally:
 

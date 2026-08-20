@@ -2,8 +2,10 @@
 # scripts/fetch-or-build.sh — herdr [[build]] step, run with cwd = plugin root.
 # Downloads the prebuilt binary for this version + platform from the matching
 # GitHub release and verifies its SHA-256, so installing needs no Rust toolchain.
-# Anything that misses (unmapped platform, no release for this version, download
-# or checksum failure) falls back to `cargo build --release`.
+# The release also stamps the commit it was built from, and a checkout sitting on
+# any other commit gets built from source instead of handed an older binary.
+# Anything that misses (unmapped platform, no release for this version, commit
+# mismatch, download or checksum failure) falls back to `cargo build --release`.
 set -u
 
 repo="andybarilla/herdr-scuttlebutt"
@@ -20,7 +22,7 @@ build_from_source() {
   # start), so pick cargo up from its env file when there is one.
   [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
   have cargo || {
-    echo "scuttlebutt: cargo not found. Install Rust from https://rustup.rs, or re-run once a release exists for this version." >&2
+    echo "scuttlebutt: cargo not found. Install Rust from https://rustup.rs, or re-install at a release tag (--ref v${version:-X.Y.Z}) to get a prebuilt binary." >&2
     exit 1
   }
   cd "$repo_root" || exit 1
@@ -61,6 +63,23 @@ version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' "$repo_root
 asset="scuttlebutt-$version-$triple.tar.gz"
 tmpdir=$(mktemp -d) || fallback "could not create a temp dir"
 trap 'rm -rf "$tmpdir"' EXIT
+
+# The prebuilt is only right for the commit it was built from, and Cargo.toml
+# still says the released version until the next bump lands — so a clone of main
+# names a version whose binary is older than its source. herdr clones shallow and
+# without tags, so `git describe` can never answer this; the release stamps its
+# commit in COMMIT and we compare that against HEAD. A missing COMMIT means a
+# release published before stamping, and in that window HEAD is not the tag
+# either, so an absent or empty stamp is deliberately treated as a mismatch.
+download "$base_url/v$version/COMMIT" "$tmpdir/COMMIT" || fallback "no prebuilt binary published for v$version (no commit stamp)"
+released=$(tr -d ' \t\r\n' < "$tmpdir/COMMIT")
+[ -n "$released" ] || fallback "v$version's commit stamp is empty"
+# No git metadata means this is not a herdr install (that clones; `plugin link`
+# skips [[build]]), so there is nothing to compare HEAD against.
+head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || head=
+if [ -n "$head" ] && [ "$head" != "$released" ]; then
+  fallback "this checkout is $(echo "$head" | cut -c1-7) but v$version was released from $(echo "$released" | cut -c1-7) — install with --ref v$version for the prebuilt binary"
+fi
 
 download "$base_url/v$version/$asset" "$tmpdir/$asset" || fallback "no prebuilt binary published for v$version ($asset)"
 download "$base_url/v$version/SHA256SUMS" "$tmpdir/SHA256SUMS" || fallback "no checksums published for v$version"
