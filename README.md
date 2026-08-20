@@ -11,8 +11,11 @@ under `~/dev/printersrow`.
 ## Install
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.1
 ```
+
+The tag is what has a prebuilt binary; installing from the default branch builds
+from source with `cargo build --release`.
 
 Or, working on it locally:
 

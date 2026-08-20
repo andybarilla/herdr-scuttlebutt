@@ -25,6 +25,8 @@ sed "/^\[package\]/,/^\[/ s/^version = .*/version = \"$version\"/" Cargo.toml > 
 mv Cargo.toml.tmp Cargo.toml
 sed "s/^version = .*/version = \"$version\"/" herdr-plugin.toml > herdr-plugin.toml.tmp
 mv herdr-plugin.toml.tmp herdr-plugin.toml
+sed "s|^herdr plugin install andybarilla/herdr-scuttlebutt --ref v.*|herdr plugin install andybarilla/herdr-scuttlebutt --ref v$version|" README.md > README.md.tmp
+mv README.md.tmp README.md
 
 cargo update -p scuttlebutt
 "$script_dir/check-versions.sh" >/dev/null
