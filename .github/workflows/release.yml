@@ -19,7 +19,8 @@ jobs:
         run: |
           tag=
           if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME; fi
-          echo "version=$(scripts/check-versions.sh $tag)" >> "$GITHUB_OUTPUT"
+          version=$(scripts/check-versions.sh $tag)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version-guard
