@@ -10,7 +10,7 @@ bin="$script_dir/../target/release/scuttlebutt"
 
 case "$cmd" in
   start)
-    status="$("$bin" daemon-status)"
+    status="$("$bin" daemon-status || true)"
     if grep -q '^running' <<<"$status"; then
       echo "$status"
       exit 0
@@ -19,9 +19,9 @@ case "$cmd" in
       # A daemon on a replaced binary has to go before the new one starts:
       # launching alongside it leaves two daemons, both delivering.
       echo "$status"
-      "$bin" daemon-stop
+      "$bin" daemon-stop || true
       for _ in $(seq 100); do
-        "$bin" daemon-status | grep -q '^not running' && break
+        if "$bin" daemon-status | grep -q '^not running'; then break; fi
         sleep 0.1
       done
       if ! "$bin" daemon-status | grep -q '^not running'; then
