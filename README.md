@@ -52,7 +52,7 @@ description = "Scuttlebutt: chat tab"
 | `andybarilla.scuttlebutt.open-chat-tab` | Chat room in its own tab; starts the daemon |
 | `andybarilla.scuttlebutt.daemon-start` | Start the delivery daemon |
 | `andybarilla.scuttlebutt.daemon-stop` | Stop it |
-| `andybarilla.scuttlebutt.daemon-status` | Report whether it is running |
+| `andybarilla.scuttlebutt.daemon-status` | Report whether it is running, and which build |
 
 In the chat pane, `Enter` posts, `Up`/`Down` scroll, and `Esc` or `Ctrl-C`
 leaves.

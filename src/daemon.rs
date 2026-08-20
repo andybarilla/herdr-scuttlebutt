@@ -627,11 +627,23 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     Ok(())
 }
 
+/// The commit comes from build.rs. An install that fetched a prebuilt binary
+/// older than the source it cloned shows up as a commit that is not the one
+/// `herdr plugin list` reports for the plugin.
+pub fn build_line() -> String {
+    format!(
+        "build: {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("SCUTTLEBUTT_COMMIT").unwrap_or("unknown")
+    )
+}
+
 pub fn status(dir: &Path) {
     // The session dir derives silently from HERDR_SOCKET_PATH; printing it
     // turns "daemon and TUI are on different sessions" from a silent no-op
     // into something you can see. Group rooms live underneath it.
     println!("session dir: {}", dir.display());
+    println!("{}", build_line());
     match read_live_record(dir) {
         Some(record) => println!("{}", status_line(record.pid, record.freshness())),
         None => println!("not running"),
@@ -1430,6 +1442,18 @@ mod tests {
         f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
             .unwrap();
         assert_eq!(rec.freshness(), Freshness::Stale);
+    }
+
+    #[test]
+    fn build_line_names_the_version_and_a_commit() {
+        // Neither field is knowable here, so this pins the shape scripts and
+        // `daemon-ctl.sh status` readers see, not the values.
+        let line = build_line();
+        let rest = line.strip_prefix("build: ").expect("build: prefix");
+        let (version, commit) = rest.split_once(' ').expect("version and commit");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert!(commit.starts_with('(') && commit.ends_with(')'), "{line}");
+        assert!(commit.len() > 2, "{line}");
     }
 
     #[test]

@@ -51,8 +51,11 @@ jobs:
           key: ${{ matrix.target }}
       - if: matrix.apt
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      # The stamp build.rs would read from git is the same commit, but passing it
+      # keeps the binary's stamp and the release's COMMIT asset on one source.
       - env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          SCUTTLEBUTT_COMMIT: ${{ needs.version-guard.outputs.sha }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
