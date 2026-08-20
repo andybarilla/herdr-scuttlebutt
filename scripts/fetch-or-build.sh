@@ -70,13 +70,14 @@ trap 'rm -rf "$tmpdir"' EXIT
 # without tags, so `git describe` can never answer this; the release stamps its
 # commit in COMMIT and we compare that against HEAD. A missing COMMIT means a
 # release published before stamping, and in that window HEAD is not the tag
-# either, so treating it as a mismatch is the right answer, not a gap to close.
+# either, so an absent or empty stamp is deliberately treated as a mismatch.
 download "$base_url/v$version/COMMIT" "$tmpdir/COMMIT" || fallback "no prebuilt binary published for v$version (no commit stamp)"
 released=$(tr -d ' \t\r\n' < "$tmpdir/COMMIT")
+[ -n "$released" ] || fallback "v$version's commit stamp is empty"
 # No git metadata means this is not a herdr install (that clones; `plugin link`
 # skips [[build]]), so there is nothing to compare HEAD against.
 head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || head=
-if [ -n "$head" ] && [ -n "$released" ] && [ "$head" != "$released" ]; then
+if [ -n "$head" ] && [ "$head" != "$released" ]; then
   fallback "this checkout is $(echo "$head" | cut -c1-7) but v$version was released from $(echo "$released" | cut -c1-7) — install with --ref v$version for the prebuilt binary"
 fi
 

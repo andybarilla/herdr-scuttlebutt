@@ -14,8 +14,9 @@ under `~/dev/printersrow`.
 herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.1
 ```
 
-The tag is what has a prebuilt binary; installing from the default branch builds
-from source with `cargo build --release`.
+The prebuilt binary is only used when the checkout is the commit that release
+was built from, so installing from the default branch generally builds from
+source with `cargo build --release`.
 
 Or, working on it locally:
 
