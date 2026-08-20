@@ -178,12 +178,26 @@ pub fn format_messages(msgs: &[Message]) -> String {
         .collect()
 }
 
+/// Ceiling on a posted message, in Unicode scalar values. A ceiling with
+/// headroom over the longest message anyone judged worth its length, not a
+/// target: see ADR-0001 for why the room's guidance is a rejected command
+/// rather than a sentence asking for brevity.
+pub const MAX_POST_CHARS: usize = 700;
+
 pub fn cmd_post(
     group: Option<&str>,
     herd: &dyn HerdControl,
     as_flag: Option<&str>,
     text: &str,
 ) -> Result<()> {
+    // First, before resolving anything. The length depends on the text alone,
+    // so checking here is what makes `--as human` capped without a special
+    // case, and what stops an unresolvable cwd or an unreachable herd from
+    // reporting itself instead of the length.
+    let chars = text.chars().count();
+    if chars > MAX_POST_CHARS {
+        bail!("message is {chars} chars; limit is {MAX_POST_CHARS}. Post a summary under {MAX_POST_CHARS} chars and put the detail on the issue.");
+    }
     let (resolved, _, _) = group_for_invocation(group)?;
     let dir = crate::paths::room_dir(resolved.as_deref())?;
     let pane = std::env::var("HERDR_PANE_ID").ok();
@@ -464,6 +478,95 @@ mod tests {
     fn unknown_pane_is_an_error() {
         assert!(resolve_sender(None, Some("w9:p9"), &agents()).is_err());
         assert!(resolve_sender(None, None, &agents()).is_err());
+    }
+
+    /// `cmd_post` with `--as` never reaches the herd; a stub that panics
+    /// proves the length check runs before anything else is resolved.
+    struct NoHerd;
+    impl HerdControl for NoHerd {
+        fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+            panic!("cmd_post must not consult the herd");
+        }
+        fn prompt(&self, _name: &str, _text: &str) -> Result<()> {
+            panic!("cmd_post must not prompt");
+        }
+    }
+
+    /// Points every path helper at a fresh room and returns it. Holds the
+    /// process-wide env lock for the caller's benefit.
+    fn room(guard: &std::sync::MutexGuard<'static, ()>) -> tempfile::TempDir {
+        let _ = guard;
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/cap-test.sock");
+        dir
+    }
+
+    fn room_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path()
+            .join("-tmp-cap-test-sock")
+            .join("t")
+            .join("room.jsonl")
+    }
+
+    #[test]
+    fn a_message_at_the_limit_is_posted() {
+        let env = crate::paths::env_guard();
+        let dir = room(&env);
+        let text = "a".repeat(MAX_POST_CHARS);
+        cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap();
+        let msgs = log_store::read_since(room_file(&dir).parent().unwrap(), 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text.chars().count(), MAX_POST_CHARS);
+    }
+
+    #[test]
+    fn one_char_over_the_limit_is_refused_and_writes_nothing() {
+        let env = crate::paths::env_guard();
+        let dir = room(&env);
+        let text = "a".repeat(MAX_POST_CHARS + 1);
+        let err = cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "message is 701 chars; limit is 700. Post a summary under 700 chars and put the detail on the issue."
+        );
+        // Not merely empty: `append` creates the file, so its absence is what
+        // proves the check ran before the write rather than after it.
+        assert!(!room_file(&dir).exists());
+    }
+
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        // A 700-character message of 4-byte characters is 2800 bytes; a byte
+        // count would reject it.
+        let env = crate::paths::env_guard();
+        let dir = room(&env);
+        let text = "\u{1F600}".repeat(MAX_POST_CHARS);
+        cmd_post(Some("t"), &NoHerd, Some("agent"), &text).unwrap();
+        let msgs = log_store::read_since(room_file(&dir).parent().unwrap(), 0).unwrap();
+        assert_eq!(msgs[0].text.chars().count(), MAX_POST_CHARS);
+    }
+
+    #[test]
+    fn posting_as_human_is_capped_too() {
+        // The obvious evasion: the human's TUI is uncapped, so the command
+        // must not become uncapped by claiming to be the human.
+        let env = crate::paths::env_guard();
+        let dir = room(&env);
+        let text = "a".repeat(MAX_POST_CHARS + 1);
+        assert!(cmd_post(Some("t"), &NoHerd, Some("human"), &text).is_err());
+        assert!(!room_file(&dir).exists());
+    }
+
+    #[test]
+    fn the_tui_append_path_is_uncapped() {
+        // The human posts by appending directly; keeping the check out of
+        // `log_store::append` is what preserves that.
+        let dir = tempfile::tempdir().unwrap();
+        let text = "a".repeat(MAX_POST_CHARS + 500);
+        log_store::append(dir.path(), "human", &text).unwrap();
+        let msgs = log_store::read_since(dir.path(), 0).unwrap();
+        assert_eq!(msgs[0].text.chars().count(), MAX_POST_CHARS + 500);
     }
 
     #[test]
