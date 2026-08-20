@@ -288,6 +288,90 @@ pub fn status_line(pid: u32, freshness: Freshness) -> String {
     }
 }
 
+/// What the loop should do about the executable on disk this tick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestartDecision {
+    Stay,
+    /// The file changed but has not held still for a tick yet.
+    Settling,
+    /// Exec this path: it is a different build than the one running, and it
+    /// stopped changing.
+    Restart(PathBuf),
+}
+
+/// Watches the executable a daemon started from and decides when the daemon
+/// should hand itself over to a newer build. An install rewrites the file in
+/// place, so a change seen on one tick can be a half-written file; a
+/// fingerprint only counts once it has survived a tick unchanged.
+pub struct RestartWatch {
+    recorded: Option<RecordedExe>,
+    /// Seen changed, not yet stable.
+    pending: Option<ExeFingerprint>,
+    /// Reached `Restart` and failed to exec. Not offered again.
+    failed: Option<ExeFingerprint>,
+}
+
+impl RestartWatch {
+    pub fn new(recorded: Option<RecordedExe>) -> Self {
+        RestartWatch {
+            recorded,
+            pending: None,
+            failed: None,
+        }
+    }
+
+    pub fn poll(&mut self) -> RestartDecision {
+        let Some(recorded) = &self.recorded else {
+            return RestartDecision::Stay;
+        };
+        // A missing file is the middle of an install, not a build to exec.
+        let Some(current) = ExeFingerprint::of(&recorded.path) else {
+            self.pending = None;
+            return RestartDecision::Stay;
+        };
+        if current == recorded.fingerprint || Some(&current) == self.failed.as_ref() {
+            self.pending = None;
+            return RestartDecision::Stay;
+        }
+        if self.pending.as_ref() == Some(&current) {
+            RestartDecision::Restart(recorded.path.clone())
+        } else {
+            self.pending = Some(current);
+            RestartDecision::Settling
+        }
+    }
+
+    /// The exec for the last `Restart` returned instead of replacing this
+    /// process. That build is written off until another one lands.
+    pub fn exec_failed(&mut self) {
+        self.failed = self.pending.take();
+    }
+}
+
+/// Hands this process over to the build at `path`, keeping argv so a
+/// `--agents` filter survives the upgrade. Returns only on failure — a
+/// successful exec replaces this image, pid and all.
+///
+/// The pidfile goes first: exec keeps the pid, so the new image's
+/// single-instance guard would find this very process alive and refuse to
+/// start. If it cannot be removed the restart is abandoned rather than risked,
+/// since the alternative is no daemon at all.
+fn restart_into(session: &Path, path: &Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    log_line(
+        session,
+        &format!("binary replaced; restarting into {}", path.display()),
+    );
+    match std::fs::remove_file(session.join("daemon.pid")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return e,
+    }
+    std::process::Command::new(path)
+        .args(std::env::args_os().skip(1))
+        .exec()
+}
+
 fn read_live_record(dir: &Path) -> Option<PidRecord> {
     let text = std::fs::read_to_string(dir.join("daemon.pid")).ok()?;
     let record = parse_pidfile(&text)?;
@@ -557,6 +641,7 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
              reinstall from a current build for this daemon",
         );
     }
+    let mut watch = RestartWatch::new(recorded.clone());
     let pidfile = render_pidfile(std::process::id(), recorded.as_ref());
     if let Err(e) = std::fs::write(session.join("daemon.pid"), pidfile) {
         // Without a pidfile, daemon-status/daemon-stop cannot find us; fail
@@ -620,6 +705,33 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // A signal that arrived during the sleep wins over a pending restart:
+        // exec'ing here would clear the term flag in the new image, so
+        // `daemon-stop` would report success and the daemon would come back.
+        if term.load(Ordering::Relaxed) {
+            break;
+        }
+        // Between passes, never mid-delivery: an install that lands while this
+        // daemon runs leaves it delivering old code until something restarts
+        // it, and nothing else was going to.
+        if let RestartDecision::Restart(path) = watch.poll() {
+            let e = restart_into(session, &path);
+            report(
+                session,
+                &format!(
+                    "restart into {} failed: {e}; staying on the running build. \
+                     That build is not retried — start the daemon again to pick it up",
+                    path.display()
+                ),
+            );
+            if let Err(e) = std::fs::write(
+                session.join("daemon.pid"),
+                render_pidfile(std::process::id(), recorded.as_ref()),
+            ) {
+                report(session, &format!("failed to restore daemon.pid: {e}"));
+            }
+            watch.exec_failed();
         }
     }
     log_line(session, "daemon stopped");
@@ -1430,6 +1542,93 @@ mod tests {
         f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
             .unwrap();
         assert_eq!(rec.freshness(), Freshness::Stale);
+    }
+
+    /// Rewrites the file the way an install or a `cargo build` does: new
+    /// content, and an mtime set explicitly rather than slept for so a
+    /// coarse-granularity filesystem cannot decide whether this passes.
+    fn replace_binary(path: &Path, body: &str, newer_by_secs: u64) {
+        std::fs::write(path, body).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(newer_by_secs),
+            )
+            .unwrap();
+    }
+
+    /// A watch over a freshly written executable, as `run` builds one at start.
+    fn watching(dir: &Path) -> (PathBuf, RestartWatch) {
+        let exe = dir.join("scuttlebutt");
+        std::fs::write(&exe, "build one").unwrap();
+        (exe.clone(), RestartWatch::new(RecordedExe::of(&exe)))
+    }
+
+    #[test]
+    fn restart_watch_stays_while_the_binary_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_exe, mut watch) = watching(dir.path());
+        assert_eq!(watch.poll(), RestartDecision::Stay);
+        assert_eq!(watch.poll(), RestartDecision::Stay);
+    }
+
+    #[test]
+    fn restart_watch_settles_for_one_tick_before_restarting() {
+        // The binary is written in place, so the tick that first sees a change
+        // can be looking at a half-written file. Only a fingerprint that holds
+        // still across a tick is safe to exec.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, mut watch) = watching(dir.path());
+        replace_binary(&exe, "build two", 60);
+        assert_eq!(watch.poll(), RestartDecision::Settling);
+        assert_eq!(watch.poll(), RestartDecision::Restart(exe));
+    }
+
+    #[test]
+    fn restart_watch_keeps_settling_while_the_binary_keeps_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, mut watch) = watching(dir.path());
+        replace_binary(&exe, "build two", 60);
+        assert_eq!(watch.poll(), RestartDecision::Settling);
+        replace_binary(&exe, "build two and a half", 120);
+        assert_eq!(watch.poll(), RestartDecision::Settling);
+    }
+
+    #[test]
+    fn restart_watch_stays_while_the_binary_is_missing() {
+        // The window inside an install where the old file is unlinked and the
+        // new one is not written yet: there is nothing to exec.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, mut watch) = watching(dir.path());
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(watch.poll(), RestartDecision::Stay);
+    }
+
+    #[test]
+    fn restart_watch_stays_without_a_recorded_fingerprint() {
+        // A daemon that could not fingerprint itself at startup has nothing to
+        // compare against, so it keeps running rather than guessing.
+        let mut watch = RestartWatch::new(None);
+        assert_eq!(watch.poll(), RestartDecision::Stay);
+    }
+
+    #[test]
+    fn restart_watch_does_not_retry_a_build_that_failed_to_exec() {
+        // Retrying a binary that would not exec every 2s buys nothing and
+        // fills the log; the next build is a different fingerprint and does
+        // get its turn.
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, mut watch) = watching(dir.path());
+        replace_binary(&exe, "build two", 60);
+        assert_eq!(watch.poll(), RestartDecision::Settling);
+        assert_eq!(watch.poll(), RestartDecision::Restart(exe.clone()));
+        watch.exec_failed();
+        assert_eq!(watch.poll(), RestartDecision::Stay);
+        replace_binary(&exe, "build three", 120);
+        assert_eq!(watch.poll(), RestartDecision::Settling);
+        assert_eq!(watch.poll(), RestartDecision::Restart(exe));
     }
 
     #[test]
