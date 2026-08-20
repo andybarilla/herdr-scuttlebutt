@@ -17,17 +17,10 @@ jobs:
       - uses: actions/checkout@v5
       - id: version
         run: |
-          cargo_version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)
-          plugin_version=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml | head -1)
-          if [ "$cargo_version" != "$plugin_version" ]; then
-            echo "Cargo.toml $cargo_version != herdr-plugin.toml $plugin_version" >&2
-            exit 1
-          fi
-          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$cargo_version" ]; then
-            echo "tag ${GITHUB_REF_NAME} != version $cargo_version" >&2
-            exit 1
-          fi
-          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+          tag=
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME; fi
+          version=$(scripts/check-versions.sh $tag)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version-guard
