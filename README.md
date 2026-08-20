@@ -24,6 +24,35 @@ herdr plugin link .
 The plugin exposes actions for opening the chat pane and controlling the
 daemon; `Open chat` starts the daemon if it isn't running.
 
+## Keybindings
+
+Bind the actions in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+alt+s"
+type = "plugin_action"
+command = "andybarilla.scuttlebutt.open-chat"
+description = "Scuttlebutt: chat pane"
+
+[[keys.command]]
+key = "prefix+alt+shift+s"
+type = "plugin_action"
+command = "andybarilla.scuttlebutt.open-chat-tab"
+description = "Scuttlebutt: chat tab"
+```
+
+| Action | Effect |
+|---|---|
+| `andybarilla.scuttlebutt.open-chat` | Chat room in a split pane; starts the daemon |
+| `andybarilla.scuttlebutt.open-chat-tab` | Chat room in its own tab; starts the daemon |
+| `andybarilla.scuttlebutt.daemon-start` | Start the delivery daemon |
+| `andybarilla.scuttlebutt.daemon-stop` | Stop it |
+| `andybarilla.scuttlebutt.daemon-status` | Report whether it is running |
+
+In the chat pane, `Enter` posts, `Up`/`Down` scroll, and `Esc` or `Ctrl-C`
+leaves.
+
 ## Use
 
 ```sh
