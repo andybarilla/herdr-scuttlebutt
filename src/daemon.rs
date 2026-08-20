@@ -203,8 +203,8 @@ pub fn parse_pidfile(text: &str) -> Option<PidRecord> {
             fields.insert(k.trim(), v.trim());
         }
     }
-    // Anything short of a whole record is unknown, not stale: a partial record
-    // cannot be compared, and guessing would restart a healthy daemon.
+    // A partial record cannot be compared against anything, so it reports
+    // unknown; guessing at it would restart a healthy daemon.
     let exe = (|| {
         Some(RecordedExe {
             path: PathBuf::from(fields.get("exe")?),
@@ -220,8 +220,8 @@ pub fn parse_pidfile(text: &str) -> Option<PidRecord> {
     Some(PidRecord { pid, exe })
 }
 
-/// A distinct first word rather than a suffix on `running`, so scripts can
-/// branch on it — `daemon-ctl.sh`'s start branch greps for `^running`.
+/// Staleness gets its own first word so scripts can branch on it:
+/// `daemon-ctl.sh`'s start branch greps for `^running`.
 pub fn status_line(pid: u32, freshness: Freshness) -> String {
     match freshness {
         Freshness::Stale => format!(
