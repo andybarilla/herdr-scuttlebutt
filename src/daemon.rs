@@ -596,17 +596,7 @@ pub fn stop(dir: &Path) -> Result<()> {
     }
 }
 
-pub fn intro_text(name: &str, members: &[AgentInfo], exe: &str, group: Option<&str>) -> String {
-    let others: Vec<&str> = members
-        .iter()
-        .map(|a| a.name.as_str())
-        .filter(|n| *n != name)
-        .collect();
-    let others = if others.is_empty() {
-        "none yet".to_string()
-    } else {
-        others.join(", ")
-    };
+pub fn intro_text(exe: &str, group: Option<&str>) -> String {
     // Structural separation (one room dir per group) is the real control;
     // this sentence is belt-and-braces against an agent volunteering to relay.
     let scope = match group {
@@ -619,9 +609,10 @@ pub fn intro_text(name: &str, members: &[AgentInfo], exe: &str, group: Option<&s
     };
     format!(
         "[scuttlebutt] You are in this herdr session's shared chat room.{scope} \
-         Other members: {others} (plus the human).\n\
+         The human is in the room too.\n\
          To post: {exe} post \"your message\"\n\
          To catch up: {exe} read\n\
+         To see who's here: {exe} agents\n\
          New messages from others are delivered to you automatically when \
          you are idle; a message you already saw via `read` may be delivered \
          again. Keep messages short and purposeful. No action needed now."
@@ -725,7 +716,7 @@ pub fn tick(
             // handed was checked as late as possible: a plugin install can
             // land at any point in the session.
             let exe = crate::paths::command_path();
-            match herd.prompt(&a.name, &intro_text(&a.name, &agents, &exe, group)) {
+            match herd.prompt(&a.name, &intro_text(&exe, group)) {
                 Ok(()) => {
                     state.introduced.insert(a.name.clone());
                     state.intro_fails.remove(&a.name);
@@ -1593,17 +1584,24 @@ mod tests {
 
     #[test]
     fn intro_names_the_group_and_forbids_relaying() {
-        let members = vec![agent_at("a1", "/w/alare", "idle")];
-        let text = intro_text("a1", &members, "scuttlebutt", Some("alare"));
+        let text = intro_text("scuttlebutt", Some("alare"));
         assert!(text.contains("alare"));
         assert!(text.to_lowercase().contains("relay"));
     }
 
     #[test]
     fn intro_without_a_group_does_not_mention_one() {
-        let members = vec![agent_at("a1", "/w/alare", "idle")];
-        let text = intro_text("a1", &members, "scuttlebutt", None);
+        let text = intro_text("scuttlebutt", None);
         assert!(!text.contains("alare"));
+    }
+
+    #[test]
+    fn intro_points_at_the_roster_command_instead_of_listing_members() {
+        // Any list baked in here is frozen at enrollment; the command is not.
+        let text = intro_text("scuttlebutt", None);
+        assert!(text.contains("scuttlebutt agents"));
+        assert!(!text.contains("Other members"));
+        assert!(text.contains("The human is in the room too."));
     }
 
     #[test]
