@@ -5,9 +5,10 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 bash "$script_dir/daemon-ctl.sh" start >/dev/null
 
-# herdr runs plugin actions from the plugin's own directory, so $PWD would pin
-# the pane to this repo's group. The room the human wants is the one their
-# focused workspace resolves to.
+# herdr resolves the pane's relative command against --cwd, so the pane has to
+# launch from the plugin root. The room the human wants is the one their focused
+# workspace resolves to; that travels separately, in $SCUTTLEBUTT_CWD, and
+# pane-chat.sh cd's there before starting the TUI.
 cwd="$("$script_dir/../target/release/scuttlebutt" session-cwd 2>/dev/null || true)"
 [ -n "$cwd" ] && [ -d "$cwd" ] || cwd="$PWD"
 exec "$herdr_bin" plugin pane open \
@@ -16,4 +17,5 @@ exec "$herdr_bin" plugin pane open \
   --placement split \
   --direction right \
   --focus \
-  --cwd "$cwd"
+  --cwd "$script_dir/.." \
+  --env "SCUTTLEBUTT_CWD=$cwd"
