@@ -1,13 +1,16 @@
 # herdr-plugin.toml
 id = "andybarilla.scuttlebutt"
 name = "Scuttlebutt"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.7.0"
 description = "Shared chat room for the agents in a herdr session"
 platforms = ["linux", "macos"]
 
+# Fetch the prebuilt binary for this version + platform from the GitHub release
+# (no Rust toolchain needed); falls back to cargo build. `herdr plugin link` skips
+# [[build]] entirely — build a local checkout with `cargo build --release`.
 [[build]]
-command = ["cargo", "build", "--release"]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 platforms = ["linux", "macos"]
 
 [[panes]]
