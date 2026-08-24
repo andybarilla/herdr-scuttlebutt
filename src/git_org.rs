@@ -111,18 +111,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    fn counting_lookup(_cwd: &Path) -> Option<String> {
-        CALLS.fetch_add(1, Ordering::SeqCst);
-        Some("acme".to_string())
-    }
-
-    fn counting_miss(_cwd: &Path) -> Option<String> {
-        CALLS.fetch_add(1, Ordering::SeqCst);
-        None
-    }
-
     fn repo_with_origin(url: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -167,8 +155,19 @@ mod tests {
 
     #[test]
     fn repeat_lookups_of_one_cwd_hit_the_cache() {
-        CALLS.store(0, Ordering::SeqCst);
-        let mut cache = OrgCache::with_lookup(counting_lookup, Duration::from_secs(300));
+        // `with_lookup` takes a plain `fn`, which cannot capture, so the call
+        // counter has to be a static. Each cache test declares its own inside
+        // its body: cargo runs these in parallel, and one counter at module
+        // scope both accumulated other tests' calls and was reset by them
+        // mid-test, so every count belonged to the interleaving rather than to
+        // the test reading it.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn lookup(_cwd: &Path) -> Option<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Some("acme".to_string())
+        }
+
+        let mut cache = OrgCache::with_lookup(lookup, Duration::from_secs(300));
         assert_eq!(cache.get(Path::new("/w/a")).as_deref(), Some("acme"));
         assert_eq!(cache.get(Path::new("/w/a")).as_deref(), Some("acme"));
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
@@ -177,8 +176,13 @@ mod tests {
     #[test]
     fn a_missing_org_is_cached_too() {
         // otherwise every tick re-spawns git for every non-repo agent
-        CALLS.store(0, Ordering::SeqCst);
-        let mut cache = OrgCache::with_lookup(counting_miss, Duration::from_secs(300));
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn lookup(_cwd: &Path) -> Option<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+
+        let mut cache = OrgCache::with_lookup(lookup, Duration::from_secs(300));
         assert_eq!(cache.get(Path::new("/w/b")), None);
         assert_eq!(cache.get(Path::new("/w/b")), None);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
@@ -187,8 +191,13 @@ mod tests {
     #[test]
     fn an_expired_entry_is_looked_up_again() {
         // a cwd becomes a repo, or gains an origin, while the daemon runs
-        CALLS.store(0, Ordering::SeqCst);
-        let mut cache = OrgCache::with_lookup(counting_lookup, Duration::ZERO);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn lookup(_cwd: &Path) -> Option<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Some("acme".to_string())
+        }
+
+        let mut cache = OrgCache::with_lookup(lookup, Duration::ZERO);
         cache.get(Path::new("/w/c"));
         cache.get(Path::new("/w/c"));
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
@@ -196,8 +205,13 @@ mod tests {
 
     #[test]
     fn distinct_cwds_are_looked_up_separately() {
-        CALLS.store(0, Ordering::SeqCst);
-        let mut cache = OrgCache::with_lookup(counting_lookup, Duration::from_secs(300));
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn lookup(_cwd: &Path) -> Option<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Some("acme".to_string())
+        }
+
+        let mut cache = OrgCache::with_lookup(lookup, Duration::from_secs(300));
         cache.get(Path::new("/w/d"));
         cache.get(Path::new("/w/e"));
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
