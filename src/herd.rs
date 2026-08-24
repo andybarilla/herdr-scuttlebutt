@@ -50,9 +50,8 @@ const FINGERPRINT_CHARS: usize = 40;
 /// landed between the write and the snapshot.
 const REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Consecutive horizontal box-drawing characters that make a line a rule.
-/// Long enough that prose quoting a rule (`"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}"`) is not
-/// mistaken for one.
+/// Horizontal box-drawing characters a line needs before it counts as a
+/// rule, so that a lone `\u{2502}` or a two-character fragment is not one.
 const RULE_RUN: usize = 8;
 
 /// Whitespace-insensitive form. The composer wraps at word boundaries and
@@ -61,53 +60,76 @@ fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Least composer text that can be taken for a run of our own. A rule inside
-/// a message body splits the composer region, leaving only the text below it
-/// to match; this is the floor at which that remainder is ours rather than a
-/// short phrase someone happened to type.
-const SPLIT_TAIL_CHARS: usize = 16;
-
-/// Whether `region` is the tail of a composer whose top a rule inside the
-/// message body cut off.
-fn is_split_tail(region: &str, sent: &str) -> bool {
-    region.chars().count() >= SPLIT_TAIL_CHARS && sent.contains(region)
+/// The composer's prompt marker is furniture, not content. Stripping it is
+/// what separates a cleared composer from one holding text, and it stops a
+/// batch that happens to quote a marker from making a cleared composer look
+/// occupied.
+fn strip_marker(region: &str) -> &str {
+    let is_marker = |t: &str| t.chars().count() == 1 && !t.chars().any(char::is_alphanumeric);
+    match region.split_once(' ') {
+        Some((first, rest)) if is_marker(first) => rest,
+        _ if is_marker(region) => "",
+        _ => region,
+    }
 }
 
-/// A horizontal rule, which is how the composer box is drawn. Any of the
-/// box-drawing horizontals — heavy, double, dashed — counts, since which one
-/// a terminal UI picks is its own business; a run of them is required so that
-/// text merely containing one is content, not furniture.
+/// Whether a line *is* a horizontal rule, which is how the composer box is
+/// drawn. Any of the box-drawing horizontals counts — heavy, double, dashed,
+/// block — since which one a terminal UI picks is its own business, and
+/// corners and verticals may bracket the run.
+///
+/// The whole line has to be rule characters. A line that merely contains a
+/// run is content: a message body carrying box-drawn terminal output reaches
+/// the composer with its line breaks intact, and treating one of its lines as
+/// furniture would move the composer boundary onto it.
 fn is_rule(line: &str) -> bool {
-    let mut run = 0;
+    let line = line.trim();
+    let mut horizontals = 0;
     for c in line.chars() {
-        run = match c {
+        match c {
             // light, heavy, dashed and double horizontals; the horizontal
             // bar and extension; the block halves a UI may rule with
             '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
             | '\u{254c}' | '\u{254d}' | '\u{2550}' | '\u{2015}' | '\u{23af}' | '\u{2580}'
-            | '\u{2581}' | '\u{2584}' | '\u{2594}' => run + 1,
-            _ => 0,
-        };
-        if run >= RULE_RUN {
-            return true;
+            | '\u{2581}' | '\u{2584}' | '\u{2594}' => horizontals += 1,
+            // corners, tees and verticals may bracket or join the run
+            '\u{2502}'
+            | '\u{2503}'
+            | '\u{2506}'
+            | '\u{2507}'
+            | '\u{250a}'
+            | '\u{250b}'
+            | '\u{250c}'..='\u{254b}'
+            | '\u{254e}'
+            | '\u{254f}'
+            | '\u{2551}'..='\u{256c}' => {}
+            _ => return false,
         }
     }
-    false
+    horizontals >= RULE_RUN
 }
 
 /// Whether `sent` is sitting unsubmitted on `pane`'s composer — the region
 /// between the last two horizontal rules, below which there is only the
-/// status footer. It counts as ours when it opens with our fingerprint, or
-/// when a rule inside a message body cut the top off and only a run of our
-/// own text is left (`is_split_tail`).
+/// status footer.
 ///
-/// `None` means no composer could be located. That is ambiguous rather than
-/// informative: it happens when an unsubmitted batch is tall enough to push
-/// its own top rule off the screen, when a pane draws no composer at all,
-/// and when a rule is drawn some way this does not recognize. The ambiguity
-/// is resolved toward "not submitted" by the caller, because a wrong
-/// `Submitted` drops the batch permanently while a wrong `Unconfirmed` costs
-/// a repeat delivery and converges on the skip threshold.
+/// Three answers, and the boundary between them is where this earns its
+/// keep. Text that is a run of our own — whole, or with its top cut off by a
+/// rule inside a message body — is `Some(true)`. `Some(false)` is claimed
+/// only for a composer that was found and then either cleared or holding
+/// text that is not ours; someone typing at the pane does not make our
+/// delivery undelivered, which is #24's question and stays out of scope.
+/// Everything else is `None`: no rules to bound a region, or a region with
+/// nothing in it at all, which means the pair of rules found was not the
+/// composer's.
+///
+/// `None` is ambiguous rather than informative — it covers an unsubmitted
+/// batch tall enough to push its own top rule off screen, a pane drawing no
+/// composer, and a rule drawn some way `is_rule` does not know — so the
+/// caller resolves it toward "not submitted". A wrong `Submitted` drops the
+/// batch permanently; a wrong `Unconfirmed` costs a repeat delivery and
+/// converges on the skip threshold. Every path here that cannot tell must
+/// therefore reach `None` rather than falling through to `Some(false)`.
 fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     let lines: Vec<&str> = pane.lines().collect();
     let rules: Vec<usize> = lines
@@ -120,9 +142,21 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
         return None;
     };
     let region = normalize(&lines[top + 1..bottom].join(" "));
+    if region.is_empty() {
+        // Not even a prompt marker: a composer always draws one, so these
+        // two rules bound something else — most often a message body that
+        // ended with a rule of its own.
+        return None;
+    }
+    let content = strip_marker(&region);
+    if content.is_empty() {
+        return Some(false);
+    }
     let sent = normalize(sent);
     let fingerprint: String = sent.chars().take(FINGERPRINT_CHARS).collect();
-    Some(region.contains(&fingerprint) || is_split_tail(&region, &sent))
+    // Either the composer opens with our text, or a rule inside a message
+    // body cut its top off and what is left is still a run of our own.
+    Some(content.contains(&fingerprint) || sent.contains(content))
 }
 
 fn read_pane(name: &str) -> Result<String> {
@@ -487,20 +521,73 @@ mod tests {
             let r = c.to_string().repeat(RULE_RUN);
             assert!(is_rule(&r), "{c:?} run not recognized");
         }
-        // a rule with corners, and a titled rule, both still read as rules
+        // corners may bracket the run, and surrounding whitespace is ignored
         assert!(is_rule(&format!(
-            "\u{250c}{}\u{2510}",
+            "  \u{250c}{}\u{2510}  ",
             "\u{2500}".repeat(20)
         )));
-        assert!(is_rule(&format!(
+        // a fragment is not a rule
+        assert!(!is_rule("\u{2500}\u{2500}"));
+        assert!(!is_rule(""));
+    }
+
+    #[test]
+    fn a_line_merely_containing_a_run_is_content_not_furniture() {
+        // The whole-line property is what keeps a message body out of the
+        // composer boundary. A titled rule is prose by the same test.
+        assert!(!is_rule(
+            "like \"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\", dashed variants"
+        ));
+        assert!(!is_rule(&format!(
             "{} Context {}",
             "\u{2500}".repeat(10),
             "\u{2500}".repeat(10)
         )));
-        // and a short run in prose is not
-        assert!(!is_rule(
-            "like \"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\", dashed variants"
-        ));
+        assert!(!is_rule("[#1] someone: load \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2584}\u{2584}\u{2584} ok"));
+    }
+
+    #[test]
+    fn a_run_inside_a_message_body_does_not_relocate_the_boundary() {
+        // Message bodies keep their line breaks through `scrub`, so a pasted
+        // line of block-drawn output lands in the composer as its own line.
+        // Reading it as furniture put the boundary on it, emptied the region
+        // and reported the batch submitted — silent loss.
+        let composer = [
+            "\u{276f} Reply only if you have information others don't \u{2014} don't",
+            "  acknowledge or repeat. Under 80 words; longer belongs on the issue.",
+            "  [scuttlebutt] New messages in the room:",
+            "  [#1] someone: load \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2584}\u{2584}\u{2584} ok",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
+    }
+
+    #[test]
+    fn a_batch_ending_in_a_rule_is_not_read_as_a_cleared_composer() {
+        // The message's own rule becomes the top of the last pair, leaving
+        // an empty region. Nothing was found, so nothing is confirmed.
+        let composer = [
+            "\u{276f} Reply only if you have information others don't \u{2014} don't",
+            "  [scuttlebutt] New messages in the room:",
+            &"\u{2500}".repeat(30),
+        ];
+        assert_eq!(composer_holds(&pane(&composer), RULE), None);
+    }
+
+    #[test]
+    fn a_short_tail_below_a_body_rule_is_still_ours() {
+        // The remainder can be shorter than any fingerprint. Requiring a
+        // minimum length here reported the batch submitted and dropped it.
+        let sent = format!(
+            "{RULE}\n[scuttlebutt] New messages in the room:\n[#1] a: {}\nthanks all",
+            "\u{2500}".repeat(30)
+        );
+        let composer = [
+            "\u{276f} Reply only if you have information others don't",
+            "  [#1] a:",
+            &"\u{2500}".repeat(30),
+            "  thanks all",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), &sent), Some(true));
     }
 
     #[test]
@@ -519,20 +606,30 @@ mod tests {
         assert_eq!(composer_holds(&pane(&composer), &sent), Some(true));
     }
 
-    fn ok_pane(_: &str) -> Result<String> {
-        Ok(EMPTY.to_string())
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn unreadable(_: &str) -> Result<String> {
-        anyhow::bail!("agent target gone not found")
-    }
+    /// One counter per test rather than one shared by all of them: a static
+    /// that several tests reset races under `cargo test`'s parallelism, which
+    /// is what #30 is about.
+    static CLEARED_READS: AtomicUsize = AtomicUsize::new(0);
+    static REPAINT_READS: AtomicUsize = AtomicUsize::new(0);
+    static STUCK_READS: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn a_confirmed_first_look_costs_no_retry() {
+    fn a_confirmed_first_look_costs_one_read_and_no_retry() {
+        // The retry costs a `REREAD_DELAY` on every delivery if it is not
+        // skipped on the happy path, so the read count is the assertion —
+        // `Submitted` alone would hold however many looks it took.
+        fn cleared(_: &str) -> Result<String> {
+            CLEARED_READS.fetch_add(1, Ordering::SeqCst);
+            Ok(EMPTY.to_string())
+        }
+        CLEARED_READS.store(0, Ordering::SeqCst);
         assert_eq!(
-            Confirmer::with_read(ok_pane).confirm("reviewer", RULE),
+            Confirmer::with_read(cleared).confirm("reviewer", RULE),
             Delivery::Submitted
         );
+        assert_eq!(CLEARED_READS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -541,34 +638,41 @@ mod tests {
         // the pane has not repainted yet. Retrying is what keeps a healthy
         // delivery from being reported as undelivered.
         fn repainting(_: &str) -> Result<String> {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static LOOKS: AtomicUsize = AtomicUsize::new(0);
-            Ok(match LOOKS.fetch_add(1, Ordering::SeqCst) {
+            Ok(match REPAINT_READS.fetch_add(1, Ordering::SeqCst) {
                 0 => HOLDS_BATCH.to_string(),
                 _ => EMPTY.to_string(),
             })
         }
+        REPAINT_READS.store(0, Ordering::SeqCst);
         assert_eq!(
             Confirmer::with_read(repainting).confirm("reviewer", RULE),
             Delivery::Submitted
         );
+        assert_eq!(REPAINT_READS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn text_still_on_the_composer_after_both_looks_is_unconfirmed() {
         fn stuck(_: &str) -> Result<String> {
+            STUCK_READS.fetch_add(1, Ordering::SeqCst);
             Ok(HOLDS_BATCH.to_string())
         }
+        STUCK_READS.store(0, Ordering::SeqCst);
         assert_eq!(
             Confirmer::with_read(stuck).confirm("reviewer", RULE),
             Delivery::Unconfirmed("the text is still on the composer".into())
         );
+        // two looks and no more: the wait is paid once, not per tick
+        assert_eq!(STUCK_READS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn an_unreadable_pane_is_unconfirmed_and_names_the_cause() {
         // The agent's pane closed between the prompt and the read: nothing
         // was delivered, and the operator needs to see why.
+        fn unreadable(_: &str) -> Result<String> {
+            anyhow::bail!("agent target gone not found")
+        }
         let Delivery::Unconfirmed(why) = Confirmer::with_read(unreadable).confirm("gone", RULE)
         else {
             panic!("an unreadable pane confirmed a delivery");

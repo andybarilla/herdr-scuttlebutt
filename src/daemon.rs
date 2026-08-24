@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Consecutive non-deliveries of a batch to one agent before it is given up
-/// on. Counted two ways — per batch in `fail_counts`, and across batches in
-/// `unconfirmed_streak` — and either reaching this skips the batch.
+/// Non-deliveries to one agent before its batch is given up on. Two counters
+/// reach it over different events: `fail_counts` counts every non-delivery of
+/// one batch and restarts when the batch grows, while `unconfirmed_streak`
+/// counts only unconfirmed deliveries and ignores the batch. Either reaching
+/// this skips the batch.
 pub const MAX_BATCH_FAILURES: u32 = 5;
 
 /// Which agents this daemon enrolls. The spec's design is auto-enroll, so an
@@ -1038,15 +1040,18 @@ pub fn tick(
                 let fails = entry.0;
                 // Batch-independent, so a room busy enough to grow the batch
                 // every tick cannot keep an unconfirmable agent below the
-                // threshold forever.
-                let streak = match unconfirmed {
-                    true => {
-                        let s = state.unconfirmed_streak.entry(a.name.clone()).or_insert(0);
-                        *s += 1;
-                        *s
-                    }
-                    false => 0,
-                };
+                // threshold forever. Only unconfirmed deliveries advance it,
+                // but the stored value is what gets reported either way: a
+                // hard error in the middle of a streak must not log 0/5 and
+                // make the eventual skip look like it came from nowhere.
+                if unconfirmed {
+                    *state.unconfirmed_streak.entry(a.name.clone()).or_insert(0) += 1;
+                }
+                let streak = state
+                    .unconfirmed_streak
+                    .get(&a.name)
+                    .copied()
+                    .unwrap_or_default();
                 report(
                     dir,
                     &format!(
@@ -1825,6 +1830,28 @@ mod tests {
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         assert_eq!(state.fail_counts["reviewer"].0, 1);
         assert_eq!(state.unconfirmed_streak.get("reviewer"), None);
+    }
+
+    #[test]
+    fn a_hard_error_mid_streak_reports_the_stored_count() {
+        // Reporting a local 0 here made the skip two ticks later look like it
+        // arrived from nowhere in the daemon log.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+        for _ in 0..2 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        herd.fail_prompts = true;
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("failed: stalled (batch 3/5, unconfirmed 2/5)"),
+            "log was: {log}"
+        );
     }
 
     #[test]
