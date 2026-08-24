@@ -28,15 +28,32 @@ pub trait HerdControl {
     fn prompt(&self, name: &str, text: &str) -> Result<Delivery>;
 }
 
-/// Characters of the sent text matched against the composer. Long enough to
-/// be unique to scuttlebutt's own outgoing text, short enough to survive a
-/// composer that clips the line it is rendered on.
+/// Characters of the sent text matched against the composer.
+///
+/// Deliberately *not* unique to one batch: every batch opens with the same
+/// `DELIVERY_RULE`, so this identifies scuttlebutt's outgoing text in
+/// general, not this particular send. That is sound only because `herdr
+/// agent prompt` replaces the composer contents rather than appending to
+/// them — observed on live panes and recorded on #26 — so text matching the
+/// fingerprint after a prompt can only be the text that prompt just wrote.
+///
+/// If herdr ever appends instead, an older batch left unsent on the composer
+/// would make a genuinely submitted new batch read as unsubmitted. That
+/// costs a repeat delivery and converges on the skip threshold; it does not
+/// lose a batch silently, which is the failure this whole path exists to
+/// prevent. No unit test can guard a third-party invariant, so it is named
+/// here instead.
 const FINGERPRINT_CHARS: usize = 40;
 
 /// How long to let the pane repaint before a second look. Paid only when the
-/// first read found the text still on the composer, which on a healthy pane
-/// means the prompt landed between the write and the snapshot.
+/// first look failed to confirm, which on a healthy pane means the prompt
+/// landed between the write and the snapshot.
 const REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Consecutive horizontal box-drawing characters that make a line a rule.
+/// Long enough that prose quoting a rule (`"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}"`) is not
+/// mistaken for one.
+const RULE_RUN: usize = 8;
 
 /// Whitespace-insensitive form. The composer wraps at word boundaries and
 /// pads with NBSP, so comparing normalized text matches across both.
@@ -44,41 +61,68 @@ fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn fingerprint(sent: &str) -> String {
-    normalize(sent).chars().take(FINGERPRINT_CHARS).collect()
+/// Least composer text that can be taken for a run of our own. A rule inside
+/// a message body splits the composer region, leaving only the text below it
+/// to match; this is the floor at which that remainder is ours rather than a
+/// short phrase someone happened to type.
+const SPLIT_TAIL_CHARS: usize = 16;
+
+/// Whether `region` is the tail of a composer whose top a rule inside the
+/// message body cut off.
+fn is_split_tail(region: &str, sent: &str) -> bool {
+    region.chars().count() >= SPLIT_TAIL_CHARS && sent.contains(region)
 }
 
-/// A horizontal rule, which is how the composer box is drawn. Box-drawing
-/// characters only: message bodies reach the pane unaltered, so a line of
-/// ASCII `---` in someone's post is content, not furniture.
-fn is_border(line: &str) -> bool {
-    let t = line.trim();
-    !t.is_empty()
-        && t.chars()
-            .all(|c| matches!(c, '\u{2500}' | '\u{2501}' | '\u{2550}'))
+/// A horizontal rule, which is how the composer box is drawn. Any of the
+/// box-drawing horizontals — heavy, double, dashed — counts, since which one
+/// a terminal UI picks is its own business; a run of them is required so that
+/// text merely containing one is content, not furniture.
+fn is_rule(line: &str) -> bool {
+    let mut run = 0;
+    for c in line.chars() {
+        run = match c {
+            // light, heavy, dashed and double horizontals; the horizontal
+            // bar and extension; the block halves a UI may rule with
+            '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
+            | '\u{254c}' | '\u{254d}' | '\u{2550}' | '\u{2015}' | '\u{23af}' | '\u{2580}'
+            | '\u{2581}' | '\u{2584}' | '\u{2594}' => run + 1,
+            _ => 0,
+        };
+        if run >= RULE_RUN {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `sent` is sitting unsubmitted on `pane`'s composer — the region
 /// between the last two horizontal rules, below which there is only the
-/// status footer.
+/// status footer. It counts as ours when it opens with our fingerprint, or
+/// when a rule inside a message body cut the top off and only a run of our
+/// own text is left (`is_split_tail`).
 ///
-/// `None` means the composer could not be located, which is itself evidence
-/// against submission: a submitted prompt leaves an empty one-line box with
-/// both rules on screen, while an unsubmitted batch is tall enough to push
-/// its own top rule off it.
+/// `None` means no composer could be located. That is ambiguous rather than
+/// informative: it happens when an unsubmitted batch is tall enough to push
+/// its own top rule off the screen, when a pane draws no composer at all,
+/// and when a rule is drawn some way this does not recognize. The ambiguity
+/// is resolved toward "not submitted" by the caller, because a wrong
+/// `Submitted` drops the batch permanently while a wrong `Unconfirmed` costs
+/// a repeat delivery and converges on the skip threshold.
 fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     let lines: Vec<&str> = pane.lines().collect();
     let rules: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| is_border(l))
+        .filter(|(_, l)| is_rule(l))
         .map(|(i, _)| i)
         .collect();
     let [.., top, bottom] = rules[..] else {
         return None;
     };
     let region = normalize(&lines[top + 1..bottom].join(" "));
-    Some(region.contains(&fingerprint(sent)))
+    let sent = normalize(sent);
+    let fingerprint: String = sent.chars().take(FINGERPRINT_CHARS).collect();
+    Some(region.contains(&fingerprint) || is_split_tail(&region, &sent))
 }
 
 fn read_pane(name: &str) -> Result<String> {
@@ -99,30 +143,53 @@ fn read_pane(name: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-/// Reads `name`'s pane back and reports whether `sent` actually left the
-/// composer.
-fn confirm(name: &str, sent: &str) -> Delivery {
-    match look(name, sent) {
-        // The happy path costs one read and no waiting.
-        Delivery::Submitted => Delivery::Submitted,
-        // A pane that has not repainted yet still shows the text it is about
-        // to submit, so give it a moment and look once more before calling a
-        // delivery undelivered.
-        Delivery::Unconfirmed(_) => {
-            std::thread::sleep(REREAD_DELAY);
-            look(name, sent)
-        }
-    }
+/// Reads a pane back to decide whether a prompt was submitted. The pane read
+/// and the retry delay are fields so the retry, the delay and the error
+/// mapping can be driven without a live herdr.
+struct Confirmer {
+    read: fn(&str) -> Result<String>,
+    delay: std::time::Duration,
 }
 
-fn look(name: &str, sent: &str) -> Delivery {
-    match read_pane(name) {
-        Err(e) => Delivery::Unconfirmed(format!("could not read the pane: {e}")),
-        Ok(pane) => match composer_holds(&pane, sent) {
-            Some(false) => Delivery::Submitted,
-            Some(true) => Delivery::Unconfirmed("the text is still on the composer".into()),
-            None => Delivery::Unconfirmed("no composer found in the pane".into()),
-        },
+impl Confirmer {
+    fn new() -> Self {
+        Confirmer {
+            read: read_pane,
+            delay: REREAD_DELAY,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_read(read: fn(&str) -> Result<String>) -> Self {
+        Confirmer {
+            read,
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    fn confirm(&self, name: &str, sent: &str) -> Delivery {
+        match self.look(name, sent) {
+            // The happy path costs one read and no waiting.
+            Delivery::Submitted => Delivery::Submitted,
+            // A pane that has not repainted yet still shows the text it is
+            // about to submit, so give it a moment and look once more before
+            // calling a delivery undelivered.
+            Delivery::Unconfirmed(_) => {
+                std::thread::sleep(self.delay);
+                self.look(name, sent)
+            }
+        }
+    }
+
+    fn look(&self, name: &str, sent: &str) -> Delivery {
+        match (self.read)(name) {
+            Err(e) => Delivery::Unconfirmed(format!("could not read the pane: {e}")),
+            Ok(pane) => match composer_holds(&pane, sent) {
+                Some(false) => Delivery::Submitted,
+                Some(true) => Delivery::Unconfirmed("the text is still on the composer".into()),
+                None => Delivery::Unconfirmed("no composer found in the pane".into()),
+            },
+        }
     }
 }
 
@@ -200,7 +267,7 @@ impl HerdControl for RealHerd {
             "herdr agent prompt {name} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        Ok(confirm(name, text))
+        Ok(Confirmer::new().confirm(name, text))
     }
 }
 
@@ -378,5 +445,146 @@ mod tests {
             "  acknowledge or repeat.",
         ];
         assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
+    }
+
+    /// Captured verbatim from `herdr agent read --source visible --format
+    /// text` on a live Claude Code pane, transcript above the composer
+    /// trimmed. `composer-holds-batch` was taken with a real delivery
+    /// preamble typed into the composer and never submitted — the #26 state;
+    /// `composer-empty` is the same pane with the composer cleared. Both
+    /// keep one transcript line quoting box-drawing characters, which is
+    /// what stops `is_rule` from being loosened into matching prose.
+    const HOLDS_BATCH: &str = include_str!("../tests/fixtures/composer-holds-batch.txt");
+    const EMPTY: &str = include_str!("../tests/fixtures/composer-empty.txt");
+
+    #[test]
+    fn a_real_pane_holding_an_unsubmitted_batch_is_not_confirmed() {
+        assert_eq!(composer_holds(HOLDS_BATCH, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_real_pane_with_an_empty_composer_confirms_submission() {
+        assert_eq!(composer_holds(EMPTY, RULE), Some(false));
+    }
+
+    #[test]
+    fn a_real_transcript_line_quoting_a_rule_is_not_a_rule() {
+        // Both fixtures carry a line containing `\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}`. Treating it
+        // as furniture would move the composer region up into the transcript.
+        let quoting: Vec<&str> = HOLDS_BATCH
+            .lines()
+            .filter(|l| l.contains('\u{2500}') && !is_rule(l))
+            .collect();
+        assert!(!quoting.is_empty(), "fixture lost its rule-quoting line");
+        assert_eq!(composer_holds(HOLDS_BATCH, RULE), Some(true));
+    }
+
+    #[test]
+    fn heavy_dashed_and_double_rules_are_rules_too() {
+        for c in [
+            '\u{2500}', '\u{2501}', '\u{2504}', '\u{254c}', '\u{2550}', '\u{2015}', '\u{2581}',
+        ] {
+            let r = c.to_string().repeat(RULE_RUN);
+            assert!(is_rule(&r), "{c:?} run not recognized");
+        }
+        // a rule with corners, and a titled rule, both still read as rules
+        assert!(is_rule(&format!(
+            "\u{250c}{}\u{2510}",
+            "\u{2500}".repeat(20)
+        )));
+        assert!(is_rule(&format!(
+            "{} Context {}",
+            "\u{2500}".repeat(10),
+            "\u{2500}".repeat(10)
+        )));
+        // and a short run in prose is not
+        assert!(!is_rule(
+            "like \"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\", dashed variants"
+        ));
+    }
+
+    #[test]
+    fn a_rule_inside_a_message_body_does_not_hide_the_batch() {
+        // A room message can contain a rule of its own. It splits the
+        // composer region, leaving only the text after it — which the tail
+        // fingerprint still matches.
+        let sent = format!("{RULE}\n[scuttlebutt] New messages in the room:\n[#1] a: {}\nthe last line of the batch", "\u{2500}".repeat(30));
+        let composer = [
+            "\u{276f} Reply only if you have information others don't",
+            "  [scuttlebutt] New messages in the room:",
+            "  [#1] a:",
+            &"\u{2500}".repeat(30),
+            "  the last line of the batch",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), &sent), Some(true));
+    }
+
+    fn ok_pane(_: &str) -> Result<String> {
+        Ok(EMPTY.to_string())
+    }
+
+    fn unreadable(_: &str) -> Result<String> {
+        anyhow::bail!("agent target gone not found")
+    }
+
+    #[test]
+    fn a_confirmed_first_look_costs_no_retry() {
+        assert_eq!(
+            Confirmer::with_read(ok_pane).confirm("reviewer", RULE),
+            Delivery::Submitted
+        );
+    }
+
+    #[test]
+    fn a_pane_that_repaints_between_looks_confirms_on_the_second() {
+        // The first snapshot catches the text still on the composer because
+        // the pane has not repainted yet. Retrying is what keeps a healthy
+        // delivery from being reported as undelivered.
+        fn repainting(_: &str) -> Result<String> {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static LOOKS: AtomicUsize = AtomicUsize::new(0);
+            Ok(match LOOKS.fetch_add(1, Ordering::SeqCst) {
+                0 => HOLDS_BATCH.to_string(),
+                _ => EMPTY.to_string(),
+            })
+        }
+        assert_eq!(
+            Confirmer::with_read(repainting).confirm("reviewer", RULE),
+            Delivery::Submitted
+        );
+    }
+
+    #[test]
+    fn text_still_on_the_composer_after_both_looks_is_unconfirmed() {
+        fn stuck(_: &str) -> Result<String> {
+            Ok(HOLDS_BATCH.to_string())
+        }
+        assert_eq!(
+            Confirmer::with_read(stuck).confirm("reviewer", RULE),
+            Delivery::Unconfirmed("the text is still on the composer".into())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pane_is_unconfirmed_and_names_the_cause() {
+        // The agent's pane closed between the prompt and the read: nothing
+        // was delivered, and the operator needs to see why.
+        let Delivery::Unconfirmed(why) = Confirmer::with_read(unreadable).confirm("gone", RULE)
+        else {
+            panic!("an unreadable pane confirmed a delivery");
+        };
+        assert!(why.contains("could not read the pane"), "why was: {why}");
+        assert!(why.contains("not found"), "why was: {why}");
+    }
+
+    #[test]
+    fn a_pane_with_no_composer_is_unconfirmed() {
+        fn no_composer(_: &str) -> Result<String> {
+            Ok("a plain shell with no composer at all\n$ ".to_string())
+        }
+        assert_eq!(
+            Confirmer::with_read(no_composer).confirm("reviewer", RULE),
+            Delivery::Unconfirmed("no composer found in the pane".into())
+        );
     }
 }

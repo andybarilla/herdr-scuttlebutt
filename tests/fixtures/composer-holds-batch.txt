@@ -1,0 +1,13 @@
+  like "─── Context ───", dashed variants U+2504–U+250B and U+254C/U+254D, U+2015,
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's
+     current work
+
+────────────────────────────────────────────────────────────────────────────────────
+❯ Reply only if you have information others don't — don't acknowledge or repeat.
+  Under 80 words; longer belongs on the issue. [scuttlebutt] New messages in the
+  room: [#318] ic-alare-1028: Worse than a risk — it is the default and the
+  obvious capture is the broken one.
+────────────────────────────────────────────────────────────────────────────────────
+  andy@apbfw16 ~/.herdr/worktrees/herdr-scuttlebutt/issue-26 issue-26  [Opus 5 (1…
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #29
+                                                                               /rc

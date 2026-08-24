@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Consecutive non-deliveries of a batch to one agent before it is given up
+/// on. Counted two ways — per batch in `fail_counts`, and across batches in
+/// `unconfirmed_streak` — and either reaching this skips the batch.
 pub const MAX_BATCH_FAILURES: u32 = 5;
 
 /// Which agents this daemon enrolls. The spec's design is auto-enroll, so an
@@ -599,8 +602,8 @@ fn run_once(
         // there is no single in-memory state to carry. Consequence: while
         // `state::save` keeps failing (disk full, permissions) each pass
         // re-derives from the last state that reached disk, so the same batch
-        // is delivered again every pass and `fail_counts` never survives to
-        // reach the 5-failure cap.
+        // is delivered again every pass and neither `fail_counts` nor
+        // `unconfirmed_streak` survives to reach the 5-failure cap.
         let mut st = crate::state::load(&dir);
         let scoped = ScopedHerd {
             inner: herd,
@@ -829,17 +832,27 @@ const MAX_ABSENCES: u32 = 3;
 /// from being permanently marked introduced without ever seeing the intro.
 const REQUIRED_SIGHTINGS: u32 = 2;
 
-/// Why a prompt did not reach the agent, or `None` when it did. An `Ok` that
-/// herdr could not confirm as submitted is a non-delivery like any other: the
-/// text is sitting on the agent's composer, unread, and advancing the cursor
-/// on it drops the batch permanently (#26). Both kinds feed one failure
-/// counter, so a pane that can never be confirmed degrades into the existing
-/// skip threshold instead of stalling the room.
-fn undelivered(outcome: Result<Delivery>) -> Option<String> {
+/// A prompt that did not reach the agent. An `Ok` herdr could not confirm as
+/// submitted is a non-delivery like any other — the text is sitting on the
+/// agent's composer, unread, and advancing the cursor on it drops the batch
+/// permanently (#26) — but the two kinds converge differently, so which one
+/// it was has to survive.
+struct NotDelivered {
+    why: String,
+    unconfirmed: bool,
+}
+
+fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
     match outcome {
         Ok(Delivery::Submitted) => None,
-        Ok(Delivery::Unconfirmed(why)) => Some(format!("was not confirmed submitted: {why}")),
-        Err(e) => Some(format!("failed: {e}")),
+        Ok(Delivery::Unconfirmed(why)) => Some(NotDelivered {
+            why: format!("was not confirmed submitted: {why}"),
+            unconfirmed: true,
+        }),
+        Err(e) => Some(NotDelivered {
+            why: format!("failed: {e}"),
+            unconfirmed: false,
+        }),
     }
 }
 
@@ -909,6 +922,7 @@ pub fn tick(
         .cloned()
         .chain(state.introduced.iter().cloned())
         .chain(state.fail_counts.keys().cloned())
+        .chain(state.unconfirmed_streak.keys().cloned())
         .chain(state.absences.keys().cloned())
         .chain(state.deliverable_streak.keys().cloned())
         .chain(state.intro_fails.keys().cloned())
@@ -924,6 +938,7 @@ pub fn tick(
             state.cursors.remove(&name);
             state.introduced.remove(&name);
             state.fail_counts.remove(&name);
+            state.unconfirmed_streak.remove(&name);
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
             state.intro_fails.remove(&name);
@@ -954,7 +969,7 @@ pub fn tick(
                     state.intro_fails.remove(&a.name);
                     state.deliverable_streak.remove(&a.name);
                 }
-                Some(why) => {
+                Some(NotDelivered { why, .. }) => {
                     let fails = state.intro_fails.entry(a.name.clone()).or_insert(0);
                     *fails += 1;
                     let fails = *fails;
@@ -1007,8 +1022,9 @@ pub fn tick(
             None => {
                 state.cursors.insert(a.name.clone(), max_id);
                 state.fail_counts.remove(&a.name);
+                state.unconfirmed_streak.remove(&a.name);
             }
-            Some(why) => {
+            Some(NotDelivered { why, unconfirmed }) => {
                 let entry = state
                     .fail_counts
                     .entry(a.name.clone())
@@ -1020,14 +1036,27 @@ pub fn tick(
                 }
                 entry.0 += 1;
                 let fails = entry.0;
+                // Batch-independent, so a room busy enough to grow the batch
+                // every tick cannot keep an unconfirmable agent below the
+                // threshold forever.
+                let streak = match unconfirmed {
+                    true => {
+                        let s = state.unconfirmed_streak.entry(a.name.clone()).or_insert(0);
+                        *s += 1;
+                        *s
+                    }
+                    false => 0,
+                };
                 report(
                     dir,
                     &format!(
-                        "[scuttlebutt] delivery to {} {why} ({fails}/{MAX_BATCH_FAILURES})",
+                        "[scuttlebutt] delivery to {} {why} \
+                         (batch {fails}/{MAX_BATCH_FAILURES}, \
+                         unconfirmed {streak}/{MAX_BATCH_FAILURES})",
                         a.name
                     ),
                 );
-                if fails >= MAX_BATCH_FAILURES {
+                if fails >= MAX_BATCH_FAILURES || streak >= MAX_BATCH_FAILURES {
                     report(
                         dir,
                         &format!(
@@ -1038,6 +1067,7 @@ pub fn tick(
                     );
                     state.cursors.insert(a.name.clone(), max_id);
                     state.fail_counts.remove(&a.name);
+                    state.unconfirmed_streak.remove(&a.name);
                 }
             }
         }
@@ -1108,6 +1138,14 @@ mod tests {
     }
 
     impl FakeHerd {
+        /// `new` for agents already built with a cwd, so the grouping tests
+        /// do not each have to spell out every field.
+        fn of(agents: Vec<AgentInfo>) -> Self {
+            let mut h = FakeHerd::new(vec![]);
+            h.agents = agents;
+            h
+        }
+
         /// `new` with explicit per-agent focus. `None` models a herdr that
         /// does not emit the field at all.
         fn with_focus(agents: Vec<(&str, &str, Option<bool>)>) -> Self {
@@ -1737,6 +1775,56 @@ mod tests {
             log.contains("SKIPPING batch up to #1 for reviewer"),
             "log was: {log}"
         );
+    }
+
+    #[test]
+    fn an_unconfirmable_agent_converges_while_the_room_is_busy() {
+        // The room this runs in gets traffic faster than five ticks, so the
+        // batch max id changes every pass and `fail_counts`' streak restarts
+        // every pass. Without a batch-independent counter the agent is
+        // re-prompted forever and never reaches the skip.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+
+        for i in 0..MAX_BATCH_FAILURES {
+            append(dir.path(), "human", &format!("message {i}")).unwrap();
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+            // the per-batch counter never gets past its first failure
+            let batch_fails = state.fail_counts.get("reviewer").map(|e| e.0);
+            match i + 1 < MAX_BATCH_FAILURES {
+                true => assert_eq!(batch_fails, Some(1)),
+                // cleared by the skip on the last pass
+                false => assert_eq!(batch_fails, None),
+            }
+        }
+        let tail = u64::from(MAX_BATCH_FAILURES);
+        assert_eq!(state.cursors["reviewer"], tail, "never converged");
+        assert_eq!(state.unconfirmed_streak.get("reviewer"), None);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains(&format!("SKIPPING batch up to #{tail} for reviewer")),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn a_hard_prompt_error_does_not_feed_the_unconfirmed_streak() {
+        // An outright error means herdr rejected the write; a bigger batch on
+        // the next pass is worth another try, which is the per-batch
+        // behaviour `new_message_resets_fail_streak_for_batch` pins down.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        herd.fail_prompts = true;
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.fail_counts["reviewer"].0, 1);
+        assert_eq!(state.unconfirmed_streak.get("reviewer"), None);
     }
 
     #[test]
@@ -2398,16 +2486,10 @@ mod tests {
             Ok(d)
         };
 
-        let herd = FakeHerd {
-            agents: vec![
-                agent_at("a1", "/w/alare/api", "idle"),
-                agent_at("b1", "/w/acme/web", "idle"),
-            ],
-            prompts: RefCell::new(vec![]),
-            fail_prompts: false,
-            fail_agents: false,
-            unconfirmed: std::collections::HashSet::new(),
-        };
+        let herd = FakeHerd::of(vec![
+            agent_at("a1", "/w/alare/api", "idle"),
+            agent_at("b1", "/w/acme/web", "idle"),
+        ]);
         let mut announced = Announced::default();
         let filter = AgentFilter::default();
 
@@ -2471,16 +2553,10 @@ mod tests {
             std::fs::create_dir_all(&d)?;
             Ok(d)
         };
-        let herd = FakeHerd {
-            agents: vec![
-                agent_at("a1", "/w/alare/api", "idle"),
-                agent_at("b1", "/w/acme/web", "idle"),
-            ],
-            prompts: RefCell::new(vec![]),
-            fail_prompts: false,
-            fail_agents: false,
-            unconfirmed: std::collections::HashSet::new(),
-        };
+        let herd = FakeHerd::of(vec![
+            agent_at("a1", "/w/alare/api", "idle"),
+            agent_at("b1", "/w/acme/web", "idle"),
+        ]);
         let cfg_dir = cfg.clone();
         let load = move || crate::groups::load(&cfg_dir);
         let mut announced = Announced::default();
@@ -2543,23 +2619,11 @@ mod tests {
                 &mut cache,
             );
         };
-        run(&FakeHerd {
-            agents: vec![agent_at("a1", "/w/alare/api", "idle")],
-            prompts: RefCell::new(vec![]),
-            fail_prompts: false,
-            fail_agents: false,
-            unconfirmed: std::collections::HashSet::new(),
-        });
-        run(&FakeHerd {
-            agents: vec![
-                agent_at("a1", "/w/alare/api", "idle"),
-                agent_at("b1", "/w/acme/web", "idle"),
-            ],
-            prompts: RefCell::new(vec![]),
-            fail_prompts: false,
-            fail_agents: false,
-            unconfirmed: std::collections::HashSet::new(),
-        });
+        run(&FakeHerd::of(vec![agent_at("a1", "/w/alare/api", "idle")]));
+        run(&FakeHerd::of(vec![
+            agent_at("a1", "/w/alare/api", "idle"),
+            agent_at("b1", "/w/acme/web", "idle"),
+        ]));
         let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
         assert!(log.contains("enrolling in alare"), "{log}");
         assert!(log.contains("enrolling in acme"), "{log}");
@@ -2579,13 +2643,7 @@ mod tests {
         let mut announced = Announced::default();
         let mut cache = orgs(fake_org);
         let mut run = |cwds: &[(&str, &str)]| {
-            let herd = FakeHerd {
-                agents: cwds.iter().map(|(n, c)| agent_at(n, c, "idle")).collect(),
-                prompts: RefCell::new(vec![]),
-                fail_prompts: false,
-                fail_agents: false,
-                unconfirmed: std::collections::HashSet::new(),
-            };
+            let herd = FakeHerd::of(cwds.iter().map(|(n, c)| agent_at(n, c, "idle")).collect());
             run_once(
                 &herd,
                 &|| Grouping::Inactive,
@@ -2613,13 +2671,7 @@ mod tests {
             std::fs::create_dir_all(&d)?;
             Ok(d)
         };
-        let herd = FakeHerd {
-            agents: vec![agent_at("a1", "/w/alare/api", "idle")],
-            prompts: RefCell::new(vec![]),
-            fail_prompts: false,
-            fail_agents: false,
-            unconfirmed: std::collections::HashSet::new(),
-        };
+        let herd = FakeHerd::of(vec![agent_at("a1", "/w/alare/api", "idle")]);
         let mut announced = Announced::default();
         for _ in 0..REQUIRED_SIGHTINGS + 1 {
             run_once(

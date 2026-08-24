@@ -7,7 +7,9 @@ use std::path::Path;
 pub struct DaemonState {
     pub cursors: HashMap<String, u64>,
     pub introduced: HashSet<String>,
-    /// (consecutive failure count, batch max message id) per agent.
+    /// (consecutive failure count, batch max message id) per agent. Restarts
+    /// whenever the batch grows, so on its own it converges only in a quiet
+    /// room; `unconfirmed_streak` is what bounds the busy one.
     #[serde(default)]
     pub fail_counts: HashMap<String, (u32, u64)>,
     /// Consecutive ticks an enrolled agent has been absent from `herdr agent list`.
@@ -17,6 +19,17 @@ pub struct DaemonState {
     /// unfocused. Broken by either, so the intro waits for fresh sightings.
     #[serde(default)]
     pub deliverable_streak: HashMap<String, u32>,
+    /// Consecutive deliveries to an agent that herdr accepted without
+    /// confirming submitted. Separate from `fail_counts`, which restarts
+    /// whenever the batch grows: in a room with traffic that streak never
+    /// reaches the threshold, so an agent whose pane never submits would be
+    /// re-prompted every tick forever. This one is batch-independent and
+    /// cleared only by a confirmed delivery, which is what makes it
+    /// converge. Outright prompt errors do not touch it — those keep
+    /// `fail_counts`' per-batch semantics, where a bigger batch is worth
+    /// another try.
+    #[serde(default)]
+    pub unconfirmed_streak: HashMap<String, u32>,
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
@@ -104,6 +117,9 @@ mod tests {
         assert_eq!(loaded.cursors["ic-alare-1040"], 320);
         assert!(loaded.introduced.contains("lead-alare"));
         assert_eq!(loaded.fail_counts["ic-alare-1040"], (2, 320));
+        // fields added after this file was written default rather than
+        // failing the parse and resetting every cursor
+        assert!(loaded.unconfirmed_streak.is_empty());
         assert!(
             !daemon_log(dir.path()).contains("delivery cursors reset"),
             "an existing state file was rejected"
