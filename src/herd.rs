@@ -602,6 +602,18 @@ mod tests {
     }
 
     #[test]
+    fn a_composer_clipped_mid_word_still_matches() {
+        // Clipping does not always leave an ellipsis to cut, so the last
+        // word can arrive truncated. It matches because a window is compared
+        // as a substring rather than as whole tokens, and a truncated final
+        // word is a prefix of the real one. Pinned because switching that
+        // comparison to word boundaries would reopen a fall-through: three
+        // words, all of them ours, matching nothing, reported submitted.
+        let composer = ["\u{276f} Reply only i".to_string()];
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
     fn someone_elses_text_on_the_composer_confirms_submission() {
         // A human typing at the pane did not stop our delivery landing, and
         // telling their text from a tool's is #24, which stays out of scope.
