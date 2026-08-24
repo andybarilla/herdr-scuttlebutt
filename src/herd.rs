@@ -8,7 +8,7 @@ pub struct AgentInfo {
     pub cwd: String,
     /// Whether the human's cursor is in this agent's pane. `None` means
     /// `herdr agent list` did not emit the field at all, which is treated as
-    /// "not focused" at the delivery gate — see `deliverable` in `daemon.rs`.
+    /// "not focused" at the delivery gate — see `focus_blocked` in `daemon.rs`.
     pub focused: Option<bool>,
 }
 

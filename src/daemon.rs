@@ -795,8 +795,8 @@ pub fn intro_text(exe: &str, group: Option<&str>) -> String {
          To catch up: {exe} read\n\
          To see who's here: {exe} agents\n\
          New messages from others are delivered to you automatically when \
-         you are idle and your pane is not the one you are typing in; a \
-         message you already saw via `read` may be delivered again.\n\
+         you are idle and nobody is typing at your pane; a message you \
+         already saw via `read` may be delivered again.\n\
          {length_rule} No action needed now."
     )
 }
@@ -1084,7 +1084,7 @@ mod tests {
     impl FakeHerd {
         /// `new` with explicit per-agent focus. `None` models a herdr that
         /// does not emit the field at all.
-        fn focused(agents: Vec<(&str, &str, Option<bool>)>) -> Self {
+        fn with_focus(agents: Vec<(&str, &str, Option<bool>)>) -> Self {
             let mut h = FakeHerd::new(agents.iter().map(|(n, s, _)| (*n, *s)).collect());
             for (a, (_, _, f)) in h.agents.iter_mut().zip(agents) {
                 a.focused = f;
@@ -1107,7 +1107,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        let herd = FakeHerd::focused(vec![("reviewer", "idle", Some(true))]);
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         assert!(
             herd.prompts.borrow().is_empty(),
@@ -1119,20 +1119,58 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_pane_gets_no_intro_and_its_streak_is_cleared() {
+    fn a_focused_pane_gets_no_intro() {
         // The intro is one-shot — delivering it into a focused pane would
         // mark the agent introduced having never seen the instructions.
         let dir = tempfile::tempdir().unwrap();
         let mut state = DaemonState::default();
-        let herd = FakeHerd::focused(vec![("reviewer", "idle", Some(true))]);
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
         for _ in 0..REQUIRED_SIGHTINGS + 1 {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert!(herd.prompts.borrow().is_empty());
         assert!(!state.introduced.contains("reviewer"));
-        // A focused pane is not a settled PTY, so the streak breaks rather
-        // than accumulating behind the block.
+        // Focused from the first sighting, so there was never a streak to
+        // keep: `a_focus_block_breaks_the_intro_streak` covers the clearing.
         assert_eq!(state.deliverable_streak.get("reviewer"), None);
+    }
+
+    #[test]
+    fn a_focus_block_breaks_the_intro_streak() {
+        // Decision 4 of #23: REQUIRED_SIGHTINGS proves the PTY has settled,
+        // and a focused pane is not settled by that reasoning. So a focus
+        // block must reset the streak, not bank it — otherwise the intro
+        // fires on the very tick focus clears, off sightings taken before
+        // the human sat down.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        let free = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
+        let busy = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
+
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.deliverable_streak["reviewer"], 1);
+
+        tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            state.deliverable_streak.get("reviewer"),
+            None,
+            "an accumulated streak survived a focus block"
+        );
+
+        // First tick after focus clears: the streak restarts at 1, so this
+        // must NOT be the intro. Code that banked the streak fires here.
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.deliverable_streak["reviewer"], 1);
+        assert!(
+            free.prompts.borrow().is_empty(),
+            "intro fired the instant focus cleared: {:?}",
+            free.prompts.borrow()
+        );
+
+        // Two fresh settled sightings: now it goes out.
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(free.prompts.borrow().len(), 1);
+        assert!(state.introduced.contains("reviewer"));
     }
 
     #[test]
@@ -1142,14 +1180,14 @@ mod tests {
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
 
-        let busy = FakeHerd::focused(vec![("reviewer", "idle", Some(true))]);
+        let busy = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
         append(dir.path(), "human", "first").unwrap();
         tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
         append(dir.path(), "human", "second").unwrap();
         tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
         assert!(busy.prompts.borrow().is_empty());
 
-        let free = FakeHerd::focused(vec![("reviewer", "idle", Some(false))]);
+        let free = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
         tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
         let prompts = free.prompts.borrow();
         assert_eq!(prompts.len(), 1);
@@ -1174,7 +1212,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        let herd = FakeHerd::focused(vec![("reviewer", "idle", None)]);
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", None)]);
         for _ in 0..3 {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
@@ -1195,8 +1233,8 @@ mod tests {
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
 
-        let blind = FakeHerd::focused(vec![("reviewer", "idle", None)]);
-        let seeing = FakeHerd::focused(vec![("reviewer", "idle", Some(false))]);
+        let blind = FakeHerd::with_focus(vec![("reviewer", "idle", None)]);
+        let seeing = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
         tick(
             &mut state,
             &blind,
