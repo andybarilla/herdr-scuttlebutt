@@ -1740,25 +1740,27 @@ mod tests {
     }
 
     #[test]
-    fn one_unconfirmable_agent_does_not_hold_up_the_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let herd = unconfirmed_for(&["stuck"], vec![("stuck", "idle"), ("reviewer", "idle")]);
-        let mut state = DaemonState::default();
-        introduced(&mut state, &["stuck", "reviewer"]);
-        state.cursors.insert("stuck".into(), 0);
-        state.cursors.insert("reviewer".into(), 0);
-        append(dir.path(), "human", "hello").unwrap();
+    fn an_unconfirmable_agent_listed_first_still_lets_the_rest_through() {
+        // Order matters: an unconfirmed delivery that short-circuited the
+        // pass would strand every agent listed after it.
+        for order in [
+            vec![("stuck", "idle"), ("reviewer", "idle")],
+            vec![("reviewer", "idle"), ("stuck", "idle")],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let herd = unconfirmed_for(&["stuck"], order);
+            let mut state = DaemonState::default();
+            introduced(&mut state, &["stuck", "reviewer"]);
+            state.cursors.insert("stuck".into(), 0);
+            state.cursors.insert("reviewer".into(), 0);
+            append(dir.path(), "human", "hello").unwrap();
 
-        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
-        assert_eq!(state.cursors["stuck"], 0);
-        assert_eq!(state.cursors["reviewer"], 1);
-        let names: Vec<String> = herd
-            .prompts
-            .borrow()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        assert_eq!(names, vec!["stuck", "reviewer"]);
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+            assert_eq!(state.cursors["stuck"], 0);
+            assert_eq!(state.fail_counts["stuck"].0, 1);
+            assert_eq!(state.cursors["reviewer"], 1);
+            assert_eq!(state.fail_counts.get("reviewer"), None);
+        }
     }
 
     #[test]
