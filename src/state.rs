@@ -19,6 +19,10 @@ pub struct DaemonState {
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
+    /// Agents already reported as missing the `focused` field. The check runs
+    /// every tick; the warning is once per agent.
+    #[serde(default)]
+    pub focus_unknown_warned: HashSet<String>,
 }
 
 pub fn load(dir: &Path) -> DaemonState {

@@ -386,6 +386,7 @@ mod tests {
             pane_id: "w1:p1".into(),
             status: "idle".into(),
             cwd: String::new(),
+            focused: Some(false),
         }]
     }
 
@@ -396,18 +397,21 @@ mod tests {
                 pane_id: "w1:p1".into(),
                 status: "idle".into(),
                 cwd: "/w/alare/api".into(),
+                focused: Some(false),
             },
             AgentInfo {
                 name: "acme-secret-issue".into(),
                 pane_id: "w2:p1".into(),
                 status: "idle".into(),
                 cwd: "/w/acme/web".into(),
+                focused: Some(false),
             },
             AgentInfo {
                 name: "stray".into(),
                 pane_id: "w3:p1".into(),
                 status: "idle".into(),
                 cwd: "/tmp/scratch".into(),
+                focused: Some(false),
             },
         ]
     }
