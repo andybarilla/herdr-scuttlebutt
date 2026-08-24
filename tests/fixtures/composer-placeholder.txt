@@ -1,0 +1,6 @@
+                                                                                                                    Now using usage credits
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  andy@apbfw16 ~/.herdr/worktrees/exit66jukebox/issue-132-no-implicit-create issue-132-no-implicit-create  [Opus 5 (1M context)] ctx:8% /rc
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents

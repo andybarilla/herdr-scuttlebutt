@@ -28,22 +28,17 @@ pub trait HerdControl {
     fn prompt(&self, name: &str, text: &str) -> Result<Delivery>;
 }
 
-/// Characters of the sent text matched against the composer.
-///
-/// Deliberately *not* unique to one batch: every batch opens with the same
-/// `DELIVERY_RULE`, so this identifies scuttlebutt's outgoing text in
-/// general, not this particular send. That is sound only because `herdr
-/// agent prompt` replaces the composer contents rather than appending to
-/// them — observed on live panes and recorded on #26 — so text matching the
-/// fingerprint after a prompt can only be the text that prompt just wrote.
-///
-/// If herdr ever appends instead, an older batch left unsent on the composer
-/// would make a genuinely submitted new batch read as unsubmitted. That
-/// costs a repeat delivery and converges on the skip threshold; it does not
-/// lose a batch silently, which is the failure this whole path exists to
-/// prevent. No unit test can guard a third-party invariant, so it is named
-/// here instead.
-const FINGERPRINT_CHARS: usize = 40;
+/// Prompt markers a composer opens with. Identification is by this set
+/// rather than "any punctuation": a marker we do not know is a composer we
+/// have not identified, which resolves to `Unconfirmed` and costs a repeat.
+/// Guessing instead resolves to `Submitted` and costs the batch.
+const MARKERS: [&str; 3] = ["\u{276f}", ">", "\u{203a}"];
+
+/// Words of the composer that must reappear, in order, in what we sent
+/// before the composer counts as holding our text. Three rather than a
+/// character-count fingerprint because the composer clips, wraps mid-token
+/// and pads with NBSP — all of which survive a short run of whole words.
+const OVERLAP_WORDS: usize = 3;
 
 /// How long to let the pane repaint before a second look. Paid only when the
 /// first look failed to confirm, which on a healthy pane means the prompt
@@ -60,28 +55,15 @@ fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The composer's prompt marker is furniture, not content. Stripping it is
-/// what separates a cleared composer from one holding text, and it stops a
-/// batch that happens to quote a marker from making a cleared composer look
-/// occupied.
-fn strip_marker(region: &str) -> &str {
-    let is_marker = |t: &str| t.chars().count() == 1 && !t.chars().any(char::is_alphanumeric);
-    match region.split_once(' ') {
-        Some((first, rest)) if is_marker(first) => rest,
-        _ if is_marker(region) => "",
-        _ => region,
-    }
-}
-
-/// Whether a line *is* a horizontal rule, which is how the composer box is
+/// Whether a line *is* a horizontal rule, which is how a composer box is
 /// drawn. Any of the box-drawing horizontals counts — heavy, double, dashed,
 /// block — since which one a terminal UI picks is its own business, and
-/// corners and verticals may bracket the run.
+/// corners (square or rounded), tees and verticals may bracket the run.
 ///
 /// The whole line has to be rule characters. A line that merely contains a
 /// run is content: a message body carrying box-drawn terminal output reaches
 /// the composer with its line breaks intact, and treating one of its lines as
-/// furniture would move the composer boundary onto it.
+/// furniture would move a region boundary onto it.
 fn is_rule(line: &str) -> bool {
     let line = line.trim();
     let mut horizontals = 0;
@@ -92,7 +74,7 @@ fn is_rule(line: &str) -> bool {
             '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
             | '\u{254c}' | '\u{254d}' | '\u{2550}' | '\u{2015}' | '\u{23af}' | '\u{2580}'
             | '\u{2581}' | '\u{2584}' | '\u{2594}' => horizontals += 1,
-            // corners, tees and verticals may bracket or join the run
+            // corners, tees, verticals and half-lines may bracket or join it
             '\u{2502}'
             | '\u{2503}'
             | '\u{2506}'
@@ -102,35 +84,24 @@ fn is_rule(line: &str) -> bool {
             | '\u{250c}'..='\u{254b}'
             | '\u{254e}'
             | '\u{254f}'
-            | '\u{2551}'..='\u{256c}' => {}
+            | '\u{2551}'..='\u{257f}' => {}
             _ => return false,
         }
     }
     horizontals >= RULE_RUN
 }
 
-/// Whether `sent` is sitting unsubmitted on `pane`'s composer — the region
-/// between the last two horizontal rules, below which there is only the
-/// status footer.
+/// The content of every rule-bounded region in `pane` that opens with a
+/// prompt marker, marker stripped and whitespace normalized.
 ///
-/// Three answers, and the boundary between them is where this earns its
-/// keep. Text that is a run of our own — whole, or with its top cut off by a
-/// rule inside a message body — is `Some(true)`. `Some(false)` is claimed
-/// only for a composer that was found and then either cleared or holding
-/// text that is not ours; someone typing at the pane does not make our
-/// delivery undelivered, which is #24's question and stays out of scope.
-/// Everything else is `None`: no rules to bound a region, or a region with
-/// nothing in it at all, which means the pair of rules found was not the
-/// composer's.
-///
-/// `None` is ambiguous rather than informative — it covers an unsubmitted
-/// batch tall enough to push its own top rule off screen, a pane drawing no
-/// composer, and a rule drawn some way `is_rule` does not know — so the
-/// caller resolves it toward "not submitted". A wrong `Submitted` drops the
-/// batch permanently; a wrong `Unconfirmed` costs a repeat delivery and
-/// converges on the skip threshold. Every path here that cannot tell must
-/// therefore reach `None` rather than falling through to `Some(false)`.
-fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
+/// Every such region is returned, not just the last one, and that is the
+/// point. A message body ending in a rule of its own, or a bordered box
+/// drawn below the composer, both put a *different* region last; picking one
+/// region by position is a guess, and a wrong guess here reports a batch
+/// submitted that is sitting on a composer two lines up. A transcript echo
+/// of a submitted prompt cannot be mistaken for one of these, because the
+/// transcript draws no rules around it.
+fn composer_regions(pane: &str) -> Vec<String> {
     let lines: Vec<&str> = pane.lines().collect();
     let rules: Vec<usize> = lines
         .iter()
@@ -138,25 +109,75 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
         .filter(|(_, l)| is_rule(l))
         .map(|(i, _)| i)
         .collect();
-    let [.., top, bottom] = rules[..] else {
+    rules
+        .windows(2)
+        .filter_map(|w| {
+            let region = normalize(&lines[w[0] + 1..w[1]].join(" "));
+            let marker = MARKERS.iter().find(|m| region.starts_with(**m))?;
+            Some(region[marker.len()..].trim().to_string())
+        })
+        .collect()
+}
+
+/// Whether `content` is a run of `sent` rather than something else on the
+/// composer. Matched as whole words in order, so a composer that wrapped the
+/// text mid-token or padded it with NBSP still matches: a mangled word kills
+/// only the windows it appears in, and any longer run has clean ones.
+///
+/// The clip marker is cut first, because it fuses onto the last word and
+/// there is no window after it to fall back on — `\u{276f} Reply only if\u{2026}` is
+/// three words, all of them ours, and none of them matching with the
+/// ellipsis still attached. Clipped shorter than that, the content is too
+/// short to classify and never reaches a confirmation at all.
+fn is_our_text(content: &str, sent: &str) -> bool {
+    let content = content
+        .trim_end_matches(['\u{2026}', '.', ' '])
+        .trim_start_matches(['\u{2026}', '.', ' ']);
+    let words: Vec<&str> = content.split_whitespace().collect();
+    words
+        .windows(OVERLAP_WORDS)
+        .any(|w| sent.contains(&w.join(" ")))
+}
+
+/// Whether `sent` is sitting unsubmitted on `pane`'s composer.
+///
+/// `Some(false)` — submitted — is the only answer that advances a cursor and
+/// so the only one that can lose a batch, and it is reachable on exactly one
+/// path: at least one composer was identified, and every identified composer
+/// is either empty or holds text long enough to be recognized as not ours.
+/// Everything else is `None`, including cases that look like nothing at all:
+/// no rules, no marker, a marker we do not know, or content too short to
+/// classify either way.
+///
+/// The caller resolves `None` toward "not submitted". A wrong `Submitted`
+/// drops the batch permanently; a wrong `Unconfirmed` costs a repeat
+/// delivery, bounded by the unconfirmed streak. This shape is deliberate:
+/// three review rounds found layouts nobody anticipated, and each one was a
+/// case that failed to match and fell through to `Submitted`. There is no
+/// fall-through here — a layout this does not understand cannot reach it.
+fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
+    let regions = composer_regions(pane);
+    if regions.is_empty() {
         return None;
-    };
-    let region = normalize(&lines[top + 1..bottom].join(" "));
-    if region.is_empty() {
-        // Not even a prompt marker: a composer always draws one, so these
-        // two rules bound something else — most often a message body that
-        // ended with a rule of its own.
-        return None;
-    }
-    let content = strip_marker(&region);
-    if content.is_empty() {
-        return Some(false);
     }
     let sent = normalize(sent);
-    let fingerprint: String = sent.chars().take(FINGERPRINT_CHARS).collect();
-    // Either the composer opens with our text, or a rule inside a message
-    // body cut its top off and what is left is still a run of our own.
-    Some(content.contains(&fingerprint) || sent.contains(content))
+    if regions.iter().any(|c| is_our_text(c, &sent)) {
+        return Some(true);
+    }
+    // Non-empty but too short to tell ours from a placeholder or a menu.
+    // Idle composers really do carry text that is neither: `\u{276f} Press up to
+    // edit queued messages` is what Claude Code shows over a queue.
+    let classifiable = |c: &String| {
+        let words = c
+            .trim_end_matches(['\u{2026}', '.', ' '])
+            .split_whitespace()
+            .count();
+        words == 0 || words >= OVERLAP_WORDS
+    };
+    match regions.iter().all(classifiable) {
+        true => Some(false),
+        false => None,
+    }
 }
 
 fn read_pane(name: &str) -> Result<String> {
@@ -221,7 +242,7 @@ impl Confirmer {
             Ok(pane) => match composer_holds(&pane, sent) {
                 Some(false) => Delivery::Submitted,
                 Some(true) => Delivery::Unconfirmed("the text is still on the composer".into()),
-                None => Delivery::Unconfirmed("no composer found in the pane".into()),
+                None => Delivery::Unconfirmed("no composer could be identified in the pane".into()),
             },
         }
     }
@@ -395,6 +416,19 @@ mod tests {
     const RULE: &str =
         "Reply only if you have information others don't \u{2014} don't acknowledge or repeat.";
 
+    /// Captured verbatim from `herdr agent read --source visible --format
+    /// text` on live Claude Code panes, transcript above the composer
+    /// trimmed. `composer-holds-batch` was taken with a real delivery
+    /// preamble typed into the composer and never submitted — the #26 state;
+    /// `composer-empty` is the same pane cleared; `composer-placeholder` is
+    /// a different pane showing the hint Claude Code puts on an idle
+    /// composer over a queue, which is text that is neither ours nor a
+    /// human's. `composer-holds-batch` and `composer-empty` keep one
+    /// transcript line quoting box-drawing characters.
+    const HOLDS_BATCH: &str = include_str!("../tests/fixtures/composer-holds-batch.txt");
+    const EMPTY: &str = include_str!("../tests/fixtures/composer-empty.txt");
+    const PLACEHOLDER: &str = include_str!("../tests/fixtures/composer-placeholder.txt");
+
     /// A pane rendered the way herdr's `visible` snapshot returns it: a
     /// transcript, the composer box, then the status footer.
     fn pane(composer: &[&str]) -> String {
@@ -413,83 +447,25 @@ mod tests {
         out.join("\n")
     }
 
-    #[test]
-    fn an_empty_composer_confirms_submission() {
-        assert_eq!(composer_holds(&pane(&["\u{276f}"]), RULE), Some(false));
-    }
-
-    #[test]
-    fn our_own_text_on_the_composer_is_not_submitted() {
-        // The #26 pane: herdr returned success, the batch is sitting unsent.
-        let composer = [
-            "\u{276f} Reply only if you have information others don't \u{2014} don't",
-            "  acknowledge or repeat. Under 80 words; longer belongs on the issue.",
-            "  [scuttlebutt] New messages in the room:",
+    /// The batch as it renders on a composer: wrapped, NBSP-padded, and
+    /// followed by whatever the caller wants after it.
+    fn held(extra: &[&str]) -> Vec<String> {
+        let mut lines = vec![
+            "\u{276f}\u{a0}Reply only if you have information others don't \u{2014} don't"
+                .to_string(),
+            "  acknowledge or repeat. Under 80 words; longer belongs on the issue.".to_string(),
+            "  [scuttlebutt] New messages in the room:".to_string(),
         ];
-        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
+        lines.extend(extra.iter().map(|l| l.to_string()));
+        lines
     }
 
-    #[test]
-    fn someone_elses_text_on_the_composer_confirms_submission() {
-        // A human typing at the pane is not our text: the delivery still
-        // went through, and #24 stays out of scope.
-        let composer = ["\u{276f} stop posting to the room and stand down"];
-        assert_eq!(composer_holds(&pane(&composer), RULE), Some(false));
+    fn holds(composer: &[String], sent: &str) -> Option<bool> {
+        let refs: Vec<&str> = composer.iter().map(String::as_str).collect();
+        composer_holds(&pane(&refs), sent)
     }
 
-    #[test]
-    fn the_same_text_in_the_transcript_confirms_submission() {
-        // Submitted text is echoed above the composer. Only the composer
-        // region is consulted, or every delivery would look undelivered.
-        let echoed = format!("\u{276f} {RULE}\n{}", pane(&["\u{276f}"]));
-        assert_eq!(composer_holds(&echoed, RULE), Some(false));
-    }
-
-    #[test]
-    fn a_wrapped_composer_still_matches() {
-        // The composer wraps at word boundaries and pads with NBSP; matching
-        // has to see through both.
-        let composer = [
-            "\u{276f}\u{a0}Reply  only if you",
-            "  have information others don't \u{2014} don't acknowledge or repeat.",
-        ];
-        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
-    }
-
-    #[test]
-    fn a_composer_that_cannot_be_located_is_not_confirmed() {
-        // A batch tall enough to push its own top rule off screen. A
-        // submitted prompt always leaves both rules on screen, so an
-        // unlocatable composer is evidence against submission, not for it.
-        let clipped = format!(
-            "  {RULE}\n  [scuttlebutt] New messages in the room:\n{}\n  status",
-            "\u{2500}".repeat(60)
-        );
-        assert_eq!(composer_holds(&clipped, RULE), None);
-        assert_eq!(composer_holds("", RULE), None);
-    }
-
-    #[test]
-    fn ascii_rules_in_a_message_are_content_not_furniture() {
-        // A post containing `-----` reaches the pane unaltered; reading it as
-        // a composer edge would move the region and hide the real text.
-        let composer = [
-            "\u{276f} Reply only if you have information others don't \u{2014} don't",
-            "  -------------------------",
-            "  acknowledge or repeat.",
-        ];
-        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
-    }
-
-    /// Captured verbatim from `herdr agent read --source visible --format
-    /// text` on a live Claude Code pane, transcript above the composer
-    /// trimmed. `composer-holds-batch` was taken with a real delivery
-    /// preamble typed into the composer and never submitted — the #26 state;
-    /// `composer-empty` is the same pane with the composer cleared. Both
-    /// keep one transcript line quoting box-drawing characters, which is
-    /// what stops `is_rule` from being loosened into matching prose.
-    const HOLDS_BATCH: &str = include_str!("../tests/fixtures/composer-holds-batch.txt");
-    const EMPTY: &str = include_str!("../tests/fixtures/composer-empty.txt");
+    // ---- the real panes -------------------------------------------------
 
     #[test]
     fn a_real_pane_holding_an_unsubmitted_batch_is_not_confirmed() {
@@ -502,15 +478,191 @@ mod tests {
     }
 
     #[test]
+    fn a_real_placeholder_composer_confirms_submission() {
+        // `\u{276f} Press up to edit queued messages` is the hint Claude Code shows
+        // over a queue. Requiring an empty composer would leave every agent
+        // in that state permanently unconfirmable, and the streak would then
+        // skip real batches.
+        assert_eq!(composer_holds(PLACEHOLDER, RULE), Some(false));
+    }
+
+    #[test]
     fn a_real_transcript_line_quoting_a_rule_is_not_a_rule() {
-        // Both fixtures carry a line containing `\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}`. Treating it
-        // as furniture would move the composer region up into the transcript.
         let quoting: Vec<&str> = HOLDS_BATCH
             .lines()
             .filter(|l| l.contains('\u{2500}') && !is_rule(l))
             .collect();
         assert!(!quoting.is_empty(), "fixture lost its rule-quoting line");
         assert_eq!(composer_holds(HOLDS_BATCH, RULE), Some(true));
+    }
+
+    // ---- nothing identified is never a confirmation ---------------------
+
+    #[test]
+    fn a_pane_with_no_rules_identifies_no_composer() {
+        assert_eq!(composer_holds("a plain shell\n$ ", RULE), None);
+        assert_eq!(composer_holds("", RULE), None);
+    }
+
+    #[test]
+    fn a_region_without_a_known_marker_identifies_no_composer() {
+        // A bordered box that is not a composer — a notification band, a
+        // permission prompt — must not be read as one and reported clear.
+        let composer = ["  Allow this command? [y/N]"];
+        assert_eq!(holds(&composer.map(String::from), RULE), None);
+    }
+
+    #[test]
+    fn an_unrecognized_marker_identifies_no_composer() {
+        let composer = ["\u{2794} Reply only if you have information others don't"];
+        assert_eq!(holds(&composer.map(String::from), RULE), None);
+    }
+
+    #[test]
+    fn content_too_short_to_classify_is_not_a_confirmation() {
+        // One or two words could be a placeholder, a menu row, or the last
+        // clipped fragment of our own batch. Unclassifiable is not clear.
+        for short in ["-", "\u{1f389}", "ok", "5"] {
+            let composer = [format!("\u{276f} {short}")];
+            assert_eq!(holds(&composer, RULE), None, "{short:?} was classified");
+        }
+    }
+
+    // ---- the boundary cannot be relocated -------------------------------
+
+    #[test]
+    fn a_run_inside_a_message_body_does_not_relocate_the_boundary() {
+        // Message bodies keep their line breaks through `scrub`, so a pasted
+        // line of block-drawn output lands in the composer as its own line.
+        let composer = held(&["  [#1] someone: load \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2584}\u{2584}\u{2584} ok"]);
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_batch_ending_in_a_rule_is_still_found() {
+        // The message's own rule splits the composer in two. The half that
+        // opens with the marker is still a composer and still holds us.
+        let composer = held(&[&"\u{2500}".repeat(30)]);
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_one_character_tail_below_a_body_rule_is_not_a_confirmation() {
+        // The tail region has no marker, so it is not a composer at all; the
+        // half above it is, and it holds the batch.
+        let composer = held(&[&"\u{2500}".repeat(30), "  -"]);
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_box_below_the_composer_does_not_hide_the_batch() {
+        // A permission prompt or notification band drawn under the composer
+        // puts a different region last. Every marker-led region is checked,
+        // so the batch two lines up is still found.
+        let mut composer = held(&[]);
+        composer.push("\u{2500}".repeat(60));
+        composer.push("\u{276f} 1. Yes, allow this command to run".into());
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_rounded_composer_box_is_still_a_composer() {
+        // Synthetic: no pane here draws one, but a UI that did would
+        // otherwise identify nothing on every tick.
+        let rounded = format!("\u{256d}{}\u{256e}", "\u{2500}".repeat(40));
+        let pane = format!("\u{25cf} done\n{rounded}\n\u{276f}\n{rounded}\n  status line");
+        assert_eq!(composer_holds(&pane, RULE), Some(false));
+    }
+
+    // ---- matching what is there -----------------------------------------
+
+    #[test]
+    fn a_wrapped_and_nbsp_padded_composer_still_matches() {
+        assert_eq!(holds(&held(&[]), RULE), Some(true));
+    }
+
+    #[test]
+    fn a_hard_wrapped_token_still_matches() {
+        // A narrow pane breaks mid-token, so normalize sees two words where
+        // we sent one. Whole-word runs elsewhere in the batch still match.
+        let sent = format!("{RULE} see https://example.com/a/very/long/path for the rest");
+        let composer = [
+            "\u{276f} Reply only if you have information others don't \u{2014} don't".to_string(),
+            "  acknowledge or repeat. see https://example.com/a/very/lo".to_string(),
+            "  ng/path for the rest".to_string(),
+        ];
+        assert_eq!(holds(&composer, &sent), Some(true));
+    }
+
+    #[test]
+    fn a_clipped_composer_still_matches() {
+        // Claude Code clips a tall composer; three words of ours is enough.
+        let composer = ["\u{276f} Reply only if\u{2026}".to_string()];
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn someone_elses_text_on_the_composer_confirms_submission() {
+        // A human typing at the pane did not stop our delivery landing, and
+        // telling their text from a tool's is #24, which stays out of scope.
+        let composer = ["\u{276f} stop posting to the room and stand down".to_string()];
+        assert_eq!(holds(&composer, RULE), Some(false));
+    }
+
+    #[test]
+    fn the_same_text_in_the_transcript_confirms_submission() {
+        // Submitted text is echoed above the composer, with no rules drawn
+        // around it, so it forms no region and cannot be mistaken for one.
+        let echoed = format!("\u{276f} {RULE}\n{}", EMPTY);
+        assert_eq!(composer_holds(&echoed, RULE), Some(false));
+    }
+
+    #[test]
+    fn no_layout_change_turns_a_held_batch_into_a_confirmation() {
+        // The property, stated directly. Three review rounds each found a
+        // layout that made a held batch read as submitted, and each was a
+        // different input rather than a different bug. Any perturbation may
+        // cost identification — `None`, a repeat delivery — but none of them
+        // may reach `Some(false)`, which advances the cursor and drops it.
+        let rounded = format!("\u{256d}{}\u{256e}", "\u{2500}".repeat(60));
+        let held = held(&[]).join("\n");
+        let perturbed = [
+            // a bordered box drawn below the composer
+            format!(
+                "{HOLDS_BATCH}\n{}\n\u{276f} 1. Yes\n{}",
+                "\u{2500}".repeat(60),
+                "\u{2500}".repeat(60)
+            ),
+            // the composer's own box drawn with rounded corners
+            format!("\u{25cf} done\n{rounded}\n{held}\n{rounded}\n  status"),
+            // a rule inside a message body, with tails of several lengths
+            format!(
+                "{}\n{held}\n{}\n  -\n{}",
+                "\u{2500}".repeat(60),
+                "\u{2500}".repeat(60),
+                "\u{2500}".repeat(60)
+            ),
+            format!(
+                "{}\n{held}\n{}\n  thanks all\n{}",
+                "\u{2500}".repeat(60),
+                "\u{2500}".repeat(60),
+                "\u{2500}".repeat(60)
+            ),
+            // the top rule scrolled off a narrow screen
+            HOLDS_BATCH.lines().skip(5).collect::<Vec<_>>().join("\n"),
+            // an unfamiliar marker, and none at all
+            HOLDS_BATCH.replace('\u{276f}', "\u{2794}"),
+            HOLDS_BATCH.replace('\u{276f}', " "),
+            // no furniture whatsoever
+            held.clone(),
+        ];
+        for (i, pane) in perturbed.iter().enumerate() {
+            assert_ne!(
+                composer_holds(pane, RULE),
+                Some(false),
+                "perturbation {i} reported a held batch as submitted"
+            );
+        }
     }
 
     #[test]
@@ -521,89 +673,24 @@ mod tests {
             let r = c.to_string().repeat(RULE_RUN);
             assert!(is_rule(&r), "{c:?} run not recognized");
         }
-        // corners may bracket the run, and surrounding whitespace is ignored
         assert!(is_rule(&format!(
             "  \u{250c}{}\u{2510}  ",
             "\u{2500}".repeat(20)
         )));
-        // a fragment is not a rule
+        assert!(is_rule(&format!(
+            "\u{256d}{}\u{256e}",
+            "\u{2500}".repeat(20)
+        )));
         assert!(!is_rule("\u{2500}\u{2500}"));
         assert!(!is_rule(""));
     }
 
     #[test]
     fn a_line_merely_containing_a_run_is_content_not_furniture() {
-        // The whole-line property is what keeps a message body out of the
-        // composer boundary. A titled rule is prose by the same test.
         assert!(!is_rule(
             "like \"\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\", dashed variants"
         ));
-        assert!(!is_rule(&format!(
-            "{} Context {}",
-            "\u{2500}".repeat(10),
-            "\u{2500}".repeat(10)
-        )));
         assert!(!is_rule("[#1] someone: load \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2584}\u{2584}\u{2584} ok"));
-    }
-
-    #[test]
-    fn a_run_inside_a_message_body_does_not_relocate_the_boundary() {
-        // Message bodies keep their line breaks through `scrub`, so a pasted
-        // line of block-drawn output lands in the composer as its own line.
-        // Reading it as furniture put the boundary on it, emptied the region
-        // and reported the batch submitted — silent loss.
-        let composer = [
-            "\u{276f} Reply only if you have information others don't \u{2014} don't",
-            "  acknowledge or repeat. Under 80 words; longer belongs on the issue.",
-            "  [scuttlebutt] New messages in the room:",
-            "  [#1] someone: load \u{2581}\u{2581}\u{2581}\u{2581}\u{2581}\u{2584}\u{2584}\u{2584} ok",
-        ];
-        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
-    }
-
-    #[test]
-    fn a_batch_ending_in_a_rule_is_not_read_as_a_cleared_composer() {
-        // The message's own rule becomes the top of the last pair, leaving
-        // an empty region. Nothing was found, so nothing is confirmed.
-        let composer = [
-            "\u{276f} Reply only if you have information others don't \u{2014} don't",
-            "  [scuttlebutt] New messages in the room:",
-            &"\u{2500}".repeat(30),
-        ];
-        assert_eq!(composer_holds(&pane(&composer), RULE), None);
-    }
-
-    #[test]
-    fn a_short_tail_below_a_body_rule_is_still_ours() {
-        // The remainder can be shorter than any fingerprint. Requiring a
-        // minimum length here reported the batch submitted and dropped it.
-        let sent = format!(
-            "{RULE}\n[scuttlebutt] New messages in the room:\n[#1] a: {}\nthanks all",
-            "\u{2500}".repeat(30)
-        );
-        let composer = [
-            "\u{276f} Reply only if you have information others don't",
-            "  [#1] a:",
-            &"\u{2500}".repeat(30),
-            "  thanks all",
-        ];
-        assert_eq!(composer_holds(&pane(&composer), &sent), Some(true));
-    }
-
-    #[test]
-    fn a_rule_inside_a_message_body_does_not_hide_the_batch() {
-        // A room message can contain a rule of its own. It splits the
-        // composer region, leaving only the text after it — which the tail
-        // fingerprint still matches.
-        let sent = format!("{RULE}\n[scuttlebutt] New messages in the room:\n[#1] a: {}\nthe last line of the batch", "\u{2500}".repeat(30));
-        let composer = [
-            "\u{276f} Reply only if you have information others don't",
-            "  [scuttlebutt] New messages in the room:",
-            "  [#1] a:",
-            &"\u{2500}".repeat(30),
-            "  the last line of the batch",
-        ];
-        assert_eq!(composer_holds(&pane(&composer), &sent), Some(true));
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -684,7 +771,7 @@ mod tests {
         }
         assert_eq!(
             Confirmer::with_read(no_composer).confirm("reviewer", RULE),
-            Delivery::Unconfirmed("no composer found in the pane".into())
+            Delivery::Unconfirmed("no composer could be identified in the pane".into())
         );
     }
 }
