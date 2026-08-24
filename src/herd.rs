@@ -608,28 +608,24 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// One counter per test rather than one shared by all of them: a static
-    /// that several tests reset races under `cargo test`'s parallelism, which
-    /// is what #30 is about.
-    static CLEARED_READS: AtomicUsize = AtomicUsize::new(0);
-    static REPAINT_READS: AtomicUsize = AtomicUsize::new(0);
-    static STUCK_READS: AtomicUsize = AtomicUsize::new(0);
-
     #[test]
     fn a_confirmed_first_look_costs_one_read_and_no_retry() {
         // The retry costs a `REREAD_DELAY` on every delivery if it is not
         // skipped on the happy path, so the read count is the assertion —
         // `Submitted` alone would hold however many looks it took.
+        // The counter lives in the test body, so no other test can reach
+        // it. A module-scope static reset by its one owner is correct only
+        // by convention, and #30 is that convention decaying.
+        static READS: AtomicUsize = AtomicUsize::new(0);
         fn cleared(_: &str) -> Result<String> {
-            CLEARED_READS.fetch_add(1, Ordering::SeqCst);
+            READS.fetch_add(1, Ordering::SeqCst);
             Ok(EMPTY.to_string())
         }
-        CLEARED_READS.store(0, Ordering::SeqCst);
         assert_eq!(
             Confirmer::with_read(cleared).confirm("reviewer", RULE),
             Delivery::Submitted
         );
-        assert_eq!(CLEARED_READS.load(Ordering::SeqCst), 1);
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -637,33 +633,33 @@ mod tests {
         // The first snapshot catches the text still on the composer because
         // the pane has not repainted yet. Retrying is what keeps a healthy
         // delivery from being reported as undelivered.
+        static READS: AtomicUsize = AtomicUsize::new(0);
         fn repainting(_: &str) -> Result<String> {
-            Ok(match REPAINT_READS.fetch_add(1, Ordering::SeqCst) {
+            Ok(match READS.fetch_add(1, Ordering::SeqCst) {
                 0 => HOLDS_BATCH.to_string(),
                 _ => EMPTY.to_string(),
             })
         }
-        REPAINT_READS.store(0, Ordering::SeqCst);
         assert_eq!(
             Confirmer::with_read(repainting).confirm("reviewer", RULE),
             Delivery::Submitted
         );
-        assert_eq!(REPAINT_READS.load(Ordering::SeqCst), 2);
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn text_still_on_the_composer_after_both_looks_is_unconfirmed() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
         fn stuck(_: &str) -> Result<String> {
-            STUCK_READS.fetch_add(1, Ordering::SeqCst);
+            READS.fetch_add(1, Ordering::SeqCst);
             Ok(HOLDS_BATCH.to_string())
         }
-        STUCK_READS.store(0, Ordering::SeqCst);
         assert_eq!(
             Confirmer::with_read(stuck).confirm("reviewer", RULE),
             Delivery::Unconfirmed("the text is still on the composer".into())
         );
         // two looks and no more: the wait is paid once, not per tick
-        assert_eq!(STUCK_READS.load(Ordering::SeqCst), 2);
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
