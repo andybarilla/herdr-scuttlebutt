@@ -80,6 +80,36 @@ mod tests {
         assert!(loaded.introduced.contains("reviewer"));
     }
 
+    #[test]
+    fn a_production_state_file_still_loads() {
+        // Verbatim from a live room dir. Cursors are the only record of what
+        // each agent has seen, so a shape change that reset them would lose
+        // every one of them silently.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("state.json"),
+            r#"{
+              "cursors": { "lead-alare": 319, "ic-alare-1040": 320 },
+              "introduced": ["ic-alare-1040", "lead-alare"],
+              "fail_counts": { "ic-alare-1040": [2, 320] },
+              "absences": {},
+              "deliverable_streak": {},
+              "intro_fails": {},
+              "focus_unknown_warned": []
+            }"#,
+        )
+        .unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.cursors["lead-alare"], 319);
+        assert_eq!(loaded.cursors["ic-alare-1040"], 320);
+        assert!(loaded.introduced.contains("lead-alare"));
+        assert_eq!(loaded.fail_counts["ic-alare-1040"], (2, 320));
+        assert!(
+            !daemon_log(dir.path()).contains("delivery cursors reset"),
+            "an existing state file was rejected"
+        );
+    }
+
     fn daemon_log(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default()
     }

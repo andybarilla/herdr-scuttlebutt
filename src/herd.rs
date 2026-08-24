@@ -12,9 +12,118 @@ pub struct AgentInfo {
     pub focused: Option<bool>,
 }
 
+/// The outcome of a prompt herdr accepted. `herdr agent prompt` can return
+/// success with the text typed into the agent's composer and never submitted
+/// (herdrdev/herdr#2422), so its `Ok` means *accepted*, not *delivered*.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Delivery {
+    /// Positive evidence the text left the composer.
+    Submitted,
+    /// Accepted, with no such evidence. `why` names what was observed.
+    Unconfirmed(String),
+}
+
 pub trait HerdControl {
     fn list_agents(&self) -> Result<Vec<AgentInfo>>;
-    fn prompt(&self, name: &str, text: &str) -> Result<()>;
+    fn prompt(&self, name: &str, text: &str) -> Result<Delivery>;
+}
+
+/// Characters of the sent text matched against the composer. Long enough to
+/// be unique to scuttlebutt's own outgoing text, short enough to survive a
+/// composer that clips the line it is rendered on.
+const FINGERPRINT_CHARS: usize = 40;
+
+/// How long to let the pane repaint before a second look. Paid only when the
+/// first read found the text still on the composer, which on a healthy pane
+/// means the prompt landed between the write and the snapshot.
+const REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Whitespace-insensitive form. The composer wraps at word boundaries and
+/// pads with NBSP, so comparing normalized text matches across both.
+fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn fingerprint(sent: &str) -> String {
+    normalize(sent).chars().take(FINGERPRINT_CHARS).collect()
+}
+
+/// A horizontal rule, which is how the composer box is drawn. Box-drawing
+/// characters only: message bodies reach the pane unaltered, so a line of
+/// ASCII `---` in someone's post is content, not furniture.
+fn is_border(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| matches!(c, '\u{2500}' | '\u{2501}' | '\u{2550}'))
+}
+
+/// Whether `sent` is sitting unsubmitted on `pane`'s composer — the region
+/// between the last two horizontal rules, below which there is only the
+/// status footer.
+///
+/// `None` means the composer could not be located, which is itself evidence
+/// against submission: a submitted prompt leaves an empty one-line box with
+/// both rules on screen, while an unsubmitted batch is tall enough to push
+/// its own top rule off it.
+fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let rules: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_border(l))
+        .map(|(i, _)| i)
+        .collect();
+    let [.., top, bottom] = rules[..] else {
+        return None;
+    };
+    let region = normalize(&lines[top + 1..bottom].join(" "));
+    Some(region.contains(&fingerprint(sent)))
+}
+
+fn read_pane(name: &str) -> Result<String> {
+    let out = std::process::Command::new("herdr")
+        .args([
+            "agent", "read", name, "--source", "visible", "--format", "text",
+        ])
+        .output()
+        .context("running `herdr agent read`")?;
+    // The socket API reports its errors on stdout (`agent_not_found` for a
+    // pane that has since closed), so stderr alone would log an empty cause.
+    anyhow::ensure!(
+        out.status.success(),
+        "herdr agent read {name} failed: {}{}",
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+/// Reads `name`'s pane back and reports whether `sent` actually left the
+/// composer.
+fn confirm(name: &str, sent: &str) -> Delivery {
+    match look(name, sent) {
+        // The happy path costs one read and no waiting.
+        Delivery::Submitted => Delivery::Submitted,
+        // A pane that has not repainted yet still shows the text it is about
+        // to submit, so give it a moment and look once more before calling a
+        // delivery undelivered.
+        Delivery::Unconfirmed(_) => {
+            std::thread::sleep(REREAD_DELAY);
+            look(name, sent)
+        }
+    }
+}
+
+fn look(name: &str, sent: &str) -> Delivery {
+    match read_pane(name) {
+        Err(e) => Delivery::Unconfirmed(format!("could not read the pane: {e}")),
+        Ok(pane) => match composer_holds(&pane, sent) {
+            Some(false) => Delivery::Submitted,
+            Some(true) => Delivery::Unconfirmed("the text is still on the composer".into()),
+            None => Delivery::Unconfirmed("no composer found in the pane".into()),
+        },
+    }
 }
 
 pub fn parse_agent_list(json: &str) -> Result<Vec<AgentInfo>> {
@@ -81,7 +190,7 @@ impl HerdControl for RealHerd {
         parse_agent_list(&String::from_utf8(out.stdout)?)
     }
 
-    fn prompt(&self, name: &str, text: &str) -> Result<()> {
+    fn prompt(&self, name: &str, text: &str) -> Result<Delivery> {
         let out = std::process::Command::new("herdr")
             .args(["agent", "prompt", name, text])
             .output()
@@ -91,7 +200,7 @@ impl HerdControl for RealHerd {
             "herdr agent prompt {name} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        Ok(())
+        Ok(confirm(name, text))
     }
 }
 
@@ -180,5 +289,94 @@ mod tests {
     #[test]
     fn rejects_malformed_workspace_json() {
         assert!(parse_focused_cwd("not json").is_err());
+    }
+
+    const RULE: &str =
+        "Reply only if you have information others don't \u{2014} don't acknowledge or repeat.";
+
+    /// A pane rendered the way herdr's `visible` snapshot returns it: a
+    /// transcript, the composer box, then the status footer.
+    fn pane(composer: &[&str]) -> String {
+        let rule = "\u{2500}".repeat(60);
+        let mut out = vec![
+            "\u{25cf} Nothing to add.".to_string(),
+            String::new(),
+            "\u{273b} Worked for 1s".to_string(),
+            String::new(),
+            rule.clone(),
+        ];
+        out.extend(composer.iter().map(|l| l.to_string()));
+        out.push(rule);
+        out.push("  andy@apbfw16 ~/dev/alare main  [Opus 5] ctx:24%".into());
+        out.push("  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)".into());
+        out.join("\n")
+    }
+
+    #[test]
+    fn an_empty_composer_confirms_submission() {
+        assert_eq!(composer_holds(&pane(&["\u{276f}"]), RULE), Some(false));
+    }
+
+    #[test]
+    fn our_own_text_on_the_composer_is_not_submitted() {
+        // The #26 pane: herdr returned success, the batch is sitting unsent.
+        let composer = [
+            "\u{276f} Reply only if you have information others don't \u{2014} don't",
+            "  acknowledge or repeat. Under 80 words; longer belongs on the issue.",
+            "  [scuttlebutt] New messages in the room:",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
+    }
+
+    #[test]
+    fn someone_elses_text_on_the_composer_confirms_submission() {
+        // A human typing at the pane is not our text: the delivery still
+        // went through, and #24 stays out of scope.
+        let composer = ["\u{276f} stop posting to the room and stand down"];
+        assert_eq!(composer_holds(&pane(&composer), RULE), Some(false));
+    }
+
+    #[test]
+    fn the_same_text_in_the_transcript_confirms_submission() {
+        // Submitted text is echoed above the composer. Only the composer
+        // region is consulted, or every delivery would look undelivered.
+        let echoed = format!("\u{276f} {RULE}\n{}", pane(&["\u{276f}"]));
+        assert_eq!(composer_holds(&echoed, RULE), Some(false));
+    }
+
+    #[test]
+    fn a_wrapped_composer_still_matches() {
+        // The composer wraps at word boundaries and pads with NBSP; matching
+        // has to see through both.
+        let composer = [
+            "\u{276f}\u{a0}Reply  only if you",
+            "  have information others don't \u{2014} don't acknowledge or repeat.",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
+    }
+
+    #[test]
+    fn a_composer_that_cannot_be_located_is_not_confirmed() {
+        // A batch tall enough to push its own top rule off screen. A
+        // submitted prompt always leaves both rules on screen, so an
+        // unlocatable composer is evidence against submission, not for it.
+        let clipped = format!(
+            "  {RULE}\n  [scuttlebutt] New messages in the room:\n{}\n  status",
+            "\u{2500}".repeat(60)
+        );
+        assert_eq!(composer_holds(&clipped, RULE), None);
+        assert_eq!(composer_holds("", RULE), None);
+    }
+
+    #[test]
+    fn ascii_rules_in_a_message_are_content_not_furniture() {
+        // A post containing `-----` reaches the pane unaltered; reading it as
+        // a composer edge would move the region and hide the real text.
+        let composer = [
+            "\u{276f} Reply only if you have information others don't \u{2014} don't",
+            "  -------------------------",
+            "  acknowledge or repeat.",
+        ];
+        assert_eq!(composer_holds(&pane(&composer), RULE), Some(true));
     }
 }

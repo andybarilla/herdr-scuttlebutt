@@ -1,5 +1,5 @@
 use crate::groups::{self, Grouping};
-use crate::herd::{AgentInfo, HerdControl};
+use crate::herd::{AgentInfo, Delivery, HerdControl};
 use crate::log_store;
 use crate::state::DaemonState;
 use anyhow::Result;
@@ -499,7 +499,7 @@ impl HerdControl for ScopedHerd<'_> {
     fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         Ok(self.members.clone())
     }
-    fn prompt(&self, name: &str, text: &str) -> Result<()> {
+    fn prompt(&self, name: &str, text: &str) -> Result<Delivery> {
         self.inner.prompt(name, text)
     }
 }
@@ -829,6 +829,20 @@ const MAX_ABSENCES: u32 = 3;
 /// from being permanently marked introduced without ever seeing the intro.
 const REQUIRED_SIGHTINGS: u32 = 2;
 
+/// Why a prompt did not reach the agent, or `None` when it did. An `Ok` that
+/// herdr could not confirm as submitted is a non-delivery like any other: the
+/// text is sitting on the agent's composer, unread, and advancing the cursor
+/// on it drops the batch permanently (#26). Both kinds feed one failure
+/// counter, so a pane that can never be confirmed degrades into the existing
+/// skip threshold instead of stalling the room.
+fn undelivered(outcome: Result<Delivery>) -> Option<String> {
+    match outcome {
+        Ok(Delivery::Submitted) => None,
+        Ok(Delivery::Unconfirmed(why)) => Some(format!("was not confirmed submitted: {why}")),
+        Err(e) => Some(format!("failed: {e}")),
+    }
+}
+
 /// `filter` is vestigial in production: `run_once` applies the agent filter
 /// once, before partitioning, so the only production call site passes
 /// `AgentFilter::default()`. It survives because the tests drive `tick`
@@ -934,20 +948,20 @@ pub fn tick(
             // handed was checked as late as possible: a plugin install can
             // land at any point in the session.
             let exe = crate::paths::command_path();
-            match herd.prompt(&a.name, &intro_text(&exe, group)) {
-                Ok(()) => {
+            match undelivered(herd.prompt(&a.name, &intro_text(&exe, group))) {
+                None => {
                     state.introduced.insert(a.name.clone());
                     state.intro_fails.remove(&a.name);
                     state.deliverable_streak.remove(&a.name);
                 }
-                Err(e) => {
+                Some(why) => {
                     let fails = state.intro_fails.entry(a.name.clone()).or_insert(0);
                     *fails += 1;
                     let fails = *fails;
                     report(
                         dir,
                         &format!(
-                            "[scuttlebutt] intro to {} failed ({fails}/{MAX_BATCH_FAILURES}): {e}",
+                            "[scuttlebutt] intro to {} {why} ({fails}/{MAX_BATCH_FAILURES})",
                             a.name
                         ),
                     );
@@ -989,12 +1003,12 @@ pub fn tick(
             .map(|m| format!("[#{}] {}: {}\n", m.id, scrub_name(&m.from), scrub(&m.text)))
             .collect();
         let text = format!("{DELIVERY_RULE}\n[scuttlebutt] New messages in the room:\n{body}");
-        match herd.prompt(&a.name, &text) {
-            Ok(()) => {
+        match undelivered(herd.prompt(&a.name, &text)) {
+            None => {
                 state.cursors.insert(a.name.clone(), max_id);
                 state.fail_counts.remove(&a.name);
             }
-            Err(e) => {
+            Some(why) => {
                 let entry = state
                     .fail_counts
                     .entry(a.name.clone())
@@ -1009,8 +1023,8 @@ pub fn tick(
                 report(
                     dir,
                     &format!(
-                        "[scuttlebutt] delivery to {} failed ({}/{MAX_BATCH_FAILURES}): {e}",
-                        a.name, fails
+                        "[scuttlebutt] delivery to {} {why} ({fails}/{MAX_BATCH_FAILURES})",
+                        a.name
                     ),
                 );
                 if fails >= MAX_BATCH_FAILURES {
@@ -1043,6 +1057,9 @@ mod tests {
         prompts: RefCell<Vec<(String, String)>>,
         fail_prompts: bool,
         fail_agents: bool,
+        /// Agents whose prompts herdr accepts while leaving the text sitting
+        /// on the composer: `Ok`, but nothing delivered.
+        unconfirmed: std::collections::HashSet<String>,
     }
 
     impl FakeHerd {
@@ -1061,6 +1078,7 @@ mod tests {
                 prompts: RefCell::new(vec![]),
                 fail_prompts: false,
                 fail_agents: false,
+                unconfirmed: std::collections::HashSet::new(),
             }
         }
     }
@@ -1072,12 +1090,20 @@ mod tests {
             }
             Ok(self.agents.clone())
         }
-        fn prompt(&self, name: &str, text: &str) -> anyhow::Result<()> {
+        fn prompt(&self, name: &str, text: &str) -> anyhow::Result<Delivery> {
             if self.fail_prompts {
                 anyhow::bail!("stalled");
             }
+            // Recorded either way: the text reached the pane, which is
+            // exactly why an unconfirmed prompt is indistinguishable from a
+            // delivered one at the call site.
             self.prompts.borrow_mut().push((name.into(), text.into()));
-            Ok(())
+            if self.unconfirmed.contains(name) {
+                return Ok(Delivery::Unconfirmed(
+                    "the text is still on the composer".into(),
+                ));
+            }
+            Ok(Delivery::Submitted)
         }
     }
 
@@ -1632,6 +1658,124 @@ mod tests {
         // after the 5th consecutive failure the batch is skipped
         assert_eq!(state.cursors["reviewer"], 1);
         assert_eq!(state.fail_counts.get("reviewer"), None);
+    }
+
+    /// A prompt herdr accepted while leaving the text on the composer. This
+    /// is the #26 defect: the batch never reached the agent, so treating the
+    /// `Ok` as delivery advances the cursor past messages nobody saw.
+    fn unconfirmed_for(agents: &[&str], statuses: Vec<(&str, &str)>) -> FakeHerd {
+        let mut herd = FakeHerd::new(statuses);
+        herd.unconfirmed = agents.iter().map(|a| a.to_string()).collect();
+        herd
+    }
+
+    #[test]
+    fn an_unconfirmed_prompt_does_not_advance_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "cursor advanced past a batch that never left the composer"
+        );
+        assert_eq!(state.fail_counts["reviewer"], (1, 1));
+
+        // and the same batch is offered again on the next pass
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        let prompts = herd.prompts.borrow();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[1].1.contains("hello"),
+            "second pass sent: {:?}",
+            prompts[1].1
+        );
+    }
+
+    #[test]
+    fn a_confirmed_prompt_advances_the_cursor_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.cursors["reviewer"], 1);
+        assert_eq!(herd.prompts.borrow().len(), 1, "batch was re-delivered");
+        assert_eq!(state.fail_counts.get("reviewer"), None);
+    }
+
+    #[test]
+    fn repeated_unconfirmed_deliveries_hit_the_skip_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.cursors["reviewer"], 0);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        // the room does not stall on one bad pane: give up, loudly, and move on
+        assert_eq!(state.cursors["reviewer"], 1);
+        assert_eq!(state.fail_counts.get("reviewer"), None);
+        let log = daemon_log(dir.path());
+        assert!(log.contains("still on the composer"), "log was: {log}");
+        assert!(
+            log.contains("SKIPPING batch up to #1 for reviewer"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn one_unconfirmable_agent_does_not_hold_up_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["stuck"], vec![("stuck", "idle"), ("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["stuck", "reviewer"]);
+        state.cursors.insert("stuck".into(), 0);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.cursors["stuck"], 0);
+        assert_eq!(state.cursors["reviewer"], 1);
+        let names: Vec<String> = herd
+            .prompts
+            .borrow()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(names, vec!["stuck", "reviewer"]);
+    }
+
+    #[test]
+    fn an_unconfirmed_intro_is_not_recorded_as_introduced() {
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        state
+            .deliverable_streak
+            .insert("reviewer".into(), REQUIRED_SIGHTINGS);
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            !state.introduced.contains("reviewer"),
+            "introduced on a prompt that never left the composer"
+        );
+        assert_eq!(state.intro_fails["reviewer"], 1);
     }
 
     #[test]
@@ -2260,6 +2404,7 @@ mod tests {
             prompts: RefCell::new(vec![]),
             fail_prompts: false,
             fail_agents: false,
+            unconfirmed: std::collections::HashSet::new(),
         };
         let mut announced = Announced::default();
         let filter = AgentFilter::default();
@@ -2332,6 +2477,7 @@ mod tests {
             prompts: RefCell::new(vec![]),
             fail_prompts: false,
             fail_agents: false,
+            unconfirmed: std::collections::HashSet::new(),
         };
         let cfg_dir = cfg.clone();
         let load = move || crate::groups::load(&cfg_dir);
@@ -2400,6 +2546,7 @@ mod tests {
             prompts: RefCell::new(vec![]),
             fail_prompts: false,
             fail_agents: false,
+            unconfirmed: std::collections::HashSet::new(),
         });
         run(&FakeHerd {
             agents: vec![
@@ -2409,6 +2556,7 @@ mod tests {
             prompts: RefCell::new(vec![]),
             fail_prompts: false,
             fail_agents: false,
+            unconfirmed: std::collections::HashSet::new(),
         });
         let log = std::fs::read_to_string(base.path().join("daemon.log")).unwrap();
         assert!(log.contains("enrolling in alare"), "{log}");
@@ -2434,6 +2582,7 @@ mod tests {
                 prompts: RefCell::new(vec![]),
                 fail_prompts: false,
                 fail_agents: false,
+                unconfirmed: std::collections::HashSet::new(),
             };
             run_once(
                 &herd,
@@ -2467,6 +2616,7 @@ mod tests {
             prompts: RefCell::new(vec![]),
             fail_prompts: false,
             fail_agents: false,
+            unconfirmed: std::collections::HashSet::new(),
         };
         let mut announced = Announced::default();
         for _ in 0..REQUIRED_SIGHTINGS + 1 {
