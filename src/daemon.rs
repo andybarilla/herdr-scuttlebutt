@@ -857,16 +857,22 @@ pub fn tick(
         // Reported here, above the `introduced` early-continue, because the
         // steady state for every agent is introduced: a warning any lower
         // would never fire for the agents it is about.
-        if a.focused.is_none() && state.focus_unknown_warned.insert(a.name.clone()) {
-            report(
-                dir,
-                &format!(
-                    "[scuttlebutt] herdr reported {} without a `focused` field; \
-                     delivering anyway, so a batch may land in a pane someone \
-                     is typing in",
-                    a.name
-                ),
-            );
+        if a.focused.is_none() {
+            if state.focus_unknown_warned.insert(a.name.clone()) {
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] herdr reported {} without a `focused` field; \
+                         delivering anyway, so a batch may land in a pane someone \
+                         is typing in",
+                        a.name
+                    ),
+                );
+            }
+        } else {
+            // Once per episode, not once per state file: a herdr that drops
+            // the field, recovers and drops it again must warn both times.
+            state.focus_unknown_warned.remove(&a.name);
         }
         if state.introduced.contains(&a.name) {
             continue;
@@ -1180,6 +1186,48 @@ mod tests {
             "log was: {log}"
         );
         assert!(log.contains("reviewer"), "log was: {log}");
+    }
+
+    #[test]
+    fn a_recovered_focused_field_rearms_the_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+
+        let blind = FakeHerd::focused(vec![("reviewer", "idle", None)]);
+        let seeing = FakeHerd::focused(vec![("reviewer", "idle", Some(false))]);
+        tick(
+            &mut state,
+            &blind,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+        tick(
+            &mut state,
+            &seeing,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+        tick(
+            &mut state,
+            &blind,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+
+        let log = daemon_log(dir.path());
+        assert_eq!(
+            log.matches("without a `focused` field").count(),
+            2,
+            "a second outage went unreported: {log}"
+        );
     }
 
     fn introduced(state: &mut DaemonState, names: &[&str]) {
