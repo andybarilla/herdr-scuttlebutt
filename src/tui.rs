@@ -446,8 +446,8 @@ mod tests {
             }
             Ok(self.0.clone())
         }
-        fn prompt(&self, _: &str, _: &str) -> Result<()> {
-            Ok(())
+        fn prompt(&self, _: &str, _: &str) -> Result<crate::herd::Delivery> {
+            Ok(crate::herd::Delivery::Submitted)
         }
     }
 

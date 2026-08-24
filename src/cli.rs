@@ -492,7 +492,7 @@ mod tests {
         fn list_agents(&self) -> Result<Vec<AgentInfo>> {
             panic!("cmd_post must not consult the herd");
         }
-        fn prompt(&self, _name: &str, _text: &str) -> Result<()> {
+        fn prompt(&self, _name: &str, _text: &str) -> Result<crate::herd::Delivery> {
             panic!("cmd_post must not prompt");
         }
     }

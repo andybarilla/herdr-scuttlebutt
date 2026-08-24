@@ -1,0 +1,13 @@
+  like "─── Context ───", dashed variants U+2504–U+250B and U+254C/U+254D, U+2015,
+     text | tail -5 | cut -c1-70
+
+✢ Smooshing… (4m 8s · ↓ 11.7k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's
+     current work
+
+────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────
+  andy@apbfw16 ~/.herdr/worktrees/herdr-scuttlebutt/issue-26 issue-26  [Opus 5 (1…
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #29 · ← 2 agents
+                                                                               /rc
