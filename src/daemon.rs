@@ -795,13 +795,28 @@ pub fn intro_text(exe: &str, group: Option<&str>) -> String {
          To catch up: {exe} read\n\
          To see who's here: {exe} agents\n\
          New messages from others are delivered to you automatically when \
-         you are idle; a message you already saw via `read` may be delivered \
-         again.\n{length_rule} No action needed now."
+         you are idle and nobody is typing at your pane; a message you \
+         already saw via `read` may be delivered again.\n\
+         {length_rule} No action needed now."
     )
 }
 
 fn deliverable(status: &str) -> bool {
     status == "idle" || status == "done"
+}
+
+/// Whether delivery must be withheld because a human is at this pane. A pane
+/// someone is typing in reports `idle`, so `agent_status` alone cannot tell
+/// the two apart and `herdr agent prompt` pastes into what they are composing.
+///
+/// Deferred with no timeout: the cursor advances only after a successful
+/// prompt, so the batch lands intact on the first tick after focus moves.
+///
+/// An absent `focused` field fails open. Failing closed would silently freeze
+/// the whole room the day herdr stopped emitting it, and nobody would notice
+/// the absence of messages; a stray paste announces itself immediately.
+fn focus_blocked(a: &AgentInfo) -> bool {
+    a.focused == Some(true)
 }
 
 /// Consecutive absences from `herdr agent list` tolerated before an agent's
@@ -839,13 +854,33 @@ pub fn tick(
     for a in &agents {
         state.cursors.entry(a.name.clone()).or_insert(tail);
         state.absences.remove(&a.name);
+        // Reported here, above the `introduced` early-continue, because the
+        // steady state for every agent is introduced: a warning any lower
+        // would never fire for the agents it is about.
+        if a.focused.is_none() {
+            if state.focus_unknown_warned.insert(a.name.clone()) {
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] herdr reported {} without a `focused` field; \
+                         delivering anyway, so a batch may land in a pane someone \
+                         is typing in",
+                        a.name
+                    ),
+                );
+            }
+        } else {
+            // Once per episode, not once per state file: a herdr that drops
+            // the field, recovers and drops it again must warn both times.
+            state.focus_unknown_warned.remove(&a.name);
+        }
         if state.introduced.contains(&a.name) {
             continue;
         }
         // Track the deliverable streak here rather than in the delivery loop
         // below, which skips non-deliverable agents entirely and so would
         // never reset the streak.
-        if deliverable(&a.status) {
+        if deliverable(&a.status) && !focus_blocked(a) {
             *state.deliverable_streak.entry(a.name.clone()).or_insert(0) += 1;
         } else {
             state.deliverable_streak.remove(&a.name);
@@ -863,6 +898,7 @@ pub fn tick(
         .chain(state.absences.keys().cloned())
         .chain(state.deliverable_streak.keys().cloned())
         .chain(state.intro_fails.keys().cloned())
+        .chain(state.focus_unknown_warned.iter().cloned())
         .collect();
     for name in known {
         if live.contains(&name) {
@@ -877,11 +913,12 @@ pub fn tick(
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
             state.intro_fails.remove(&name);
+            state.focus_unknown_warned.remove(&name);
         }
     }
 
     for a in &agents {
-        if !deliverable(&a.status) {
+        if !deliverable(&a.status) || focus_blocked(a) {
             continue;
         }
         if !state.introduced.contains(&a.name) {
@@ -1018,6 +1055,7 @@ mod tests {
                         pane_id: format!("w1:{n}"),
                         status: s.into(),
                         cwd: String::new(),
+                        focused: Some(false),
                     })
                     .collect(),
                 prompts: RefCell::new(vec![]),
@@ -1041,6 +1079,193 @@ mod tests {
             self.prompts.borrow_mut().push((name.into(), text.into()));
             Ok(())
         }
+    }
+
+    impl FakeHerd {
+        /// `new` with explicit per-agent focus. `None` models a herdr that
+        /// does not emit the field at all.
+        fn with_focus(agents: Vec<(&str, &str, Option<bool>)>) -> Self {
+            let mut h = FakeHerd::new(agents.iter().map(|(n, s, _)| (*n, *s)).collect());
+            for (a, (_, _, f)) in h.agents.iter_mut().zip(agents) {
+                a.focused = f;
+            }
+            h
+        }
+    }
+
+    fn daemon_log(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_focused_pane_gets_no_batch() {
+        // The bug: a human typing at an idle pane reads as deliverable, so
+        // `herdr agent prompt` pastes the batch into what they are composing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            herd.prompts.borrow().is_empty(),
+            "pasted into a focused pane: {:?}",
+            herd.prompts.borrow()
+        );
+        // Deferred, not dropped: the cursor must not have advanced.
+        assert_eq!(state.cursors["reviewer"], 0);
+    }
+
+    #[test]
+    fn a_focused_pane_gets_no_intro() {
+        // The intro is one-shot — delivering it into a focused pane would
+        // mark the agent introduced having never seen the instructions.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
+        for _ in 0..REQUIRED_SIGHTINGS + 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(herd.prompts.borrow().is_empty());
+        assert!(!state.introduced.contains("reviewer"));
+        // Focused from the first sighting, so there was never a streak to
+        // keep: `a_focus_block_breaks_the_intro_streak` covers the clearing.
+        assert_eq!(state.deliverable_streak.get("reviewer"), None);
+    }
+
+    #[test]
+    fn a_focus_block_breaks_the_intro_streak() {
+        // Decision 4 of #23: REQUIRED_SIGHTINGS proves the PTY has settled,
+        // and a focused pane is not settled by that reasoning. So a focus
+        // block must reset the streak, not bank it — otherwise the intro
+        // fires on the very tick focus clears, off sightings taken before
+        // the human sat down.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        let free = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
+        let busy = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
+
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.deliverable_streak["reviewer"], 1);
+
+        tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            state.deliverable_streak.get("reviewer"),
+            None,
+            "an accumulated streak survived a focus block"
+        );
+
+        // First tick after focus clears: the streak restarts at 1, so this
+        // must NOT be the intro. Code that banked the streak fires here.
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.deliverable_streak["reviewer"], 1);
+        assert!(
+            free.prompts.borrow().is_empty(),
+            "intro fired the instant focus cleared: {:?}",
+            free.prompts.borrow()
+        );
+
+        // Two fresh settled sightings: now it goes out.
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(free.prompts.borrow().len(), 1);
+        assert!(state.introduced.contains("reviewer"));
+    }
+
+    #[test]
+    fn the_withheld_batch_arrives_in_full_once_focus_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+
+        let busy = FakeHerd::with_focus(vec![("reviewer", "idle", Some(true))]);
+        append(dir.path(), "human", "first").unwrap();
+        tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
+        append(dir.path(), "human", "second").unwrap();
+        tick(&mut state, &busy, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(busy.prompts.borrow().is_empty());
+
+        let free = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
+        tick(&mut state, &free, dir.path(), &AgentFilter::default(), None).unwrap();
+        let prompts = free.prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        let body = &prompts[0].1;
+        assert!(body.contains("first"), "{body}");
+        assert!(body.contains("second"), "{body}");
+        assert!(
+            body.find("first").unwrap() < body.find("second").unwrap(),
+            "out of order: {body}"
+        );
+        assert_eq!(state.cursors["reviewer"], 2);
+    }
+
+    #[test]
+    fn a_missing_focused_field_delivers_and_is_logged_once() {
+        // Fail open: a herdr that stops emitting `focused` must not freeze
+        // the room silently. The warning is per-agent, not per-tick — this
+        // path runs every ~2s.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        let herd = FakeHerd::with_focus(vec![("reviewer", "idle", None)]);
+        for _ in 0..3 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(herd.prompts.borrow().len(), 1);
+        let log = daemon_log(dir.path());
+        assert_eq!(
+            log.matches("without a `focused` field").count(),
+            1,
+            "log was: {log}"
+        );
+        assert!(log.contains("reviewer"), "log was: {log}");
+    }
+
+    #[test]
+    fn a_recovered_focused_field_rearms_the_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+
+        let blind = FakeHerd::with_focus(vec![("reviewer", "idle", None)]);
+        let seeing = FakeHerd::with_focus(vec![("reviewer", "idle", Some(false))]);
+        tick(
+            &mut state,
+            &blind,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+        tick(
+            &mut state,
+            &seeing,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+        tick(
+            &mut state,
+            &blind,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+
+        let log = daemon_log(dir.path());
+        assert_eq!(
+            log.matches("without a `focused` field").count(),
+            2,
+            "a second outage went unreported: {log}"
+        );
     }
 
     fn introduced(state: &mut DaemonState, names: &[&str]) {
@@ -1686,6 +1911,7 @@ mod tests {
             pane_id: format!("w1:{name}"),
             status: status.into(),
             cwd: cwd.into(),
+            focused: Some(false),
         }
     }
 

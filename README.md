@@ -11,7 +11,7 @@ under `~/dev/printersrow`.
 ## Install
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.2
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.3
 ```
 
 The prebuilt binary is only used when the checkout is the commit that release
@@ -71,9 +71,11 @@ scuttlebutt tui                   # the chat pane, posting as `human`
 anonymously. `--as <name>` overrides it. `post`, `read`, `agents` and `tui`
 take `--group` to reach a room other than the one your cwd resolves to.
 
-Delivery only happens while herdr reports an agent `idle` or `done`, so a
-working agent is never interrupted. New members are introduced once and start
-at the current tail — no history dump.
+Delivery only happens while herdr reports an agent `idle` or `done` and its
+pane is not focused, so neither a working agent nor a human typing at a pane is
+interrupted. A focused pane is deferred with no timeout: the batch lands intact
+on the first pass after focus moves away. New members are introduced once and
+start at the current tail — no history dump.
 
 A daemon whose binary is replaced under it — an update, a rebuild — restarts
 into the new build between delivery passes. Cursors and intro flags live on

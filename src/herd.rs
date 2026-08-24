@@ -6,6 +6,10 @@ pub struct AgentInfo {
     pub pane_id: String,
     pub status: String,
     pub cwd: String,
+    /// Whether the human's cursor is in this agent's pane. `None` means
+    /// `herdr agent list` did not emit the field at all, which is treated as
+    /// "not focused" at the delivery gate — see `focus_blocked` in `daemon.rs`.
+    pub focused: Option<bool>,
 }
 
 pub trait HerdControl {
@@ -26,6 +30,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<AgentInfo>> {
                 pane_id: a["pane_id"].as_str().unwrap_or_default().to_string(),
                 status: a["agent_status"].as_str().unwrap_or("unknown").to_string(),
                 cwd: a["cwd"].as_str().unwrap_or_default().to_string(),
+                focused: a["focused"].as_bool(),
             })
         })
         .collect())
@@ -95,8 +100,8 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{"id":"cli:agent:list","result":{"agents":[
-        {"agent":"claude","agent_status":"idle","cwd":"/home/andy/.herdr/worktrees/alare/issue-590","name":"issue-590","pane_id":"w35:p1","tab_id":"w35:t1","workspace_id":"w35"},
-        {"agent":"claude","agent_status":"working","name":"issue-758","pane_id":"w3A:p1","tab_id":"w3A:t1","workspace_id":"w3A"},
+        {"agent":"claude","agent_status":"idle","cwd":"/home/andy/.herdr/worktrees/alare/issue-590","focused":true,"name":"issue-590","pane_id":"w35:p1","tab_id":"w35:t1","workspace_id":"w35"},
+        {"agent":"claude","agent_status":"working","focused":false,"name":"issue-758","pane_id":"w3A:p1","tab_id":"w3A:t1","workspace_id":"w3A"},
         {"agent":"claude","agent_status":"idle","pane_id":"w3E:p2","tab_id":"w3E:t2","workspace_id":"w3E"}
     ],"type":"agent_list"}}"#;
 
@@ -109,6 +114,25 @@ mod tests {
         assert_eq!(agents[0].pane_id, "w35:p1");
         assert_eq!(agents[1].name, "issue-758");
         assert_eq!(agents[1].status, "working");
+    }
+
+    #[test]
+    fn parses_the_focused_flag_both_ways() {
+        let agents = parse_agent_list(FIXTURE).unwrap();
+        assert_eq!(agents[0].focused, Some(true));
+        assert_eq!(agents[1].focused, Some(false));
+    }
+
+    #[test]
+    fn missing_focused_is_none_not_false() {
+        // A herdr that does not emit the field must be distinguishable from
+        // one reporting an unfocused pane: the delivery gate logs the former
+        // once and then delivers anyway.
+        let json = r#"{"result":{"agents":[
+            {"agent_status":"idle","name":"issue-590","pane_id":"w35:p1"}
+        ]}}"#;
+        let agents = parse_agent_list(json).unwrap();
+        assert_eq!(agents[0].focused, None);
     }
 
     #[test]

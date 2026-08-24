@@ -457,6 +457,7 @@ mod tests {
             pane_id: "w1:p1".into(),
             status: "idle".into(),
             cwd: cwd.into(),
+            focused: Some(false),
         }
     }
 

@@ -13,12 +13,18 @@ pub struct DaemonState {
     /// Consecutive ticks an enrolled agent has been absent from `herdr agent list`.
     #[serde(default)]
     pub absences: HashMap<String, u32>,
-    /// Consecutive ticks a not-yet-introduced agent has been deliverable.
+    /// Consecutive ticks a not-yet-introduced agent has been deliverable and
+    /// unfocused. Broken by either, so the intro waits for fresh sightings.
     #[serde(default)]
     pub deliverable_streak: HashMap<String, u32>,
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
+    /// Agents currently being reported without a `focused` field. The check
+    /// runs every tick; the warning is once per outage, and the entry is
+    /// dropped as soon as the field comes back so a later outage warns again.
+    #[serde(default)]
+    pub focus_unknown_warned: HashSet<String>,
 }
 
 pub fn load(dir: &Path) -> DaemonState {
