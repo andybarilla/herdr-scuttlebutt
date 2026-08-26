@@ -77,6 +77,13 @@ pub struct DaemonState {
     /// evicts the oldest to bound the file.
     #[serde(default)]
     pub held: HashMap<String, Held>,
+    /// Held batches this room's cap evicted, newest last and capped at
+    /// `MAX_DROPPED_NOTES`. A note is not the batch: those messages are
+    /// still in the room log and nothing will deliver them. It stays until
+    /// a human acknowledges it with `held <agent> --drop` or another
+    /// eviction pushes it out.
+    #[serde(default)]
+    pub dropped: Vec<Dropped>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
@@ -152,13 +159,47 @@ pub struct Held {
     /// is where it stays visible.
     #[serde(default)]
     pub warned: bool,
-    /// Whether a human has confirmed that the name still means the agent
-    /// this batch was held for (`scuttlebutt held <agent> --deliver`). The
-    /// session id is the only thing that can decide it automatically, and
-    /// it decides only when both sides carry one; this is the way out of
-    /// every case where it cannot.
+    /// A human's standing answer to the question the session id could not
+    /// (`scuttlebutt held <agent> --deliver`), or `None` for a hold nobody
+    /// has released. Bounded and identified rather than a bare flag: a
+    /// release that never expired and compared nothing would arm a
+    /// delivery for whoever next answered to that name, which is the
+    /// cross-delivery the automatic path exists to refuse.
     #[serde(default)]
-    pub released: bool,
+    pub release: Option<Release>,
+}
+
+/// One human authorization to deliver a held batch. An authorization, not a
+/// standing arrangement: it names the process it was given for whenever
+/// herdr could report one, and it lapses either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Release {
+    /// The session id the agent at that name was reporting when the human
+    /// released the hold. `Some` means the release is for that process and
+    /// no other. `None` means herdr reported none — the agent was gone, or
+    /// is a kind that has no id — and the window below is then the only
+    /// thing standing between the release and an unrelated pane.
+    pub session: Option<String>,
+    /// When the release was given, RFC3339. Wall-clock rather than ticks
+    /// because a room whose agents have all gone does not tick at all, and
+    /// a release that only lapsed while something was running would stand
+    /// forever in exactly the room where it is most likely to be stale.
+    ///
+    /// This is a bound on the *authorization*, never on the batch: a hold
+    /// whose release lapses is still held, and still listed.
+    pub at: String,
+}
+
+/// A held batch the room's cap evicted. Kept so `daemon-status` can still
+/// name what was dropped: a batch that leaves the state file with only a
+/// `daemon.log` line behind is invisible to the interface that is supposed
+/// to be the record of what is waiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dropped {
+    pub agent: String,
+    pub batch: u64,
+    pub held_since: u64,
+    pub at: String,
 }
 
 pub fn load(dir: &Path) -> DaemonState {
@@ -216,7 +257,7 @@ mod tests {
                 batch: 19,
                 session: Some("sess-1".into()),
                 warned: true,
-                released: false,
+                release: None,
             },
         );
         save(dir.path(), &s).unwrap();
@@ -224,7 +265,7 @@ mod tests {
         assert_eq!(loaded.held["reviewer"].cursor, 12);
         assert_eq!(loaded.held["reviewer"].session.as_deref(), Some("sess-1"));
         assert!(loaded.held["reviewer"].warned);
-        assert!(!loaded.held["reviewer"].released);
+        assert!(loaded.held["reviewer"].release.is_none());
     }
 
     #[test]

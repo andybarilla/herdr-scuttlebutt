@@ -813,8 +813,13 @@ const UNGROUPED_ROOM: &str = "(ungrouped room)";
 struct Holds {
     /// (room, agent, batch id)
     stalled: Vec<(String, String, u64)>,
-    /// (room, agent, batch id, id the hold opened on)
-    absent: Vec<(String, String, u64, u64)>,
+    /// (room, agent, batch id, id the hold opened on, standing release)
+    absent: Vec<(String, String, u64, u64, Option<String>)>,
+    /// (room, agent, batch id, id the hold opened on, when it was dropped)
+    /// for holds the room's cap evicted. Reported until a human clears the
+    /// note: the messages are still in the log and nothing will deliver
+    /// them, which is worth saying out loud rather than only in daemon.log.
+    dropped: Vec<(String, String, u64, u64, String)>,
 }
 
 fn rooms_under(session: &Path) -> Vec<(String, PathBuf)> {
@@ -842,13 +847,32 @@ fn held_batches(session: &Path) -> Holds {
             holds.stalled.push((room.clone(), name, stall.batch));
         }
         for (name, held) in st.held {
+            // A live release is state a human decided and can decide again,
+            // so it belongs in the listing rather than only in the file. A
+            // lapsed one reads as none: the daemon drops it on the next
+            // sighting, and reporting it would say the batch is authorised
+            // when nothing will deliver it.
+            let release =
+                held.release
+                    .as_ref()
+                    .filter(|r| release_live(r))
+                    .map(|r| match &r.session {
+                        Some(id) => format!("released for session {id}"),
+                        None => "released for the next agent under that name".to_string(),
+                    });
             holds
                 .absent
-                .push((room.clone(), name, held.batch, held.held_since));
+                .push((room.clone(), name, held.batch, held.held_since, release));
+        }
+        for d in st.dropped {
+            holds
+                .dropped
+                .push((room.clone(), d.agent, d.batch, d.held_since, d.at));
         }
     }
     holds.stalled.sort();
     holds.absent.sort();
+    holds.dropped.sort();
     holds
 }
 
@@ -882,33 +906,69 @@ pub fn status(dir: &Path) {
     // still there can be fixed at its pane, and one that is gone cannot.
     // Silent when empty — the absent case is the unusual one, and a "none"
     // line for it every time would bury the stalled list it sits under.
-    if holds.absent.is_empty() {
+    if !holds.absent.is_empty() {
+        println!(
+            "held batches (agent no longer present): {} of at most {MAX_HELD_BATCHES} \
+             per room (kept until delivered or dropped, never on a timer; \
+             `scuttlebutt held <agent> --deliver` authorises delivery to the agent \
+             at that name for the next {RELEASE_WINDOW_MINUTES} minutes, `--drop` \
+             discards it)",
+            holds.absent.len()
+        );
+        for (room, name, batch, since, release) in holds.absent {
+            let note = release.map(|r| format!(", {r}")).unwrap_or_default();
+            println!(
+                "  {name} in {room}: holding messages up to #{batch}, held since #{since}{note}"
+            );
+        }
+    }
+    // Last, and only when there is one: a batch that is gone is worse news
+    // than one that is waiting, and it must not be read as still waiting.
+    if holds.dropped.is_empty() {
         return;
     }
     println!(
-        "held batches (agent no longer present): {} (kept until delivered or \
-         dropped, never on a timer; `scuttlebutt held <agent> --deliver` sends \
-         one to whatever now holds the name, `--drop` discards it)",
-        holds.absent.len()
+        "dropped batches (over the {MAX_HELD_BATCHES}-per-room cap, not delivered \
+         and not recoverable; the messages are still in the room log; \
+         `scuttlebutt held <agent> --drop` clears the note): {}",
+        holds.dropped.len()
     );
-    for (room, name, batch, since) in holds.absent {
-        println!("  {name} in {room}: holding messages up to #{batch}, held since #{since}");
+    for (room, name, batch, since, at) in holds.dropped {
+        println!(
+            "  {name} in {room}: dropped messages up to #{batch}, held since #{since}, at {at}"
+        );
     }
 }
 
 /// `scuttlebutt held <agent> --deliver|--drop`. A held batch is cleared by
-/// delivery or by a human, never by a timer, and this is the human half:
-/// `--deliver` releases the hold so the next listing that carries the name
-/// resumes from its cursor whatever the session ids say, and `--drop`
-/// discards it. Acts in every room holding that name, since a name is only
-/// unique within a room.
+/// delivery or by a human, never by a timer, and this is the human half.
+///
+/// `--deliver` records a `Release`, which is an authorization and not a
+/// standing arrangement. `at_pane` is the session id herdr reports for that
+/// name *now*, captured by the caller at the moment the human answers: with
+/// one, only that process may take the batch; without one, any agent under
+/// that name may, for `RELEASE_WINDOW_MINUTES`. The window is what stops an
+/// unclaimed release — on a hold in a room its agent has left, say — from
+/// arming a delivery for whoever answers to that name days later.
+///
+/// `--drop` discards the batch, and also clears an eviction note for that
+/// name, which is the only way one leaves short of another eviction pushing
+/// it out.
+///
+/// Acts in every room holding that name, since a name is only unique within
+/// a room.
 ///
 /// Reads and rewrites `state.json` directly. The daemon reloads state from
 /// disk every pass, so the only window where this can be clobbered is the
 /// sub-millisecond gap between one pass's load and its save; losing this
 /// costs a retype, and a durable request queue would be a second
 /// concurrency design to review inside a data-loss fix.
-pub fn held_action(session: &Path, agent: &str, deliver: bool) -> Result<()> {
+pub fn held_action(
+    session: &Path,
+    agent: &str,
+    deliver: bool,
+    at_pane: Option<String>,
+) -> Result<()> {
     let mut acted = false;
     for (room, path) in rooms_under(session) {
         let Ok(text) = std::fs::read_to_string(path.join("state.json")) else {
@@ -920,26 +980,49 @@ pub fn held_action(session: &Path, agent: &str, deliver: bool) -> Result<()> {
         let Ok(mut st) = serde_json::from_str::<DaemonState>(&text) else {
             continue;
         };
+        // `--drop` also acknowledges an eviction note for that name: it is
+        // the only way one leaves short of another eviction pushing it out,
+        // and a human who has read it should not have to keep reading it.
+        if !deliver {
+            let before = st.dropped.len();
+            st.dropped.retain(|d| d.agent != agent);
+            if st.dropped.len() != before {
+                crate::state::save(&path, &st)?;
+                acted = true;
+                println!("{agent} in {room}: cleared a note about a dropped batch");
+            }
+        }
         let Some(held) = st.held.get_mut(agent) else {
             continue;
         };
         let (batch, since) = (held.batch, held.held_since);
-        if deliver {
-            held.released = true;
-            // Re-armed with the release: whoever picks the name up next
-            // deserves the same line if the ids still do not match.
+        let what = if deliver {
+            held.release = Some(crate::state::Release {
+                session: at_pane.clone(),
+                at: chrono::Utc::now().to_rfc3339(),
+            });
+            // Re-armed with the release: a release that lapses unclaimed,
+            // or an agent that turns up and cannot be matched to it, is
+            // worth a line even if this name has had one before.
             held.warned = false;
+            match &at_pane {
+                Some(id) => format!(
+                    "will be delivered to the agent now at that name (session {id}) \
+                     at its next delivery opportunity"
+                ),
+                None => format!(
+                    "will be delivered to the next agent under that name, if one \
+                     appears within {RELEASE_WINDOW_MINUTES} minutes — herdr reports \
+                     no session id for that name, so nothing can check that it is \
+                     the same agent"
+                ),
+            }
         } else {
             st.held.remove(agent);
-        }
+            "has been discarded; the messages are still in the room log".to_string()
+        };
         crate::state::save(&path, &st)?;
         acted = true;
-        let what = if deliver {
-            "will be delivered to whatever now holds that name, at its next \
-             delivery opportunity"
-        } else {
-            "has been discarded; the messages are still in the room log"
-        };
         println!("{agent} in {room}: the batch up to #{batch} (held since #{since}) {what}");
     }
     if !acted {
@@ -1031,7 +1114,8 @@ fn focus_blocked(a: &AgentInfo) -> bool {
 /// bounded by `MAX_HELD_BATCHES`.
 const MAX_ABSENCES: u32 = 3;
 
-/// Held batches one room keeps at once. This is the bound on `state.held`,
+/// Held batches one room keeps at once — per room, so a session running
+/// several rooms can hold this many in each. This is the bound on `state.held`,
 /// and it is a count rather than an age because the whole point of #43 is
 /// that a batch must not expire on a timer while its pane is being fixed.
 /// Reaching it evicts the hold that has waited longest and says so: a room
@@ -1039,14 +1123,43 @@ const MAX_ABSENCES: u32 = 3;
 /// hold would not have told anyone about.
 const MAX_HELD_BATCHES: usize = 16;
 
+/// Evictions one room remembers for `daemon-status`. Small: the note says
+/// a batch was dropped, and a room that has dropped this many has a
+/// standing problem rather than an incident to read about.
+const MAX_DROPPED_NOTES: usize = 8;
+
+/// How long a human's `held --deliver` stands before it lapses unclaimed.
+/// A release is an authorization to deliver now, not a permanent arrangement
+/// for whoever next answers to that name: long enough to cover reopening a
+/// pane and getting it to idle, short enough that a release forgotten in a
+/// room the agent has left cannot arm a delivery days later.
+const RELEASE_WINDOW_MINUTES: i64 = 30;
+
+/// Whether a release is still standing. An unparseable timestamp counts as
+/// lapsed: this gate decides whether to hand one agent's batch to a pane
+/// nothing else vouched for, and a corrupt field is not a yes.
+fn release_live(r: &crate::state::Release) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(&r.at) {
+        Ok(at) => {
+            chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc))
+                < chrono::Duration::minutes(RELEASE_WINDOW_MINUTES)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Moves a stalled agent's batch out of presence state as the purge takes
 /// the rest of it. Merging rather than replacing when the name already
 /// holds one: the older record's cursor is the lower of the two, so
 /// resuming from it covers both batches.
 fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::state::Stall) {
-    // Falls back to `held_since` only if the cursor is somehow already
-    // gone; a stall standing without a cursor is not reachable today.
-    let cursor = state.cursors.get(name).copied().unwrap_or(stall.held_since);
+    // A stall standing without a cursor is not reachable today, and the
+    // fallback is 0 anyway rather than the batch's own id: `held_since` is
+    // the *highest* id at the stall, so falling back to it would put the
+    // cursor above the very messages this function exists to keep and skip
+    // them silently. Redelivering the room from the start is the safe
+    // direction, and it is the trade the whole issue rests on.
+    let cursor = state.cursors.get(name).copied().unwrap_or(0);
     let entry = state
         .held
         .entry(name.to_string())
@@ -1056,7 +1169,7 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
             batch: stall.batch,
             session: stall.session.clone(),
             warned: false,
-            released: false,
+            release: None,
         });
     entry.cursor = entry.cursor.min(cursor);
     entry.held_since = entry.held_since.min(stall.held_since);
@@ -1064,7 +1177,19 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
     // Newest known id wins, because the gate compares against the process
     // most recently seen under this name.
     entry.session = stall.session.or_else(|| entry.session.clone());
+    // Both re-armed by a fresh hold: this is a new stall, larger than the
+    // one the last line described, so the mismatch warning is worth saying
+    // again, and a release given against the earlier hold is not an answer
+    // to this one.
+    entry.warned = false;
+    entry.release = None;
     let (batch, held_since) = (entry.batch, entry.held_since);
+    // Evicted first, so the cap's own victim is not announced as kept one
+    // line above the line dropping it.
+    evict_oldest_held(state, dir);
+    if !state.held.contains_key(name) {
+        return;
+    }
     report(
         dir,
         &format!(
@@ -1075,7 +1200,6 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
              `scuttlebutt daemon-status` lists it until then."
         ),
     );
-    evict_oldest_held(state, dir);
 }
 
 /// Enforces `MAX_HELD_BATCHES`. Oldest by `held_since`, tie-broken by name
@@ -1091,6 +1215,18 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
             return;
         };
         let dropped = state.held.remove(&name).expect("just chosen from the map");
+        // The note is what keeps the drop inside the documented interface:
+        // a batch whose only trace is a daemon.log line is a held batch
+        // nobody can see, which is this issue's failure in another costume.
+        state.dropped.push(crate::state::Dropped {
+            agent: name.clone(),
+            batch: dropped.batch,
+            held_since: dropped.held_since,
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+        while state.dropped.len() > MAX_DROPPED_NOTES {
+            state.dropped.remove(0);
+        }
         report(
             dir,
             &format!(
@@ -1117,7 +1253,17 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
 ///
 /// Both of those fail toward not delivering, because handing one agent's
 /// batch to an unrelated pane is worse than making a human confirm it.
-/// `released` is that confirmation: `scuttlebutt held <agent> --deliver`.
+/// `release` is that confirmation: `scuttlebutt held <agent> --deliver`.
+///
+/// A release does not skip the question, it answers it. Where herdr could
+/// report an id for the agent at that name when the human ran the command,
+/// the release carries it and is checked exactly like the automatic case —
+/// a human authorised a delivery to *that* process. Where it could not, the
+/// release is unidentified and the window is the only bound there is, which
+/// is why it is a window and not a flag: a standing `released = true` would
+/// arm a delivery for whoever next answered to that name, in any room,
+/// forever. That is the hazard this whole gate exists to refuse, and it
+/// does not stop being one because a human typed the command.
 ///
 /// What a *reopened* pane reports is herdr's behaviour, not something this
 /// repo has captured: `agent_session` is read straight out of `agent list`
@@ -1128,8 +1274,22 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
 /// a human closed and reopened. `--deliver` is what covers the rest, which
 /// is why it is not optional.
 fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
-    if held.released {
-        return true;
+    if let Some(r) = &held.release {
+        if release_live(r) {
+            return match (&r.session, &a.session) {
+                // Released for a named process: the same comparison the
+                // automatic path makes, with a human's answer standing
+                // where that path would have refused a mismatch.
+                (Some(was), Some(now)) => was == now,
+                // Released for a named process and this one reports none:
+                // nothing to check against, so it is not that process as
+                // far as anything here can tell.
+                (Some(_), None) => false,
+                // Nothing to compare, which is the case the release was
+                // typed for. The window is the bound.
+                (None, _) => true,
+            };
+        }
     }
     match (&held.session, &a.session) {
         (Some(was), Some(now)) => was == now,
@@ -1233,6 +1393,13 @@ pub fn tick(
         .collect();
     let tail = log_store::last_id(dir)?;
 
+    // The cap belongs to the state file, not to one writer: `hold_batch` is
+    // the only production path that adds a hold, but a state.json that
+    // arrived over it — an older build, a hand edit, a restore — would
+    // otherwise carry any number of holds forever, since nothing else
+    // trims them.
+    evict_oldest_held(state, dir);
+
     let live: std::collections::HashSet<String> = agents.iter().map(|a| a.name.clone()).collect();
 
     // enroll new agents (cursor starts at tail: no history dump) and clear
@@ -1264,21 +1431,45 @@ pub fn tick(
                         a.name, held.batch, held.held_since, held.cursor
                     ),
                 );
-            } else if !held.warned {
+            } else {
                 let (batch, held_since) = (held.batch, held.held_since);
-                state.held.get_mut(&a.name).expect("just read").warned = true;
-                report(
-                    dir,
-                    &format!(
-                        "[scuttlebutt] a batch is held for {name} (up to #{batch}, \
-                         held since #{held_since}) but the agent at that name now \
-                         cannot be matched to the session it was held for; not \
-                         delivering it. `scuttlebutt daemon-status` lists it. \
-                         `scuttlebutt held {name} --deliver` sends it anyway; \
-                         `scuttlebutt held {name} --drop` discards it.",
-                        name = a.name
-                    ),
-                );
+                let lapsed = held.release.as_ref().is_some_and(|r| !release_live(r));
+                let warned = held.warned;
+                let held = state.held.get_mut(&a.name).expect("just read");
+                if lapsed {
+                    // Dropped rather than left to be re-tested every tick,
+                    // and said once: a human who released this is entitled
+                    // to know the window closed with nobody claiming it,
+                    // because the batch is still here and still theirs to
+                    // decide about.
+                    held.release = None;
+                    held.warned = true;
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] the release on the batch held for {name} \
+                             (up to #{batch}, held since #{held_since}) lapsed \
+                             unclaimed after {RELEASE_WINDOW_MINUTES} minutes. The \
+                             batch is still held; `scuttlebutt held {name} --deliver` \
+                             again to send it, `--drop` to discard it.",
+                            name = a.name
+                        ),
+                    );
+                } else if !warned {
+                    held.warned = true;
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] a batch is held for {name} (up to #{batch}, \
+                             held since #{held_since}) but the agent at that name now \
+                             cannot be matched to the session it was held for; not \
+                             delivering it. `scuttlebutt daemon-status` lists it. \
+                             `scuttlebutt held {name} --deliver` sends it anyway; \
+                             `scuttlebutt held {name} --drop` discards it.",
+                            name = a.name
+                        ),
+                    );
+                }
             }
         }
         state.cursors.entry(a.name.clone()).or_insert(tail);
@@ -2466,11 +2657,14 @@ mod tests {
         assert_eq!(state.cursors["reviewer"], 1);
         crate::state::save(dir.path(), &state).unwrap();
 
-        held_action(dir.path(), "reviewer", true).unwrap();
+        // No id at that pane for herdr to report, which is the case the
+        // command exists for: the release is unidentified and the window is
+        // what bounds it.
+        held_action(dir.path(), "reviewer", true, None).unwrap();
         let mut state = crate::state::load(dir.path());
-        assert!(state.held["reviewer"].released);
+        assert!(state.held["reviewer"].release.is_some());
 
-        // and the next listing resumes from the held cursor, ids or no ids
+        // and the next listing resumes from the held cursor
         let back = comes_back(&mut state, dir.path(), None, 3);
         assert!(
             was_delivered(&back),
@@ -2483,11 +2677,11 @@ mod tests {
     fn a_human_can_drop_a_held_batch() {
         let (dir, state) = stalled_then_vanished(None);
         crate::state::save(dir.path(), &state).unwrap();
-        held_action(dir.path(), "reviewer", false).unwrap();
+        held_action(dir.path(), "reviewer", false, None).unwrap();
         assert!(crate::state::load(dir.path()).held.is_empty());
         // and saying so about a name holding nothing is an error, not a
         // silent success that reads as "done".
-        assert!(held_action(dir.path(), "reviewer", false).is_err());
+        assert!(held_action(dir.path(), "reviewer", false, None).is_err());
     }
 
     #[test]
@@ -2518,6 +2712,235 @@ mod tests {
         // Newest id, because the gate compares against the process most
         // recently seen under this name.
         assert_eq!(held.session.as_deref(), Some("sess-2"));
+    }
+
+    /// A release given `mins` ago, for `session`.
+    fn release_aged(session: Option<&str>, mins: i64) -> crate::state::Release {
+        crate::state::Release {
+            session: session.map(str::to_string),
+            at: (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn a_release_does_not_stand_for_a_different_session() {
+        // `--deliver` authorises a delivery, it does not arm one for
+        // whoever next answers to the name. Where herdr could report an id
+        // at release time, the release carries it and is checked.
+        let (dir, mut state) = stalled_then_vanished(Some("sess-1"));
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(Some("sess-2"), 0));
+        let wrong = comes_back(&mut state, dir.path(), Some("TOTALLY-DIFFERENT"), 4);
+        assert!(
+            !was_delivered(&wrong),
+            "a release delivered to another session"
+        );
+        assert!(
+            state.held.contains_key("reviewer"),
+            "the batch was dropped instead"
+        );
+
+        // and the session it was released for does get it
+        let right = comes_back(&mut state, dir.path(), Some("sess-2"), 4);
+        assert!(was_delivered(&right), "the released session got nothing");
+    }
+
+    #[test]
+    fn a_release_for_a_named_session_refuses_an_agent_with_no_id() {
+        // Nothing to compare against is not a match: the release named a
+        // process, and this pane cannot be shown to be it.
+        let (dir, mut state) = stalled_then_vanished(Some("sess-1"));
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(Some("sess-2"), 0));
+        let back = comes_back(&mut state, dir.path(), None, 4);
+        assert!(!was_delivered(&back));
+    }
+
+    #[test]
+    fn an_unclaimed_release_lapses_and_says_so() {
+        // The bound on an unidentified release is the window. The batch is
+        // not bounded by it: it is still held afterwards.
+        let (dir, mut state) = stalled_then_vanished(None);
+        state.held.get_mut("reviewer").unwrap().release =
+            Some(release_aged(None, RELEASE_WINDOW_MINUTES + 1));
+        let back = comes_back(&mut state, dir.path(), None, 4);
+        assert!(!was_delivered(&back), "a lapsed release still delivered");
+        let held = &state.held["reviewer"];
+        assert!(
+            held.release.is_none(),
+            "the lapsed release was left standing"
+        );
+        assert_eq!(held.batch, 1, "the batch went with the release");
+        let log = daemon_log(dir.path());
+        assert!(log.contains("lapsed unclaimed"), "log was: {log}");
+
+        // A release inside the window is the same record, and delivers.
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(None, 1));
+        let back = comes_back(&mut state, dir.path(), None, 4);
+        assert!(was_delivered(&back), "a live release did not deliver");
+    }
+
+    #[test]
+    fn a_hold_with_no_cursor_resumes_from_the_start_of_the_room() {
+        // Not reachable today, and the direction still matters: falling
+        // back to the batch's own id would put the cursor above the
+        // messages this function exists to keep.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "reviewer",
+            crate::state::Stall::new(42, None),
+        );
+        assert_eq!(state.held["reviewer"].cursor, 0);
+    }
+
+    #[test]
+    fn a_merged_hold_re_arms_the_warning_and_clears_a_release() {
+        // The second hold is a bigger batch than the line that described
+        // the first, and a release given against the earlier one is not an
+        // answer to this one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        state.cursors.insert("reviewer".into(), 4);
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "reviewer",
+            crate::state::Stall::new(6, None),
+        );
+        let held = state.held.get_mut("reviewer").unwrap();
+        held.warned = true;
+        held.release = Some(release_aged(None, 0));
+        state.cursors.insert("reviewer".into(), 9);
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "reviewer",
+            crate::state::Stall::new(11, None),
+        );
+        let held = &state.held["reviewer"];
+        assert!(!held.warned, "a larger hold merged in silently");
+        assert!(held.release.is_none(), "an old release outlived its hold");
+    }
+
+    #[test]
+    fn an_oversized_state_file_is_trimmed_on_the_next_tick() {
+        // `hold_batch` is the only writer in this build, so the cap holds
+        // in process. A state.json that arrived over it is trimmed too,
+        // or the bound is only a bound on new holds.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        for i in 0..MAX_HELD_BATCHES * 2 {
+            state.held.insert(
+                format!("agent-{i:02}"),
+                crate::state::Held {
+                    cursor: 0,
+                    held_since: i as u64,
+                    batch: i as u64 + 1,
+                    session: None,
+                    warned: false,
+                    release: None,
+                },
+            );
+        }
+        let herd = FakeHerd::new(vec![]);
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.held.len(), MAX_HELD_BATCHES);
+        assert_eq!(state.dropped.len(), MAX_DROPPED_NOTES);
+    }
+
+    #[test]
+    fn an_evicted_hold_is_still_named_by_daemon_status() {
+        // "A held batch nobody can see is the same failure in a different
+        // costume" — which is as true of one the cap dropped.
+        let session = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        for i in 0..=MAX_HELD_BATCHES {
+            let name = format!("agent-{i:02}");
+            state.cursors.insert(name.clone(), i as u64);
+            hold_batch(
+                &mut state,
+                session.path(),
+                &name,
+                crate::state::Stall::new(i as u64 + 100, None),
+            );
+        }
+        crate::state::save(session.path(), &state).unwrap();
+        let dropped = held_batches(session.path()).dropped;
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, "agent-00");
+        assert_eq!(dropped[0].2, 100);
+
+        // and a human can acknowledge the note, which is the only way one
+        // leaves short of another eviction pushing it out
+        held_action(session.path(), "agent-00", false, None).unwrap();
+        assert!(held_batches(session.path()).dropped.is_empty());
+    }
+
+    #[test]
+    fn daemon_status_names_a_standing_release_and_ignores_a_lapsed_one() {
+        // A release is a decision a human made and may want to revisit, and
+        // a lapsed one must not read as an authorization that still stands.
+        let session = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        let hold = |release| crate::state::Held {
+            cursor: 3,
+            held_since: 4,
+            batch: 7,
+            session: Some("sess-1".into()),
+            warned: false,
+            release,
+        };
+        state
+            .held
+            .insert("live".into(), hold(Some(release_aged(Some("sess-2"), 1))));
+        state.held.insert(
+            "lapsed".into(),
+            hold(Some(release_aged(None, RELEASE_WINDOW_MINUTES + 1))),
+        );
+        crate::state::save(session.path(), &state).unwrap();
+        let absent = held_batches(session.path()).absent;
+        assert_eq!(
+            absent.iter().map(|h| h.4.clone()).collect::<Vec<_>>(),
+            // sorted by room then agent, so "lapsed" comes before "live"
+            vec![None, Some("released for session sess-2".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_cap_does_not_announce_a_hold_it_drops_in_the_same_breath() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        for i in 0..MAX_HELD_BATCHES {
+            state.held.insert(
+                format!("older-{i:02}"),
+                crate::state::Held {
+                    cursor: 0,
+                    held_since: i as u64 + 1,
+                    batch: i as u64 + 1,
+                    session: None,
+                    warned: false,
+                    release: None,
+                },
+            );
+        }
+        // held_since 0 makes the newcomer the oldest hold, so the cap takes
+        // the very hold this call is opening.
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "newcomer",
+            crate::state::Stall::new(0, None),
+        );
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("DROPPING the batch held for newcomer"),
+            "log was: {log}"
+        );
+        assert!(
+            !log.contains("newcomer is gone from the listing"),
+            "announced as kept one line above dropping it: {log}"
+        );
     }
 
     #[test]
@@ -2567,7 +2990,7 @@ mod tests {
                 batch: 7,
                 session: Some("sess-1".into()),
                 warned: false,
-                released: false,
+                release: None,
             },
         );
         crate::state::save(session.path(), &state).unwrap();
@@ -2578,7 +3001,13 @@ mod tests {
         );
         assert_eq!(
             holds.absent,
-            vec![("(ungrouped room)".to_string(), "gone".to_string(), 7, 4)]
+            vec![(
+                "(ungrouped room)".to_string(),
+                "gone".to_string(),
+                7,
+                4,
+                None
+            )]
         );
     }
 

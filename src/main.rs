@@ -9,6 +9,7 @@ mod state;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use herd::HerdControl as _;
 
 #[derive(Parser)]
 #[command(name = "scuttlebutt", about = "Chat room for herdr agents")]
@@ -125,7 +126,17 @@ fn main() -> anyhow::Result<()> {
                 // Both flags is already refused by clap; neither is this.
                 anyhow::bail!("pass exactly one of --deliver or --drop");
             }
-            daemon::held_action(&paths::session_dir()?, &agent, deliver)
+            // The id is captured here, at the moment the human answers,
+            // rather than trusted later: a release that named nothing would
+            // stand for whoever next answered to that name. Best effort —
+            // the usual case for this command is an agent that is gone, and
+            // a herdr that cannot be reached says nothing either way.
+            let at_pane = herd
+                .list_agents()
+                .ok()
+                .and_then(|all| all.into_iter().find(|a| a.name == agent))
+                .and_then(|a| a.session);
+            daemon::held_action(&paths::session_dir()?, &agent, deliver, at_pane)
         }
         Cmd::SessionCwd => {
             println!("{}", herd::focused_cwd()?);
