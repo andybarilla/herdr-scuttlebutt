@@ -103,11 +103,16 @@ pub struct App {
     /// switch-in. Without it a draft either follows you into the next room
     /// or is silently dropped.
     pub drafts: HashMap<CurrentRoom, String>,
-    /// Whether `last_error` is the tail read's own, so that a later
-    /// successful read clears that and nothing else. A failed post lands in
-    /// `last_error` too, and the tail runs at the top of every loop before
-    /// the draw — an unconditional clear would wipe `post failed: …` before
-    /// the human ever saw it.
+    /// Whether the message in `last_error` is the tail read's own, so that a
+    /// later successful read clears that and nothing else. The tail runs at
+    /// the top of every loop, before the draw, so an unconditional clear
+    /// would wipe a `post failed: …` written after the last draw before the
+    /// human ever saw it.
+    ///
+    /// It is a claim about who wrote `last_error`, which means every other
+    /// writer has to clear it — `post` and `switch_room` both do, and a
+    /// third writer added without doing so silently re-opens exactly that
+    /// hole.
     pub tail_failed: bool,
     /// `room.jsonl` length per room when this pane started, refreshed for a
     /// room as you leave it. An unread dot is this compared against the
@@ -471,6 +476,11 @@ fn switch_room(
     if target == app.room {
         return Ok(());
     }
+    // Cleared before anything that can fail, because the caller writes its
+    // own `could not open that room: …` into `last_error` when this returns
+    // Err — and a flag left standing there hands that message to the next
+    // successful read to erase.
+    app.tail_failed = false;
     // Everything that can fail happens here, before a single byte of the
     // pane's room-scoped state moves. `paths::room_dir` reaches `base_dir`,
     // which spawns `herdr plugin config-dir` unless SCUTTLEBUTT_DIR is set,
@@ -525,11 +535,6 @@ fn switch_room(
     // A failure belonged to the room it happened in — a write attempted
     // there, or a read of that room's log.
     app.last_error = None;
-    // Does nothing today: the first tick in the new room reaches `tail`
-    // before any keystroke can, and a successful read consumes the flag
-    // against a `last_error` that is already `None`. It is here so the pair
-    // stays a pair without depending on that ordering.
-    app.tail_failed = false;
 
     match loaded {
         Some((dir, messages, members)) => {
@@ -549,6 +554,19 @@ fn switch_room(
     app.title = title_for(&target);
     app.room = target;
     Ok(())
+}
+
+/// Commits a line to the room on screen, reporting a failed write the way a
+/// failed read and a failed switch are reported.
+fn post(app: &mut App, dir: &Path, text: &str) {
+    app.last_error = match log_store::append(dir, "human", text) {
+        Ok(_) => None,
+        Err(e) => Some(format!("post failed: {e}")),
+    };
+    // Whatever is in `last_error` now, it is not the tail's. Leaving the
+    // flag standing would have the next good read — which comes before the
+    // next draw — erase what the human just failed to send, unseen.
+    app.tail_failed = false;
 }
 
 /// The messages `dir` has for a pane sitting at `cursor`, and whether they
@@ -658,11 +676,8 @@ pub fn run(group: Option<&str>) -> Result<()> {
                                 // `handle_key` only returns this with a room
                                 // selected, so a pane with none never reaches
                                 // an append with no directory.
-                                if let Some(dir) = &app.dir {
-                                    app.last_error = match log_store::append(dir, "human", &text) {
-                                        Ok(_) => None,
-                                        Err(e) => Some(format!("post failed: {e}")),
-                                    };
+                                if let Some(dir) = app.dir.clone() {
+                                    post(&mut app, &dir, &text);
                                 }
                             }
                             Some(Action::OpenPicker) => {
@@ -1839,6 +1854,107 @@ mod tests {
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["id 1 all over again"]
+        );
+    }
+
+    #[test]
+    fn a_failed_post_is_not_erased_by_the_next_good_read() {
+        // The sequence that reaches this: the room's log fails to read
+        // (flag set, error drawn), the human presses Enter and the write
+        // fails too — after the draw — and the read succeeds again next
+        // frame. A flag left standing from the read erases the post failure
+        // before it is ever drawn, which is the one thing the flag exists to
+        // prevent.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+        tail(&mut a, &wall);
+
+        post(&mut a, &wall, "the line the human typed");
+        assert!(
+            a.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("post failed:")),
+            "{:?}",
+            a.last_error
+        );
+
+        let good = session.join("acme");
+        std::fs::create_dir(&good).unwrap();
+        log_store::append(&good, "bob", "hi").unwrap();
+        tail(&mut a, &good);
+
+        assert!(
+            a.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("post failed:")),
+            "the good read erased what the human failed to send: {:?}",
+            a.last_error
+        );
+    }
+
+    #[test]
+    fn a_failed_switch_is_not_erased_by_the_next_good_read() {
+        // Same shape, other writer: `switch_room` returns Err and its caller
+        // writes the message, so the flag has to be down by the time it
+        // returns — on the failing path as much as the succeeding one.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+        tail(&mut a, &wall);
+
+        let e = switch(&mut a, named("wall"), &session, &FakeHerd(vec![], false)).unwrap_err();
+        assert!(
+            !a.tail_failed,
+            "a failed switch left the read's claim on `last_error` standing"
+        );
+        // The message the run loop writes for that Err, verbatim.
+        a.last_error = Some(format!("could not open that room: {e}"));
+
+        let good = session.join("acme");
+        std::fs::create_dir(&good).unwrap();
+        tail(&mut a, &good);
+
+        assert_eq!(
+            a.last_error.as_deref(),
+            Some(format!("could not open that room: {e}").as_str())
+        );
+    }
+
+    #[test]
+    fn trimming_a_room_log_leaves_the_pane_the_history_it_has_read() {
+        // A rotation that drops old lines but keeps the newest id: the
+        // cursor still matches the file, so there is nothing to re-seed
+        // from, and re-reading anyway would shrink the pane's scrollback to
+        // whatever the file kept. This is the case that separates the two
+        // branches of `reseed`; ids restarting lower is the other.
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..5 {
+            log_store::append(&dir, "bob", &format!("m{i}")).unwrap();
+        }
+        let mut a = app();
+        tail(&mut a, &dir);
+        assert_eq!(a.messages.len(), 5);
+
+        let kept: String = std::fs::read_to_string(dir.join("room.jsonl"))
+            .unwrap()
+            .lines()
+            .skip(3)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(dir.join("room.jsonl"), kept).unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m0", "m1", "m2", "m3", "m4"]
         );
     }
 
