@@ -35,7 +35,14 @@ pub trait HerdControl {
 /// costs a repeat. Guessing instead resolves to `Submitted` and costs the
 /// batch. A gutter-bounded composer has no marker and is identified by
 /// `gutter_bounded` instead.
-const MARKERS: [&str; 3] = ["\u{276f}", ">", "\u{203a}"];
+///
+/// A bare `>` was here and is not a marker. No agent this fleet runs opens
+/// its composer with one — Claude Code draws `\u{276f}`, OpenCode draws no marker
+/// at all — and `>` is what markdown opens a blockquote with and what a
+/// shell draws for a continuation line. A marker that ordinary text also
+/// starts with turns transcript into a composer, and a composer that is
+/// really transcript answers for the pane.
+const MARKERS: [&str; 2] = ["\u{276f}", "\u{203a}"];
 
 /// Verticals an editor may draw down the left edge of its input box on
 /// every row, in place of a rule above it. OpenCode uses the heavy one.
@@ -167,11 +174,12 @@ fn is_rule(line: &str) -> bool {
 /// What a pane's rules and gutters divide it into.
 ///
 /// `composers` are the regions a marker or a gutter identified as one.
-/// `others` is every remaining rule-bounded region, and it exists because a
-/// region boundary can move: a rule inside a message body splits the
-/// composer, and the half carrying our text is then the half without the
-/// marker. Those regions can say our text is still on the composer; they
-/// can never say a composer is clear. Discarding them, which is what this
+/// `others` are the regions beside a composer that carry no marker, and
+/// they exist because a region boundary can move: a rule inside a message
+/// body splits the composer, and the half carrying our text is then the
+/// half without the marker. Those regions can say our text is still on the
+/// composer, and their mere presence stops a composer claiming to be clear;
+/// neither can they ever say one is. Discarding them, which is what this
 /// did before, turned a moved boundary into `Some(false)` and dropped the
 /// batch.
 struct Regions {
@@ -201,17 +209,38 @@ fn composer_regions(pane: &str) -> Regions {
     regions
 }
 
-/// Every rule-bounded region, split by whether it opens with a prompt
-/// marker.
+/// Whether two rules could be the two edges of one box: drawn at the same
+/// column, to the same width. A composer's borders are; a rule that arrived
+/// inside a message body, or the border of a table in the transcript, has
+/// no reason to match the composer's and in practice does not.
+fn same_box(top: &str, bottom: &str) -> bool {
+    box_span(top) == box_span(bottom)
+}
+
+/// Every rule-bounded region that could be a composer, split by whether it
+/// opens with a prompt marker.
 ///
-/// Every region is returned, not just the last one, and that is the point.
-/// A message body ending in a rule of its own, or a bordered box drawn
-/// below the composer, both put a *different* region last; picking one
+/// A region counts only when its two rules could be the edges of one box.
+/// That is what keeps a transcript out: a rendered markdown table draws
+/// rules of its own, and this room's traffic is full of tables — the region
+/// between two of those rules carries a row that begins with `DELIVERY_RULE`
+/// and therefore matches every batch we ever send, forever. Matching edges
+/// exclude it, because a table's border is not the composer's width. Read
+/// without that test, the pane in `composer-below-a-table` answers
+/// `Some(true)` on a clear composer on every tick.
+///
+/// Every qualifying region is returned, not just the last one, and that is
+/// the point. A message body ending in a rule of its own, or a bordered box
+/// drawn below the composer, both put a *different* region last; picking one
 /// region by position is a guess, and a wrong guess here reports a batch
-/// submitted that is sitting on a composer two lines up. A transcript echo
-/// of a submitted prompt cannot be mistaken for a composer, because the
-/// transcript draws no rules around it — but it can still land in `others`,
-/// where the worst it costs is a repeat delivery.
+/// submitted that is sitting on a composer two lines up.
+///
+/// `others` — regions that qualify but carry no marker — are kept only next
+/// to a composer, because that is the one place a composer's own content
+/// can be: a rule that arrives inside the box splits it, and the half
+/// holding our text is then the half without the marker. They can say our
+/// text is still there; they can never say a composer is clear. Kept
+/// further afield, they are the transcript again, vetoing forever.
 fn rule_bounded(lines: &[&str]) -> Regions {
     let rules: Vec<usize> = lines
         .iter()
@@ -219,11 +248,12 @@ fn rule_bounded(lines: &[&str]) -> Regions {
         .filter(|(_, l)| is_rule(l))
         .map(|(i, _)| i)
         .collect();
-    let mut regions = Regions {
-        composers: Vec::new(),
-        others: Vec::new(),
-    };
+    let mut boxed: Vec<Option<(bool, Vec<String>)>> = Vec::new();
     for w in rules.windows(2) {
+        if !same_box(lines[w[0]], lines[w[1]]) {
+            boxed.push(None);
+            continue;
+        }
         let mut region: Vec<String> = lines[w[0] + 1..w[1]]
             .iter()
             .map(|l| normalize(l))
@@ -236,10 +266,24 @@ fn rule_bounded(lines: &[&str]) -> Regions {
         match marker {
             Some(marker) => {
                 region[0] = region[0][marker..].trim().to_string();
-                regions.composers.push(region);
+                boxed.push(Some((true, region)));
             }
-            None if !region.is_empty() => regions.others.push(region),
-            None => {}
+            None if region.is_empty() => boxed.push(None),
+            None => boxed.push(Some((false, region))),
+        }
+    }
+    let composer_at = |i: usize| matches!(boxed.get(i), Some(Some((true, _))));
+    let mut regions = Regions {
+        composers: Vec::new(),
+        others: Vec::new(),
+    };
+    for (i, region) in boxed.iter().enumerate() {
+        match region {
+            Some((true, lines)) => regions.composers.push(lines.clone()),
+            Some((false, lines)) if composer_at(i + 1) || (i > 0 && composer_at(i - 1)) => {
+                regions.others.push(lines.clone())
+            }
+            _ => {}
         }
     }
     regions
@@ -387,6 +431,14 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
         .any(|c| is_our_text(&c.join(" "), &sent))
     {
         return Some(true);
+    }
+    // A region kept in `others` is a rule inside the box with content on
+    // the far side of it, so which half is the composer's is exactly what
+    // cannot be told apart. The marker half saying it is empty is not
+    // evidence the box is: our text may be the half that lost the marker,
+    // mangled past a three-word window and so unable to say so above.
+    if !others.is_empty() {
+        return None;
     }
     // Only a region something identified as a composer can say a composer
     // is clear. `others` has already had its say above.
@@ -689,6 +741,7 @@ mod tests {
     const OC_HINT: &str = include_str!("../tests/fixtures/opencode-hint.txt");
     const OC_LIVE: &str = include_str!("../tests/fixtures/opencode-live-room.txt");
     const OC_WRAPPED_CWD: &str = include_str!("../tests/fixtures/opencode-wrapped-cwd.txt");
+    const TABLE: &str = include_str!("../tests/fixtures/composer-below-a-table.txt");
 
     /// What was typed into the OpenCode panes: `RULE` as a real delivery
     /// carries it, with the sentence that follows it in the preamble.
@@ -782,6 +835,7 @@ mod tests {
             ("opencode, holding a batch", OC_HOLDS),
             ("opencode, a working lead", OC_LIVE),
             ("opencode, a wrapped working directory", OC_WRAPPED_CWD),
+            ("claude code, a table above the composer", TABLE),
         ] {
             assert!(
                 !composer_regions(pane).composers.is_empty(),
@@ -802,19 +856,28 @@ mod tests {
 
     #[test]
     fn a_titled_border_over_a_held_batch_is_not_a_confirmation() {
-        // The two halves put together: the real titled border from one pane
-        // above the real held batch of another. Live panes gave each shape
-        // separately, and it is their combination that would drop a batch.
-        let titled = TITLED
-            .lines()
-            .find(|l| l.contains("clear-conversation-state"))
-            .expect("fixture lost its titled border");
-        let mut lines: Vec<&str> = HOLDS_BATCH.lines().collect();
+        // The real titled pane with the real held rows written into its
+        // composer. Both of its borders are kept, so the box still measures
+        // as one: splicing only the top border in would have changed the
+        // box's width and tested nothing but the mismatch.
+        let mut lines: Vec<&str> = TITLED.lines().collect();
         let top = lines
             .iter()
-            .position(|l| is_rule(l))
-            .expect("fixture lost its composer border");
-        lines[top] = titled;
+            .position(|l| l.contains("clear-conversation-state"))
+            .expect("fixture lost its titled border");
+        let bottom = top
+            + lines[top..]
+                .iter()
+                .skip(1)
+                .position(|l| is_rule(l))
+                .expect("fixture lost its composer")
+            + 1;
+        let batch: Vec<&str> = HOLDS_BATCH
+            .lines()
+            .skip_while(|l| !l.starts_with('\u{276f}'))
+            .take_while(|l| !is_rule(l))
+            .collect();
+        lines.splice(top + 1..bottom, batch);
         assert_eq!(composer_holds(&lines.join("\n"), RULE), Some(true));
     }
 
@@ -915,6 +978,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_table_in_the_transcript_is_not_a_composer() {
+        // A real Claude Code pane with a rendered markdown table above a
+        // clear composer, one of whose rows carries `DELIVERY_RULE` — which
+        // opens every batch we send, so it matches all of them, forever.
+        // Read without matching the box's edges, this pane answers
+        // `Some(true)` on every tick and the streak skips the batch: #36's
+        // symptom, from the fix for #36.
+        assert!(
+            TABLE.lines().filter(|l| is_rule(l)).count() > 2,
+            "fixture lost its table"
+        );
+        assert_eq!(composer_regions(TABLE).composers.len(), 1);
+        assert!(composer_regions(TABLE).others.is_empty());
+        assert_eq!(composer_holds(TABLE, RULE), Some(false));
+    }
+
+    #[test]
+    fn a_blockquote_is_not_a_prompt_marker() {
+        // `>` opens a markdown blockquote and a shell continuation line as
+        // readily as it opens anyone's composer, and no agent this fleet
+        // runs opens one with it. Read as a marker, a quoted line between
+        // two rules of matching width is a composer holding whatever it
+        // quotes.
+        let quoted = ["> Reply only if you have information others don't".to_string()];
+        assert_eq!(holds(&quoted, RULE), None);
+    }
+
+    #[test]
+    fn a_closing_rule_with_a_wide_label_measures_its_box_in_cells() {
+        // `box_span` reads the box's columns off the rule that closes it.
+        // Counted in characters, a double-width label makes that rule
+        // measure narrower than it is drawn, and the rows above are clipped
+        // short — far enough, on a narrow box, to cut our text off
+        // entirely and leave rows that are all empty, which reads as clear.
+        let run = "\u{2500}".repeat(RULE_RUN);
+        let bottom = format!("{run} \u{6982}\u{8981} {run}");
+        let pane = format!("  \u{2503}\n  \u{2503}  Reply only\n  \u{2503}\n{bottom}\n  status");
+        assert_eq!(box_span(&bottom), (0, display_width(&bottom)));
+        assert_ne!(composer_holds(&pane, RULE), Some(false));
+    }
+
     // ---- a boundary that moved never loses the batch --------------------
 
     #[test]
@@ -941,18 +1046,42 @@ mod tests {
 
     #[test]
     fn a_rule_inside_the_batch_does_not_hide_the_half_without_the_marker() {
-        // A message body carrying a titled rule of its own splits the
-        // composer, and our text ends up in the half the marker is not in.
-        // That half used to be discarded, which left the half holding a
-        // label — three words, none of them ours — to answer for the
-        // composer: `Some(false)`, cursor advanced, batch gone.
-        let titled = format!("{} Context \u{2500}", "\u{2500}".repeat(RULE_RUN));
+        // A rule pasted into the batch at exactly the box's width splits it
+        // into two regions that both look like the box's own. The marker
+        // half here is bare, and read alone it is a cleared composer:
+        // `Some(false)`, cursor advanced, batch gone. The half without the
+        // marker is what says otherwise.
+        let rule = "\u{2500}".repeat(60);
         let composer = [
-            format!("\u{276f} {titled}"),
-            titled,
+            "\u{276f}".to_string(),
+            rule,
             "Reply only if you have information others don't".to_string(),
         ];
         assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_bare_marker_beside_a_split_box_does_not_confirm() {
+        // The same split, with a tail too short for a three-word window to
+        // recognize as ours. Nothing can say the text is still there, so
+        // nothing may say it is gone either.
+        let rule = "\u{2500}".repeat(60);
+        let composer = ["\u{276f}".to_string(), rule, "  Done.".to_string()];
+        assert_eq!(holds(&composer, RULE), None);
+    }
+
+    #[test]
+    fn a_body_rule_of_another_width_identifies_no_box() {
+        // The same shape with the pasted rule at a different width and
+        // indent, which is what a pasted rule usually looks like. No two
+        // rules in the pane can be one box's edges, so nothing is
+        // identified at all.
+        let composer = [
+            "\u{276f}".to_string(),
+            format!("    {}", "\u{2500}".repeat(16)),
+            "  Done.".to_string(),
+        ];
+        assert_eq!(holds(&composer, RULE), None);
     }
 
     #[test]
@@ -1025,6 +1154,16 @@ mod tests {
     }
 
     #[test]
+    fn a_box_indented_further_than_its_closing_rule_still_reads() {
+        // The clip starts at the rule's own indent, so a box whose rows are
+        // indented past it keeps its gutter character as content. Every row
+        // is then one word, nothing classifies, and the pane is
+        // unconfirmable for as long as it is drawn that way.
+        let span = box_span(&"\u{2500}".repeat(60));
+        assert_eq!(boxed_row("    \u{2503}  Reply only", span), "Reply only");
+    }
+
+    #[test]
     fn a_gutter_box_without_a_footer_still_holds_what_is_in_it() {
         // The model footer used to be popped off the last row on its shape
         // alone — non-empty, blank row above it. A composer holding two
@@ -1082,18 +1221,26 @@ mod tests {
 
     #[test]
     fn a_batch_ending_in_a_rule_is_still_found() {
-        // The message's own rule splits the composer in two. The half that
-        // opens with the marker is still a composer and still holds us.
-        let composer = held(&[&"\u{2500}".repeat(30)]);
-        assert_eq!(holds(&composer, RULE), Some(true));
+        // The message's own rule splits the composer in two. Drawn to a
+        // different width than the box, no pair of rules in the pane can be
+        // that box's edges, so nothing is identified and the delivery
+        // repeats. Drawn to the same width, the half without the marker is
+        // kept beside the half with it, and it still holds us.
+        let narrow = held(&[&"\u{2500}".repeat(30)]);
+        assert_ne!(holds(&narrow, RULE), Some(false));
+        let matching = held(&[&"\u{2500}".repeat(60)]);
+        assert_eq!(holds(&matching, RULE), Some(true));
     }
 
     #[test]
     fn a_one_character_tail_below_a_body_rule_is_not_a_confirmation() {
-        // The tail region has no marker, so it is not a composer at all; the
-        // half above it is, and it holds the batch.
-        let composer = held(&[&"\u{2500}".repeat(30), "  -"]);
-        assert_eq!(holds(&composer, RULE), Some(true));
+        // A tail too short to be recognized as ours, below a rule that
+        // arrived inside the batch. Whether the rule matches the box or not,
+        // the answer may never be that the composer is clear.
+        for body in [30, 60] {
+            let composer = held(&[&"\u{2500}".repeat(body), "  -"]);
+            assert_ne!(holds(&composer, RULE), Some(false), "body rule of {body}");
+        }
     }
 
     #[test]

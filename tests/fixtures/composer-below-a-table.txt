@@ -1,0 +1,59 @@
+ ▐▛███▛█   Claude Code v2.1.246
+▝▜██████▀  Opus 5 (1M context) with medium effort · Claude Max
+  ▝▝ ▝▝    /…/-home-andy--herdr-worktrees-herdr-scuttlebutt-issue-36/8925a21f-c83a-4234-89f0-b3769ac20080/scratchpad/rig
+
+
+❯ Print exactly this markdown table and nothing else, no preamble:
+
+  | id | text |
+  | --- | --- |
+  | 318 | Reply only if you have information others don't — don't acknowledge or repeat. |
+  | 319 | Under 80 words; longer belongs on the issue. |
+
+● ┌─────┬────────────────────────────────────────────────────────────────────────────────┐
+  │ id  │                                      text                                      │
+  ├─────┼────────────────────────────────────────────────────────────────────────────────┤
+  │ 318 │ Reply only if you have information others don't — don't acknowledge or repeat. │
+  ├─────┼────────────────────────────────────────────────────────────────────────────────┤
+  │ 319 │ Under 80 words; longer belongs on the issue.                                   │
+  └─────┴────────────────────────────────────────────────────────────────────────────────┘
+
+✻ Brewed for 2s · done 1:56 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  andy@apbfw16 /tmp/claude-1000/-home-andy--herdr-worktrees-herdr-scuttlebutt-issue-36/8925a21f-c83a-4234-89f0-b3769ac20080/scr…
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents
+                                                                                                                             /rc
