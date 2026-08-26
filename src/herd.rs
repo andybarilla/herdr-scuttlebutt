@@ -1270,9 +1270,10 @@ mod tests {
         // walks up from it and boxes the echo above as a composer — holding
         // the batch it quotes, on every tick, forever.
         //
-        // That is why `a_clear_gutter_drawn_composer_confirms_submission`
-        // could not carry the guarantee on its own: "no rule is drawn beneath
-        // an echo" is false for any message body containing one.
+        // That is why `an_echo_in_the_composers_own_gutter_is_not_a_composer`
+        // could not carry the guarantee on its own: it rests on "no rule is
+        // drawn beneath an echo", which is a property of that one capture
+        // and false for any message body containing one.
         let separator = format!("  \u{2503}  \u{251c}{}\u{2524}", "\u{2500}".repeat(16));
         let plain = format!("  \u{2503}  {}", "\u{2500}".repeat(16));
         // Two guards keep those out, and each has a shape only it catches.
