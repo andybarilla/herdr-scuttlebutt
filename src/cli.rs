@@ -173,23 +173,18 @@ fn render_groups(
             &[]
         }
     };
-    let mut members: std::collections::BTreeMap<Option<String>, Vec<&AgentInfo>> =
-        std::collections::BTreeMap::new();
-    for a in agents {
-        members
-            .entry(groups::resolve(Path::new(&a.cwd), grouping, orgs))
-            .or_default()
-            .push(a);
-    }
-    let print_members =
-        |out: &mut String,
-         name: &Option<String>,
-         members: &std::collections::BTreeMap<Option<String>, Vec<&AgentInfo>>| {
-            for a in members.get(name).unwrap_or(&Vec::new()) {
-                let _ = writeln!(out, "  {}\t{}\t{}", a.name, a.status, a.cwd);
-            }
-        };
-    let mut configured: Vec<String> = Vec::new();
+    // `Broken` returned above with its own message, and it is the only
+    // grouping without a union, so this default never fires from here. The
+    // early-out is what keeps a config we could not parse from printing as an
+    // empty roster; this is belt and braces behind it.
+    let members = groups::memberships(grouping, agents, orgs).unwrap_or_default();
+    let print_members = |out: &mut String, m: Option<&groups::Membership>| {
+        for a in m.map(|m| m.agents.as_slice()).unwrap_or_default() {
+            let _ = writeln!(out, "  {}\t{}\t{}", a.name, a.status, a.cwd);
+        }
+    };
+    // Two passes, not one over the map: every configured group prints before
+    // any org-derived one, and a single pass would interleave them by name.
     if let Grouping::Active(rules) = grouping {
         for name in rules.names() {
             let paths: Vec<String> = rules
@@ -198,19 +193,25 @@ fn render_groups(
                 .map(|p| p.display().to_string())
                 .collect();
             let _ = writeln!(out, "{name}\t{}", paths.join(" "));
-            print_members(&mut out, &Some(name.to_string()), &members);
-            configured.push(name.to_string());
+            print_members(&mut out, members.get(&Some(name.to_string())));
         }
     }
     // Groups nothing in the config names: they exist because an agent's repo
     // points at that organization, and they appear and vanish with the agents.
-    for name in members.keys().flatten() {
-        if configured.iter().any(|c| c == name) {
+    // `configured` is the union's record of which groups the config names,
+    // which is what the pass above walked, so the two passes cannot disagree
+    // about where the boundary between them falls.
+    for (name, m) in &members {
+        let (Some(name), false) = (name, m.configured) else {
             continue;
-        }
+        };
         let _ = writeln!(out, "{name}\t(from repo origin)");
-        print_members(&mut out, &Some(name.clone()), &members);
+        print_members(&mut out, Some(m));
     }
+    // The union keys agents that resolve nowhere under `None` whatever the
+    // grouping. Under a config that is a diagnostic — those agents receive
+    // nothing — which is why this listing shows it where `groups::rooms`,
+    // enumerating rooms you can open, drops it.
     if let Some(ungrouped) = members.get(&None) {
         let _ = match grouping {
             Grouping::Inactive => {
@@ -218,9 +219,7 @@ fn render_groups(
             }
             _ => writeln!(out, "ungrouped (receiving nothing)"),
         };
-        for a in ungrouped {
-            let _ = writeln!(out, "  {}\t{}\t{}", a.name, a.status, a.cwd);
-        }
+        print_members(&mut out, Some(ungrouped));
     }
     out
 }
