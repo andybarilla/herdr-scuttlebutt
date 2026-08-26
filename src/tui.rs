@@ -1786,7 +1786,7 @@ mod tests {
         let wall = session.join("wall");
         std::fs::write(&wall, b"not a directory").unwrap();
 
-        let _ = tail(&mut a, &wall);
+        tail(&mut a, &wall);
 
         // The pane is still here, and it says what failed in its own words:
         // a fixed prefix is what once had a failed switch claiming "post
@@ -1801,13 +1801,45 @@ mod tests {
         // Blanking the list would make a transient read error look like a
         // room somebody emptied.
         assert_eq!(
-            a.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["already on screen"]
         );
         assert_eq!(a.input, "half-typed, not sent");
         let mut stashed: Vec<&str> = a.drafts.values().map(String::as_str).collect();
         stashed.sort();
         assert_eq!(stashed, vec!["unsent to acme", "unsent to alare"]);
+    }
+
+    #[test]
+    fn a_replaced_room_log_is_re_seeded_rather_than_filtered_out_forever() {
+        // The other half of what `tail` decides, and the one a reader is
+        // most likely to simplify away: with ids restarted below the
+        // pane's cursor, reading *since the cursor* returns nothing
+        // forever, so the room looks dead while messages arrive.
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..3 {
+            log_store::append(&dir, "bob", &format!("old{i}")).unwrap();
+        }
+        let mut a = app();
+        tail(&mut a, &dir);
+        assert_eq!(a.messages.len(), 3);
+
+        std::fs::remove_file(dir.join("room.jsonl")).unwrap();
+        log_store::append(&dir, "bob", "id 1 all over again").unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id 1 all over again"]
+        );
     }
 
     #[test]
@@ -1846,7 +1878,10 @@ mod tests {
 
         assert_eq!(a.last_error, None);
         assert_eq!(
-            a.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["back again"]
         );
     }
