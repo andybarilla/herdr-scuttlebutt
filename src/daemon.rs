@@ -1118,6 +1118,15 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
 /// Both of those fail toward not delivering, because handing one agent's
 /// batch to an unrelated pane is worse than making a human confirm it.
 /// `released` is that confirmation: `scuttlebutt held <agent> --deliver`.
+///
+/// What a *reopened* pane reports is herdr's behaviour, not something this
+/// repo has captured: `agent_session` is read straight out of `agent list`
+/// (`herd.rs`), no fixture here records a pane before and after a restart,
+/// and every test of this path sets the ids by hand. So the automatic case
+/// covers an agent that comes back reporting the id it left with — which is
+/// certain for a listing that merely skipped it, and unverified for a pane
+/// a human closed and reopened. `--deliver` is what covers the rest, which
+/// is why it is not optional.
 fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
     if held.released {
         return true;
