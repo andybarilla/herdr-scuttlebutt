@@ -161,11 +161,23 @@ fn is_rule(line: &str) -> bool {
     if !line.starts_with(boxed) || !line.ends_with(boxed) {
         return false;
     }
+    // A gutter opens a row of a box; it never opens that box's edge. Left in,
+    // `\u{2503}  \u{251c}\u{2500}\u{2500}\u{2500}\u{2524}` — a table separator inside a message OpenCode has
+    // already taken — is a rule, and `gutter_bounded` walks up from it and
+    // boxes the transcript above as a composer.
+    if line.starts_with(|c| GUTTERS.contains(&c)) {
+        return false;
+    }
     // Horizontals per run of box-drawing characters, so a label breaks the
     // run it interrupts rather than being summed across.
     let mut runs = vec![0usize];
     let mut labels = 0;
     let mut in_label = false;
+    // A gap is not a title. A line that puts two pieces of furniture side by
+    // side — a gutter and a rule, a bordered cell holding a rule — separates
+    // them with spaces, and reading the whole line as one rule moves a
+    // region boundary onto a row that was never an edge.
+    let mut blank_label = false;
     for c in line.chars() {
         if boxed(c) {
             if in_label {
@@ -176,9 +188,13 @@ fn is_rule(line: &str) -> bool {
         } else if !in_label {
             in_label = true;
             labels += 1;
+            blank_label = true;
+        }
+        if !boxed(c) {
+            blank_label &= c.is_whitespace();
         }
     }
-    labels <= 1 && runs.iter().any(|r| *r >= RULE_RUN)
+    labels <= 1 && !blank_label && runs.iter().any(|r| *r >= RULE_RUN)
 }
 
 /// What a pane's rules and gutters divide it into.
@@ -333,22 +349,33 @@ fn box_span(border: &str) -> (usize, usize) {
     (start, display_width(border.trim_end()))
 }
 
-/// Display width in terminal cells, which is what a pane's columns are.
+/// The cells one character is drawn in, given what the character before it
+/// measured.
 ///
 /// `U+FE0F` promotes what precedes it: `unicode-width` reports the variation
-/// selector as zero and leaves `\u{26a0}` at one cell, while a terminal draws
-/// the emoji presentation in two. It matters because a composer's two rules
-/// are measured independently and have to agree — a label a cell narrower
-/// than it is drawn makes them disagree, and identifies no composer at all.
+/// selector as zero and leaves `\u{26a0}` at one cell, while a terminal draws the
+/// emoji presentation in two. It is the *only* character whose width depends
+/// on its neighbour here, which is why the dependency is threaded through
+/// rather than hidden — a column has to mean the same thing to everything
+/// that measures one. Two metrics over one coordinate space is how a clip
+/// keeps the furniture it exists to remove.
+///
+/// A selector with nothing to promote, or one after a character already two
+/// cells wide, adds nothing.
+fn cell_width(c: char, previous: usize) -> usize {
+    match c {
+        '\u{fe0f}' => usize::from(previous == 1),
+        _ => c.width().unwrap_or(0),
+    }
+}
+
+/// Display width in terminal cells, which is what a pane's columns are.
 fn display_width(s: &str) -> usize {
     let mut width = 0;
-    let mut last = 0;
+    let mut previous = 0;
     for c in s.chars() {
-        last = match c {
-            '\u{fe0f}' => 2 - last.min(2),
-            _ => c.width().unwrap_or(0),
-        };
-        width += last;
+        previous = cell_width(c, previous);
+        width += previous;
     }
     width
 }
@@ -357,6 +384,7 @@ fn display_width(s: &str) -> usize {
 /// stripped and normalized.
 fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
     let mut col = 0;
+    let mut previous = 0;
     let mut clipped = String::new();
     for c in row.chars() {
         if col >= end {
@@ -365,7 +393,8 @@ fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
         if col >= start {
             clipped.push(c);
         }
-        col += c.width().unwrap_or(0);
+        previous = cell_width(c, previous);
+        col += previous;
     }
     // Trimmed before the gutter is stripped, because the clip starts at the
     // rule's own indent and a box's rows may be indented further than the
@@ -965,12 +994,15 @@ mod tests {
         // unconfirmed streak skips a batch just as surely as a failed
         // delivery does.
         //
-        // What excludes them is the rule: no rule is drawn beneath an echo,
-        // so no echo closes a box. That is a weaker guarantee than it
-        // sounds — an overlay bordered below an echo would close one — and
-        // `an_overlay_below_a_gutter_composer_does_not_hide_the_batch` is
-        // what makes that survivable, by keeping every box rather than the
-        // lowest. One region here, and it is the composer.
+        // What excludes them is the rule beneath the composer's rows, which
+        // no echo has. "No rule is drawn beneath an echo" was the claim
+        // here and it is false: a message body carrying a table or a `---`
+        // puts one inside the echo's own gutter, which is
+        // `a_rule_inside_a_gutter_row_does_not_box_the_transcript`. What
+        // holds is narrower — a rule inside a gutter row is not this box's
+        // edge, and an overlay bordered below an echo would close a real
+        // box, which is survivable only because every box is kept rather
+        // than the lowest. One region here, and it is the composer.
         assert_eq!(composer_regions(OC_LIVE).composers.len(), 1);
         assert_eq!(composer_holds(OC_LIVE, OC_SENT), Some(false));
     }
@@ -1051,6 +1083,89 @@ mod tests {
         assert!(same_box(&titled, &plain));
         let pane = format!("{titled}\n\u{276f} Reply only if you have\n{plain}\n  status");
         assert_eq!(composer_holds(&pane, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_row_and_its_box_are_measured_the_same_way() {
+        // `box_span` promoted an emoji-presentation sequence to the two
+        // cells a terminal draws it in and `boxed_row` did not, so the clip
+        // ran a cell late per sequence and kept the start of the working
+        // directory wrapped up the right margin. Beside two words of ours
+        // that is a third word, and a third word classifies: `Some(false)`
+        // on a prompt still sitting on the composer.
+        //
+        // `\u{26a0}\u{fe0f}` and not `\u{1f389}`, because the two metrics have to disagree
+        // about the character for the test to see the difference between
+        // them — `\u{1f389}` is two cells under both.
+        assert_ne!(
+            display_width("\u{26a0}\u{fe0f}"),
+            "\u{26a0}\u{fe0f}"
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>(),
+            "the metrics agree, so this proves nothing"
+        );
+        let mut lines: Vec<String> = OC_WRAPPED_CWD.lines().map(String::from).collect();
+        let bottom = lines
+            .iter()
+            .position(|l| is_rule(l))
+            .expect("fixture lost its box");
+        let span = box_span(&lines[bottom]);
+        let held = "  \u{2503}  Reply\u{26a0}\u{fe0f} only";
+        lines[bottom - 3] = format!(
+            "{held}{}~/.herdr/worktrees/alare",
+            " ".repeat(span.1 - display_width(held))
+        );
+        assert_eq!(
+            boxed_row(&lines[bottom - 3], span),
+            "Reply\u{26a0}\u{fe0f} only"
+        );
+        assert_eq!(composer_holds(&lines.join("\n"), OC_SENT), None);
+    }
+
+    #[test]
+    fn a_rule_inside_a_gutter_row_does_not_box_the_transcript() {
+        // OpenCode draws messages it has already taken in the same gutter as
+        // its composer, and a message body carrying a table or a `---` puts a
+        // rule inside one of those rows. Read as a rule, `gutter_bounded`
+        // walks up from it and boxes the echo above as a composer — holding
+        // the batch it quotes, on every tick, forever.
+        //
+        // That is why `a_clear_gutter_drawn_composer_confirms_submission`
+        // could not carry the guarantee on its own: "no rule is drawn beneath
+        // an echo" is false for any message body containing one.
+        let separator = format!("  \u{2503}  \u{251c}{}\u{2524}", "\u{2500}".repeat(16));
+        let plain = format!("  \u{2503}  {}", "\u{2500}".repeat(16));
+        // Two guards keep those out, and each has a shape only it catches.
+        // A gutter with the run against it carries no label at all; a
+        // bordered table cell holding a rule is not gutter-led.
+        let run = "\u{2500}".repeat(RULE_RUN * 2);
+        assert!(!is_rule(&format!("\u{2503}{run}")), "gutter against a run");
+        assert!(
+            !is_rule(&format!("\u{2502}  {run}")),
+            "a cell holding a rule"
+        );
+        for injected in [separator, plain] {
+            assert!(!is_rule(&injected), "{injected:?} read as a rule");
+            let pane: Vec<String> = OC_EMPTY
+                .lines()
+                .map(|l| match l.contains("[scuttlebutt] New messages") {
+                    true => injected.clone(),
+                    false => l.to_string(),
+                })
+                .collect();
+            let pane = pane.join("\n");
+            assert_eq!(composer_regions(&pane).composers.len(), 1);
+            assert_eq!(composer_holds(&pane, OC_SENT), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_variation_selector_with_nothing_to_promote_measures_nothing() {
+        assert_eq!(display_width("\u{fe0f}"), 0);
+        assert_eq!(display_width("\u{26a0}\u{fe0f}"), 2);
+        // Already two cells; the selector adds nothing to it.
+        assert_eq!(display_width("\u{1f389}\u{fe0f}"), 2);
     }
 
     #[test]
