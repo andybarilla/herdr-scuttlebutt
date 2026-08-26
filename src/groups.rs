@@ -382,10 +382,11 @@ pub fn rooms(
         }
     }
     // The ungrouped room is `session_dir()` itself, so it has no entry in the
-    // sweep above. Under an active config it receives nothing and
-    // `resolve_group` can never return `None`, so its history is the record
-    // of a room that can no longer be posted to; offering it would invite
-    // posting into a dead room.
+    // sweep above. Under an active config it receives nothing and neither
+    // `resolve_group` nor `resolve_room` can land in it, so its history is
+    // the record of a room that can no longer be posted to; offering it —
+    // to the chat pane's picker above all, which posts wherever it is
+    // pointed — would invite posting into a dead room.
     if matches!(grouping, Grouping::Inactive) && has_history(session_dir) {
         entry_for(&mut found, None).history = true;
     }

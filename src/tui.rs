@@ -78,8 +78,11 @@ pub struct App {
     /// Last post failure, surfaced in the input-line title. A transient write
     /// failure must not tear the chat pane down.
     pub post_error: Option<String>,
-    /// Message-pane title, always naming the resolved group so the human
-    /// can never mistake which room's input line they are typing into.
+    /// Message-pane title, always naming the room being viewed — a group,
+    /// the ungrouped room, or none selected. It is half the safeguard
+    /// against posting into the wrong company's room; the input line's
+    /// away-from-home marker is the other half, because that is where a
+    /// post is actually committed.
     pub title: String,
     /// The room being viewed, and the one a post goes to.
     pub room: CurrentRoom,
@@ -198,6 +201,10 @@ fn handle_picker_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> O
 /// cursor would filter out every subsequent message forever. In that case
 /// the caller should discard its in-memory messages and re-seed from the
 /// start of the file.
+///
+/// Only ever about the room currently being tailed. A room switch re-seeds
+/// unconditionally and must not come through here, which would compare one
+/// room's cursor against another room's last id.
 fn should_reseed(mem_last_id: u64, file_last_id: u64) -> bool {
     file_last_id < mem_last_id
 }
@@ -302,8 +309,14 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
     bottom.saturating_sub(scroll_from_bottom.min(bottom))
 }
 
-/// Message-pane title. Always names the resolved group, so it is the
-/// visible safeguard against typing into the wrong company's room.
+/// Message-pane title for a selected room. Always names it, the ungrouped
+/// room included, so no room can be on screen unlabelled.
+///
+/// It is only half the safeguard against typing into the wrong company's
+/// room now that a pane can switch: this titles the *messages*, while the
+/// input line — where a post is committed — carries its own marker once the
+/// pane is away from the room it opened in. A pane with no room selected
+/// does not come through here at all; it has no group to name.
 fn title_for(resolved: Option<&str>) -> String {
     match resolved {
         Some(g) => format!(" scuttlebutt · {g} "),
@@ -313,12 +326,16 @@ fn title_for(resolved: Option<&str>) -> String {
     }
 }
 
-/// The members pane's roster, scoped to the resolved group. Both the initial
-/// seed and the periodic refresh go through here: the pane sits beside a title
-/// naming the group, so an unscoped roster would show one company's agent
-/// names in another company's room. `None` on a failed listing, so the
-/// refresh can keep the last known roster instead of blanking the pane for a
-/// transient `herdr agent list` failure.
+/// The members pane's roster, scoped to the resolved group. The initial
+/// seed, the periodic refresh and every room switch go through here: the
+/// pane sits beside a title naming the group, so an unscoped roster would
+/// show one company's agent names in another company's room. `None` on a
+/// failed listing, so the refresh can keep the last known roster instead of
+/// blanking the pane for a transient `herdr agent list` failure.
+///
+/// `resolved` is a group or the ungrouped room, never "no room selected":
+/// `None` here means the shared room's roster, which is a real answer and
+/// the wrong one for a pane that has not picked a room.
 fn scoped_members(
     herd: &dyn HerdControl,
     resolved: Option<&str>,
