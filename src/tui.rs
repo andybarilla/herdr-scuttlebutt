@@ -309,21 +309,23 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
     bottom.saturating_sub(scroll_from_bottom.min(bottom))
 }
 
-/// Message-pane title for a selected room. Always names it, the ungrouped
-/// room included, so no room can be on screen unlabelled.
+/// Message-pane title. Always names the room being viewed — a group, the
+/// ungrouped room, or none selected — so no state can be on screen
+/// unlabelled.
+///
+/// The name comes from `CurrentRoom::label`, the same spelling the picker
+/// rows show and its filter searches, so what the title says is what you
+/// can type to get back here. Spelling `(ungrouped)` a second time is how
+/// the two would drift apart. `label` is parenthesised for exactly this:
+/// `valid_group_name` forbids parentheses, so it can never collide with a
+/// real group's name.
 ///
 /// It is only half the safeguard against typing into the wrong company's
 /// room now that a pane can switch: this titles the *messages*, while the
 /// input line — where a post is committed — carries its own marker once the
-/// pane is away from the room it opened in. A pane with no room selected
-/// does not come through here at all; it has no group to name.
-fn title_for(resolved: Option<&str>) -> String {
-    match resolved {
-        Some(g) => format!(" scuttlebutt · {g} "),
-        // Parenthesised because `valid_group_name` forbids parentheses, so
-        // it can never collide with a real group's name.
-        None => " scuttlebutt · (ungrouped) ".to_string(),
-    }
+/// pane is away from the room it opened in.
+fn title_for(room: &CurrentRoom) -> String {
+    format!(" scuttlebutt · {} ", room.label())
 }
 
 /// The members pane's roster, scoped to the resolved group. The initial
@@ -351,14 +353,13 @@ fn scoped_members(
     )
 }
 
-/// A room's directory under `session_dir`. The ungrouped room is
-/// `session_dir` itself, mirroring `paths::room_dir`.
+/// A room's directory under `session_dir`, or `None` when no room is
+/// selected. Shares `paths::room_dir_in` with `room_dir` rather than joining
+/// the path a second time, and inherits its refusal to create anything: this
+/// runs for every room on every picker open.
 fn room_path(session_dir: &Path, room: &CurrentRoom) -> Option<PathBuf> {
-    match room {
-        CurrentRoom::Named(n) => Some(session_dir.join(n)),
-        CurrentRoom::Ungrouped => Some(session_dir.to_path_buf()),
-        CurrentRoom::NoneSelected => None,
-    }
+    room.selected()
+        .map(|g| crate::paths::room_dir_in(session_dir, g))
 }
 
 /// Bytes in a room's `room.jsonl`, 0 if it has none.
@@ -424,9 +425,13 @@ fn open_picker(
                     .map(|s| s.label())
                     .collect::<Vec<_>>()
                     .join(", "),
+                // Changed, not merely grown: a truncated or replaced log
+                // is shorter than its seed, and `>` would leave it
+                // permanently undotted however much arrived afterwards —
+                // the case `should_reseed` exists for, one file along.
                 unread: room != app.room
                     && room_len(session_dir, &room)
-                        > app.unread_seeds.get(&room).copied().unwrap_or(0),
+                        != app.unread_seeds.get(&room).copied().unwrap_or(0),
                 room,
             }
         })
@@ -455,6 +460,31 @@ fn switch_room(
     if target == app.room {
         return Ok(());
     }
+    // Everything that can fail happens here, before a single byte of the
+    // pane's room-scoped state moves. `paths::room_dir` reaches `base_dir`,
+    // which spawns `herdr plugin config-dir` unless SCUTTLEBUTT_DIR is set,
+    // so a failing switch is a subprocess hiccup away rather than
+    // theoretical — and a half-applied one leaves room A on screen holding
+    // room B's draft, which is the next Enter posting one company's text
+    // into another company's room.
+    let loaded = match target.selected() {
+        Some(group) => {
+            let dir = crate::paths::room_dir(group)?;
+            // A clean read of the whole file, never `should_reseed`: that
+            // asks whether *this* room's log was truncated, and it would be
+            // comparing this room's cursor against another room's last id.
+            let messages = log_store::read_since(&dir, 0)?;
+            // A failed listing is not a failed switch: `scoped_members`
+            // returns `None` for it, and an empty roster beside the new
+            // room's title is honest, where the old room's names would not
+            // be.
+            let members = scoped_members(herd, group, grouping, orgs).unwrap_or_default();
+            Some((dir, messages, members))
+        }
+        None => None,
+    };
+
+    // From here nothing fails, so the pane cannot be left half-switched.
     let carried = std::mem::take(&mut app.input);
     if app.room.selected().is_some() {
         app.drafts.insert(app.room.clone(), carried);
@@ -476,15 +506,10 @@ fn switch_room(
     // A write failure belonged to the room it was attempted in.
     app.post_error = None;
 
-    match target.selected() {
-        Some(group) => {
-            let dir = crate::paths::room_dir(group)?;
-            // A clean read of the whole file, never `should_reseed`: that
-            // asks whether *this* room's log was truncated, and it would be
-            // comparing this room's cursor against another room's last id.
-            app.messages = log_store::read_since(&dir, 0)?;
-            app.members = scoped_members(herd, group, grouping, orgs).unwrap_or_default();
-            app.title = title_for(group);
+    match loaded {
+        Some((dir, messages, members)) => {
+            app.messages = messages;
+            app.members = members;
             app.dir = Some(dir);
         }
         None => {
@@ -493,10 +518,10 @@ fn switch_room(
             // is in one.
             app.messages = Vec::new();
             app.members = Vec::new();
-            app.title = " scuttlebutt · no room selected ".to_string();
             app.dir = None;
         }
     }
+    app.title = title_for(&target);
     app.room = target;
     Ok(())
 }
@@ -514,7 +539,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
         unread_seeds: seed_unread(&session_dir),
         // Seeded by the switch below, which is the same code path every
         // later switch takes.
-        title: " scuttlebutt · no room selected ".to_string(),
+        title: title_for(&CurrentRoom::NoneSelected),
         home: home.clone(),
         ..App::default()
     };
@@ -541,12 +566,21 @@ pub fn run(group: Option<&str>) -> Result<()> {
                     let mut fresh = log_store::read_since(&dir, last)?;
                     app.messages.append(&mut fresh);
                 }
-                if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
-                    let group = app.room.selected().flatten().map(str::to_string);
-                    if let Some(m) = scoped_members(&herd, group.as_deref(), &grouping, &mut orgs) {
-                        app.members = m;
+                // `selected()` is destructured, never flattened: flattening
+                // would hand `scoped_members` the ungrouped room's roster
+                // for a pane that has selected no room, which is the
+                // conflation `CurrentRoom` exists to make unsayable. The
+                // outer `if let` makes that unreachable today; relying on
+                // that would leave the leak one refactor away.
+                if let Some(group) = app.room.selected().map(|g| g.map(str::to_string)) {
+                    if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
+                        if let Some(m) =
+                            scoped_members(&herd, group.as_deref(), &grouping, &mut orgs)
+                        {
+                            app.members = m;
+                        }
+                        last_member_refresh = std::time::Instant::now();
                     }
-                    last_member_refresh = std::time::Instant::now();
                 }
             }
 
@@ -577,20 +611,32 @@ pub fn run(group: Option<&str>) -> Result<()> {
                                 ));
                             }
                             Some(Action::Switch(target)) => {
-                                switch_room(
+                                match switch_room(
                                     &mut app,
                                     target,
                                     &session_dir,
                                     &herd,
                                     &grouping,
                                     &mut orgs,
-                                )?;
-                                // `switch_room` just refreshed the roster;
-                                // without this the tick could fire again
-                                // immediately and is wasted work, and a
-                                // failed listing would blank the pane it
-                                // just filled.
-                                last_member_refresh = std::time::Instant::now();
+                                ) {
+                                    // `switch_room` just refreshed the
+                                    // roster; without this the tick could
+                                    // fire again immediately and is wasted
+                                    // work, and a failed listing would blank
+                                    // the pane it just filled.
+                                    Ok(()) => last_member_refresh = std::time::Instant::now(),
+                                    // Same standard the input line already
+                                    // holds write failures to: a transient
+                                    // failure must not tear the chat pane
+                                    // down. `switch_room` is a no-op when it
+                                    // fails, so the pane is still showing
+                                    // the room it was in, with every draft
+                                    // where it was left.
+                                    Err(e) => {
+                                        app.post_error =
+                                            Some(format!("could not open that room: {e}"))
+                                    }
+                                }
                             }
                             None => {}
                         }
@@ -664,8 +710,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // away-from-home marker: a colour *and* the room's name, because a
     // colour alone says nothing about which room you are about to post in.
     let away = app.room.selected().is_some() && app.room != app.home;
+    // A post failure never displaces the away-from-home marker. The failure
+    // is the moment the human is about to retype and press Enter, so
+    // swapping the room name out for the error would switch the safeguard
+    // off at the one moment it is doing work. Both are shown, room first,
+    // and the border stays away-yellow rather than error-red: a reader who
+    // has learned that yellow means "not your room" must not lose it to a
+    // transient write error.
     let (input_title, border) = match (&app.post_error, app.room.selected().is_some(), away) {
-        (Some(e), _, _) => (format!(" post failed: {e} "), Color::Red),
+        (Some(e), _, true) => (
+            format!(" → {} · post failed: {e} ", app.room.label()),
+            Color::Yellow,
+        ),
+        (Some(e), _, false) => (format!(" post failed: {e} "), Color::Red),
         (None, false, _) => (
             " no room selected — Ctrl-K to pick a room ".to_string(),
             Color::DarkGray,
@@ -972,14 +1029,44 @@ mod tests {
 
     #[test]
     fn title_for_names_the_group() {
-        assert!(title_for(Some("alare")).contains("alare"));
+        assert!(title_for(&named("alare")).contains("alare"));
     }
 
     #[test]
     fn title_for_names_the_ungrouped_room() {
         // Every room is named in the title, the ungrouped one included; a
         // bare " scuttlebutt " left the one room with no label on screen.
-        assert_eq!(title_for(None), " scuttlebutt · (ungrouped) ");
+        assert_eq!(
+            title_for(&CurrentRoom::Ungrouped),
+            " scuttlebutt · (ungrouped) "
+        );
+    }
+
+    #[test]
+    fn title_for_names_a_pane_that_has_no_room() {
+        assert_eq!(
+            title_for(&CurrentRoom::NoneSelected),
+            " scuttlebutt · no room selected "
+        );
+    }
+
+    #[test]
+    fn the_title_spells_a_room_the_way_the_picker_filter_reads_it() {
+        // `label`'s promise is "what you can see is what you can type", and
+        // a title that spelled the room a second way would break it without
+        // failing any test of `label` alone.
+        for room in [
+            named("alare"),
+            CurrentRoom::Ungrouped,
+            CurrentRoom::NoneSelected,
+        ] {
+            assert!(
+                title_for(&room).contains(room.label()),
+                "title {:?} does not contain {:?}",
+                title_for(&room),
+                room.label()
+            );
+        }
     }
 
     #[test]
@@ -1437,6 +1524,57 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_that_cannot_open_the_room_changes_nothing_at_all() {
+        // The half-applied switch: input taken, draft stashed, the old room
+        // marked read, `post_error` cleared — but `app.room` still the old
+        // room. The pane then displays and posts to room A while holding
+        // room B's draft, which is one company's text one Enter away from
+        // another company's room.
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(vec![], false);
+        let mut a = app();
+        a.room = named("alare");
+        a.input = "alare draft".into();
+        a.messages = vec![msg("bob", "alare chatter")];
+        a.post_error = Some("an earlier failure".into());
+        a.unread_seeds.insert(named("alare"), 11);
+        a.dir = Some(crate::paths::room_dir(Some("alare")).unwrap());
+
+        // A room name that cannot become a directory, so `room_dir` fails
+        // where every other step would have succeeded.
+        std::fs::write(session.join("wall"), b"not a directory").unwrap();
+        let err = switch(&mut a, named("wall"), &session, &herd);
+        assert!(err.is_err(), "expected this switch to fail");
+
+        assert_eq!(a.room, named("alare"));
+        assert_eq!(a.input, "alare draft");
+        assert!(
+            a.drafts.is_empty(),
+            "a draft was stashed by a failed switch"
+        );
+        assert_eq!(a.unread_seeds.get(&named("alare")), Some(&11));
+        assert_eq!(a.post_error.as_deref(), Some("an earlier failure"));
+        assert_eq!(a.messages.len(), 1);
+        assert_eq!(a.dir, Some(crate::paths::room_dir(Some("alare")).unwrap()));
+    }
+
+    #[test]
+    fn a_post_failure_never_hides_which_room_the_post_would_go_to() {
+        // The safeguard would otherwise switch itself off at the one moment
+        // it is working: the human has just failed to post and is about to
+        // retype and press Enter.
+        let a = App {
+            room: named("acme"),
+            home: named("alare"),
+            post_error: Some("disk on fire".into()),
+            ..App::default()
+        };
+        let screen = render(&a, 70, 12).join("\n");
+        assert!(screen.contains("acme"), "room name is hidden:\n{screen}");
+        assert!(screen.contains("disk on fire"), "{screen}");
+    }
+
+    #[test]
     fn switching_returns_to_the_newest_message() {
         let (_d, _env, session) = scratch();
         let mut a = app();
@@ -1596,6 +1734,41 @@ mod tests {
         );
         let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
         assert!(!acme.unread, "acme was visited and should be caught up");
+    }
+
+    #[test]
+    fn a_truncated_room_is_still_dotted() {
+        // `len > seed` never fires again once a log is replaced by a shorter
+        // one, leaving that room permanently silent however much arrives.
+        let (_d, _env, session) = scratch();
+        post_to(
+            "acme",
+            "a long line of history that will be replaced wholesale",
+        );
+        let mut a = app();
+        a.unread_seeds = seed_unread(&session);
+        a.room = named("alare");
+        std::fs::write(
+            crate::paths::room_dir(Some("acme"))
+                .unwrap()
+                .join("room.jsonl"),
+            b"",
+        )
+        .unwrap();
+        post_to("acme", "short");
+
+        let p = open_picker(
+            &a,
+            &session,
+            &FakeHerd(vec![], false),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(
+            acme.unread,
+            "a replaced log left the room permanently silent"
+        );
     }
 
     #[test]
