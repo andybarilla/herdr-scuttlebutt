@@ -1195,8 +1195,23 @@ pub fn tick(
                     .stalled
                     .get_mut(&a.name)
                     .expect("a retry only happens for an agent that is stalled");
+                // The batch is refreshed because the retry just offered the
+                // agent everything up to `max_id`, so that is what is now
+                // being held for it and what `daemon-status` should name. It
+                // is a report of what was attempted, not a retry condition:
+                // a batch that grows neither lifts the stall nor shortens
+                // the wait.
                 stall.batch = max_id;
-                stall.session = a.session.clone();
+                // Only ever upgraded, never downgraded. An id that has gone
+                // missing says nothing about the process at that pane —
+                // which is exactly what the `(Some(_), None)` arm above
+                // says — so writing the absence here would manufacture the
+                // `None` that `(None, Some(_))` then reads as a new session,
+                // and one listing that dropped the field would lift the
+                // stall and redeliver the batch.
+                if a.session.is_some() {
+                    stall.session = a.session.clone();
+                }
                 let retries = stall.retries;
                 let next = retry_after(retries);
                 report(
@@ -1350,6 +1365,15 @@ mod tests {
             let mut h = FakeHerd::new(vec![]);
             h.agents = agents;
             h
+        }
+
+        /// Models a listing where herdr emitted no `agent_session` for an
+        /// agent that has one — the field is optional per listing, not per
+        /// agent.
+        fn drop_session(&mut self, name: &str) {
+            for a in self.agents.iter_mut().filter(|a| a.name == name) {
+                a.session = None;
+            }
         }
 
         /// Sets the `agent_session` id herdr reports for one agent. A pane
@@ -2173,6 +2197,56 @@ mod tests {
         }
         assert_eq!(herd.prompts.borrow().len(), sent);
         assert!(state.stalled.contains_key("reviewer"));
+    }
+
+    #[test]
+    fn a_dropped_session_field_does_not_lift_a_stall_through_the_retry_path() {
+        // The comparison treats "no id then, an id now" as a new session,
+        // which is right. The hazard is the retry writing that `None` in the
+        // first place: one listing without the field, and the next listing
+        // with it back looks like a restart that never happened.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+
+        // herdr stops emitting the field, and the first retry fails
+        herd.drop_session("reviewer");
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].retries, 1, "the retry never came");
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "a listing without the field erased the id the stall was recorded with"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, same process, same id
+        herd.set_session("reviewer", "session-a");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "a dropped field read as a restart"
+        );
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "the batch was redelivered off a field that only went missing"
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
     }
 
     #[test]
