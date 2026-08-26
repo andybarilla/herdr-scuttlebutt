@@ -236,6 +236,11 @@ struct Regions {
 /// of — see `gutter_bounded`. A rule-bounded box is always whole: it is
 /// delimited by two matching rules rather than walked to, so a repaint that
 /// damages an edge costs the identification rather than a row.
+///
+/// It is carried per composer because that is where it is decided, but the
+/// verdict it feeds is pane-global: one composer read as partial stops the
+/// whole pane calling anything clear. Since `rule_bounded` never sets it
+/// false, a pane holding one gutter box behaves the same either way.
 struct Composer {
     rows: Vec<Row>,
     /// Whether the pane showed the whole box. Only a whole one may say a
@@ -511,20 +516,36 @@ fn bare_row(row: &str) -> String {
 /// blanks and the model footer, which reads as a cleared composer.
 ///
 /// `whole` is what stands between that and a dropped batch. The walk stops
-/// on the first row without a gutter, so that row says whether it stopped
-/// where the box ends or where the capture tore: every gutter box in every
-/// capture is drawn below a blank separator row, and a torn row is never
-/// blank, because it carries the text whose gutter it lost. Measured on all
-/// seven gutter-bounded fixtures and all four gutter-bounded live panes at
-/// the time of #51 — eleven of eleven, and none of those twenty-two
-/// verdicts changed by requiring it.
+/// on the first row without a gutter, and `whole` asks whether that is where
+/// the box ends: every gutter box in every capture is drawn below a blank
+/// separator, and above that separator is transcript. So the box is whole
+/// only if the row the walk stopped on is blank *and* the row above that
+/// carries no gutter. Measured on all seven gutter-bounded fixtures and all
+/// four gutter-bounded live panes at the time of #51 — eleven of eleven, and
+/// none of those twenty-two verdicts changed by requiring it.
 ///
-/// A box starting at the first line of the capture is not whole either, for
-/// the same reason and on weaker evidence: there is no row above to read,
-/// so nothing says whether one was torn or the box simply begins there. No
-/// capture is in that state, so unlike the rest of this its cost is
-/// unmeasured rather than measured at zero. It resolves the way everything
-/// unknown here resolves, toward a repeat rather than a drop.
+/// Both halves are needed, and the reason the second one is here is worth
+/// keeping. The first form of this rule was the blank row alone, justified
+/// by "a torn row is never blank, because it carries the text whose gutter
+/// it lost". That is false: a box's own blank rows carry nothing, so tearing
+/// one leaves a genuinely blank row and the tear reads as the separator. It
+/// is unreachable on the fixtures as captured, and only by accident — every
+/// box is four or five rows with at most one clear-voting row below its
+/// blank, so `bottom - top < 2` or #49 catches that tear first. One extra
+/// row below the blank makes it reachable. The row above the separator is
+/// what tells the two apart: under a torn blank sits the rest of the box,
+/// which still has its gutters.
+///
+/// A box with fewer than two rows above it is not whole either, and that
+/// half is a decision rather than a measurement: there is nothing to read,
+/// so nothing says whether a row was torn or the capture simply starts
+/// there. It costs a pane whose visible window is barely taller than its
+/// composer. Measured: `opencode-hint` clipped to begin at its box top, or
+/// one line above it, answers `None` — and a clear composer that answers
+/// `None` never confirms, so such a pane is #47's permanent re-prompter.
+/// Two rows of transcript are enough to clear it, and every capture we hold
+/// has far more. It resolves the way everything unknown here resolves,
+/// toward a repeat rather than a drop.
 fn gutter_bounded(lines: &[&str]) -> Vec<Composer> {
     let gutter = |l: &&str| l.trim_start().starts_with(|c| GUTTERS.contains(&c));
     let mut boxes = Vec::new();
@@ -547,15 +568,19 @@ fn gutter_bounded(lines: &[&str]) -> Vec<Composer> {
                     bare: bare_row(l),
                 })
                 .collect(),
-            // The walk stops at the first row without a gutter, so what
-            // stopped it says whether the box is all here. A blank row is
-            // the separator every capture draws above this box. Anything
-            // else is a row that had a gutter when it was drawn and lost it
-            // in the capture, and the box then starts below our text
-            // instead of above it — #51(a).
-            whole: top
-                .checked_sub(1)
-                .is_some_and(|a| lines[a].trim().is_empty()),
+            // The shape every capture draws above this box: transcript,
+            // then a blank separator. A row that had a gutter and lost it
+            // in the capture breaks one of the two — it is not blank if it
+            // carried text, and if it carried nothing then the row above it
+            // is still the box, still gutter-drawn. Either way the box
+            // starts below our text instead of above it — #51(a).
+            whole: {
+                let blank = top
+                    .checked_sub(1)
+                    .is_some_and(|a| lines[a].trim().is_empty());
+                let above_clear = top.checked_sub(2).is_some_and(|a| !gutter(&lines[a]));
+                blank && above_clear
+            },
         });
     }
     boxes
@@ -657,9 +682,10 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     // while our text sits two lines up, outside the box the walk found.
     // Whether it says so is not something the remaining rows can answer.
     //
-    // Every composer, rather than the one that voted, because the vote
-    // below is already collective — one truncated box means the pane's
-    // clear verdict rests on rows some of which we may not have seen.
+    // Pane-global, not per region: any partial composer stops every
+    // composer in the pane voting, because the vote below is collective
+    // anyway — `all` over every row of every one of them. One box we may
+    // not have seen the whole of is enough to make that verdict unsound.
     if composers.iter().any(|c| !c.whole) {
         return None;
     }
@@ -1677,6 +1703,70 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_blank_row_does_not_leave_the_box_reading_as_whole() {
+        // The hole in this rule's first form, which said a torn row is
+        // never blank because it carries the text whose gutter it lost.
+        // False: a box's own blank rows carry nothing, so tearing one
+        // leaves a genuinely blank row and the tear reads as the separator.
+        //
+        // Unreachable on the fixtures as captured, and only by accident:
+        // every box is four or five rows with at most one clear-voting row
+        // below its blank, so `bottom - top < 2` or #49 catches the same
+        // tear first. One extra row below the blank makes it reachable, so
+        // the guard is a property of today's captures unless the row above
+        // the separator is checked too.
+        let lines: Vec<&str> = OC_WRAPPED.lines().collect();
+        let bottom = lines
+            .iter()
+            .rposition(|l| is_rule(l))
+            .expect("fixture lost its box");
+        // A two-row footer, which is all it takes.
+        let mut grown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        grown.insert(bottom, lines[bottom - 1].to_string());
+        assert_eq!(
+            composer_holds(&grown.join("\n"), OC_SENT),
+            Some(true),
+            "the grown pane should still hold our text before anything is torn"
+        );
+        let blank = grown
+            .iter()
+            .rposition(|l| {
+                bare_row(l).is_empty() && l.trim_start().starts_with(|c| GUTTERS.contains(&c))
+            })
+            .expect("no blank row inside the box");
+        grown[blank] = grown[blank].replacen('\u{2503}', " ", 1);
+        assert_ne!(
+            composer_holds(&grown.join("\n"), OC_SENT),
+            Some(false),
+            "a tear on the box's own blank row reported an unsent batch as submitted"
+        );
+    }
+
+    #[test]
+    fn a_box_with_no_separator_above_it_is_not_whole_either() {
+        // Pins the blank half of the rule on its own, and pins a decision
+        // rather than an observation: every capture draws the separator, so
+        // a box sitting straight under transcript is a shape none of them
+        // has. The row above the box is then not one this can read as an
+        // edge, and an unreadable edge resolves toward a repeat.
+        //
+        // Two transcript rows above the box, so the row two above it exists
+        // and carries no gutter: the other half of the rule is satisfied
+        // and only this half can answer.
+        let pane = format!(
+            "  a line of transcript\n  another line\n  \u{2503}\n  \u{2503}\n  \u{2503}  Build \u{b7} GPT-5.6 Sol OpenAI\n{}\n  status",
+            "\u{2500}".repeat(60)
+        );
+        assert_eq!(composer_holds(&pane, RULE), None);
+        // The same box with the separator restored confirms, so it is the
+        // missing separator answering here and not the rows or the footer.
+        assert_eq!(
+            composer_holds(&pane.replacen("  another line", "", 1), RULE),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn a_gutter_box_is_only_whole_below_a_blank_row() {
         // What the rule above rests on, stated so a capture can refute it:
         // every real gutter box is preceded by a blank row, and a row that
@@ -1694,9 +1784,20 @@ mod tests {
             ("opencode-wrapped-cwd", OC_WRAPPED_CWD),
         ] {
             let lines: Vec<&str> = pane.lines().collect();
-            assert!(
-                !gutter_bounded(&lines).is_empty(),
-                "{name}: fixture lost its gutter box"
+            let boxes = gutter_bounded(&lines);
+            assert!(!boxes.is_empty(), "{name}: fixture lost its gutter box");
+            // `top_of_a_box` repeats `gutter_bounded`'s walk, so it can
+            // drift out of step with it silently. Tie the two together
+            // here: the rows between the helper's top and the closing rule
+            // have to be the rows the real walk returned.
+            let bottom = lines
+                .iter()
+                .rposition(|l| is_rule(l))
+                .expect("no rule to close a box");
+            assert_eq!(
+                bottom - top_of_a_box(&lines),
+                boxes.last().expect("checked non-empty").rows.len(),
+                "{name}: the test helper and gutter_bounded disagree on the box"
             );
             assert!(
                 gutter_bounded(&lines).iter().all(|c| c.whole),
@@ -1753,10 +1854,13 @@ mod tests {
             "\u{2500}".repeat(60)
         );
         assert_eq!(composer_holds(&pane, RULE), None);
-        // The same box below a blank row is the shape every capture has,
-        // and it confirms — so the blank row is doing the work here, not
-        // the footer or the box's contents.
-        assert_eq!(composer_holds(&format!("\n{pane}"), RULE), Some(false));
+        // The same box below the transcript-then-blank every capture draws
+        // above it confirms — so it is what sits above the box doing the
+        // work here, not the footer or the box's contents.
+        assert_eq!(
+            composer_holds(&format!("  a line of transcript\n\n{pane}"), RULE),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1808,11 +1912,13 @@ mod tests {
     }
 
     fn gutter_box(rows: &[String]) -> String {
-        // The blank separator every captured gutter box is drawn below. It
-        // is what makes the box read as whole, so that the rows are what
-        // decides these tests rather than #51's truncation veto short-
-        // circuiting them.
-        let mut lines = vec![String::new()];
+        // The two rows every captured gutter box is drawn below: transcript,
+        // then the blank separator. Both are what make the box read as
+        // whole, so that these tests are decided by their own rows rather
+        // than by #51's truncation veto short-circuiting them. A pane that
+        // begins at its box, which is what this built before, is a shape no
+        // capture has.
+        let mut lines = vec!["  a line of transcript".to_string(), String::new()];
         lines.extend(rows.to_vec());
         lines.push("\u{2500}".repeat(BOX_WIDTH));
         lines.push("  status".into());
