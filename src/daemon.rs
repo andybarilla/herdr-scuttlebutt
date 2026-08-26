@@ -29,7 +29,9 @@ pub const MAX_FAILURES_BEFORE_STALL: u32 = 5;
 /// `MAX_FAILURES_BEFORE_STALL`'s value and not its behaviour: giving up here
 /// costs an agent the explanation of what scuttlebutt is, after which it
 /// still receives every batch, so the number is free to move on its own
-/// (#44). Nothing retries an intro once this is reached.
+/// (#44). Nothing retries an intro within an enrollment; the absence purge
+/// is the only way back, because it drops `introduced` with the rest of the
+/// agent's state and the next listing introduces it afresh.
 pub const MAX_INTRO_FAILURES: u32 = 5;
 
 /// Delivery opportunities a freshly stalled agent waits before it is offered
@@ -2724,10 +2726,10 @@ mod tests {
 
     #[test]
     fn an_unconfirmable_agent_converges_while_the_room_is_busy() {
-        // The room this runs in gets traffic faster than five ticks, so the
-        // batch max id changes every pass and `fail_counts`' streak restarts
-        // every pass. Without a batch-independent counter the agent is
-        // re-prompted forever and never reaches the skip.
+        // The room this runs in gets traffic faster than the cap's worth of
+        // ticks, so the batch max id changes every pass and `fail_counts`'
+        // streak restarts every pass. Without a batch-independent counter the
+        // agent is re-prompted forever and never reaches the stall.
         let dir = tempfile::tempdir().unwrap();
         let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();

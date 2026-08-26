@@ -34,8 +34,9 @@ pub struct DaemonState {
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
     /// Agents whose batch or unconfirmed streak reached
-    /// `MAX_FAILURES_BEFORE_STALL` with nothing ever confirming a delivery. While an agent is in here the daemon leaves
-    /// its cursor alone and drops to a widening backoff instead of prompting
+    /// `MAX_FAILURES_BEFORE_STALL` with nothing ever confirming a delivery.
+    /// While an agent is in here the daemon leaves its cursor alone and
+    /// drops to a widening backoff instead of prompting
     /// it every tick, so the batch survives until its pane can take it — the
     /// alternative, advancing the cursor, loses those messages outright
     /// (#39).
@@ -46,7 +47,7 @@ pub struct DaemonState {
     /// an agent herdr reports no session id for has no other way out at all.
     ///
     /// Keyed by agent and never by batch: an entry that re-armed when the
-    /// batch grew would restart the five-failure cycle on every new room
+    /// batch grew would restart the run-up to the cap on every new room
     /// message, which is the redelivery loop the threshold exists to stop.
     #[serde(default)]
     pub stalled: HashMap<String, Stall>,
@@ -167,7 +168,7 @@ mod tests {
     fn a_stall_survives_a_daemon_restart() {
         // A held batch that did not outlive the daemon would be delivered
         // again on the next tick, and the agent would work back through the
-        // same five failures to reach the same stall.
+        // same run of failures to reach the same stall.
         let dir = tempfile::tempdir().unwrap();
         let mut s = DaemonState::default();
         s.cursors.insert("reviewer".into(), 7);
