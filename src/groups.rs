@@ -190,20 +190,56 @@ pub struct Room {
     pub history: bool,
 }
 
-impl Room {
-    /// Sort rank: rooms with agents in them, then rooms the config names,
-    /// then rooms that are only history. Public because `rooms` orders by it
-    /// and a caller grouping the list under headings needs the same
-    /// three-way split — deriving it a second time from the fields is how
-    /// the headings come to disagree with the order.
-    pub fn provenance_rank(&self) -> u8 {
-        if self.agents > 0 {
-            0
-        } else if self.configured {
-            1
-        } else {
-            2
+/// One of the three things that can vouch for a room, in provenance order:
+/// an agent standing in it now outranks the config naming it, which outranks
+/// a log left on disk. An enum rather than a string so a caller grouping
+/// rooms under headings matches on the source instead of on its wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Source {
+    Agents,
+    Config,
+    History,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Agents => "live agents",
+            Source::Config => "config",
+            Source::History => "history",
         }
+    }
+}
+
+impl Room {
+    /// Every source that vouches for this room, in provenance order, so the
+    /// first is the room's primary source. Rooms are genuinely vouched for
+    /// by more than one thing at once — `alare` has agents in it, sits in
+    /// the config and holds a log — and which ones is the whole reason
+    /// `Room` carries three flags rather than a name.
+    ///
+    /// Labelling and sorting both read from here so they cannot give two
+    /// answers about the same room: listing only the config for a room that
+    /// also has agents in it labels it as configured while `rooms` sorts it
+    /// as live.
+    ///
+    /// Empty only for a `Room` nothing vouches for, which `rooms` never
+    /// builds.
+    pub fn sources(&self) -> Vec<Source> {
+        [
+            (self.agents > 0, Source::Agents),
+            (self.configured, Source::Config),
+            (self.history, Source::History),
+        ]
+        .into_iter()
+        .filter_map(|(vouches, s)| vouches.then_some(s))
+        .collect()
+    }
+
+    /// Sort key: where this room's primary source falls in provenance order.
+    /// A room nothing vouches for sorts last rather than first.
+    pub fn provenance_rank(&self) -> u8 {
+        self.sources().first().map_or(u8::MAX, |s| *s as u8)
     }
 }
 
@@ -220,7 +256,7 @@ fn has_history(dir: &Path) -> bool {
 /// The accumulating entry for one room name, created blank on first touch.
 /// Every source goes through this, which is what makes the union a dedup
 /// rather than three lists concatenated.
-fn slot(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -> &mut Room {
+fn entry_for(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -> &mut Room {
     found.entry(name.clone()).or_insert(Room {
         name,
         agents: 0,
@@ -252,16 +288,18 @@ pub fn rooms(
 
     if let Grouping::Active(rules) = grouping {
         for name in rules.names() {
-            slot(&mut found, Some(name.to_string())).configured = true;
+            entry_for(&mut found, Some(name.to_string())).configured = true;
         }
     }
 
     for a in agents {
         match resolve(Path::new(&a.cwd), grouping, orgs) {
-            Some(g) => slot(&mut found, Some(g)).agents += 1,
+            Some(g) => entry_for(&mut found, Some(g)).agents += 1,
             // Without a config, an agent in no repository belongs to the
             // single shared room, so it is a member like any other.
-            None if matches!(grouping, Grouping::Inactive) => slot(&mut found, None).agents += 1,
+            None if matches!(grouping, Grouping::Inactive) => {
+                entry_for(&mut found, None).agents += 1
+            }
             // Under a config the same agent is enrolled nowhere, and the
             // ungrouped room receives nothing. Counting it would conjure a
             // room out of one stray cwd whose only member can never be
@@ -286,7 +324,7 @@ pub fn rooms(
                 continue;
             }
             if has_history(&e.path()) {
-                slot(&mut found, Some(name)).history = true;
+                entry_for(&mut found, Some(name)).history = true;
             }
         }
     }
@@ -296,7 +334,7 @@ pub fn rooms(
     // of a room that can no longer be posted to; offering it would invite
     // posting into a dead room.
     if matches!(grouping, Grouping::Inactive) && has_history(session_dir) {
-        slot(&mut found, None).history = true;
+        entry_for(&mut found, None).history = true;
     }
 
     let mut out: Vec<Room> = found.into_values().collect();
@@ -843,5 +881,102 @@ mod tests {
         write_room(session.path(), Some("fine"), "{}\n");
         let found = rooms(&Grouping::Inactive, &[], session.path(), &mut cache(no_org));
         assert_eq!(names(&found), vec!["fine"]);
+    }
+
+    #[test]
+    fn a_room_lists_every_source_that_vouches_for_it() {
+        let r = Room {
+            name: Some("alare".into()),
+            agents: 2,
+            configured: true,
+            history: true,
+        };
+        assert_eq!(
+            r.sources(),
+            vec![Source::Agents, Source::Config, Source::History]
+        );
+    }
+
+    #[test]
+    fn the_primary_source_of_a_room_with_agents_is_its_agents() {
+        // the label and the sort must give one answer about the same room:
+        // `alare` sits in the config and holds a log, but agents are standing
+        // in it, which is why it sorts first — so it must not read as
+        // "known from the config"
+        let r = Room {
+            name: Some("alare".into()),
+            agents: 2,
+            configured: true,
+            history: true,
+        };
+        assert_eq!(r.sources().first(), Some(&Source::Agents));
+        assert_eq!(r.provenance_rank(), 0);
+    }
+
+    #[test]
+    fn every_rank_is_its_primary_sources_place_in_provenance_order() {
+        let room_with = |agents, configured, history| Room {
+            name: None,
+            agents,
+            configured,
+            history,
+        };
+        assert_eq!(room_with(1, false, false).provenance_rank(), 0);
+        assert_eq!(room_with(0, true, true).provenance_rank(), 1);
+        assert_eq!(room_with(0, false, true).provenance_rank(), 2);
+    }
+
+    #[test]
+    fn a_room_nothing_vouches_for_sorts_last_rather_than_first() {
+        // `rooms` never builds one, but `Room`'s fields are public and a
+        // default-ish room must not outrank a room with agents in it
+        let r = room_of_no_sources();
+        assert!(r.sources().is_empty());
+        assert!(r.provenance_rank() > room_of_history_only().provenance_rank());
+    }
+
+    fn room_of_no_sources() -> Room {
+        Room {
+            name: None,
+            agents: 0,
+            configured: false,
+            history: false,
+        }
+    }
+
+    fn room_of_history_only() -> Room {
+        Room {
+            name: None,
+            agents: 0,
+            configured: false,
+            history: true,
+        }
+    }
+
+    #[test]
+    fn the_order_of_a_rooms_sources_matches_the_order_rooms_are_sorted_in() {
+        // the invariant that keeps a label and a sort position honest: for
+        // any two rooms, the one whose primary source comes first in
+        // provenance order sorts first
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("zeta"), "{}\n");
+        let g = Grouping::Active(rules(&[("busy", &["/w/busy"]), ("quiet", &["/w/quiet"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/busy/x")],
+            session.path(),
+            &mut cache(no_org),
+        );
+        let primaries: Vec<Source> = found
+            .iter()
+            .map(|r| *r.sources().first().unwrap())
+            .collect();
+        assert_eq!(
+            primaries,
+            vec![Source::Agents, Source::Config, Source::History]
+        );
+        let mut sorted = primaries.clone();
+        sorted.sort();
+        assert_eq!(primaries, sorted, "list order must follow primary source");
     }
 }

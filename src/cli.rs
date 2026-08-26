@@ -186,18 +186,9 @@ pub fn cmd_rooms(herd: &dyn HerdControl) -> Result<()> {
     let mut orgs = OrgCache::default();
     println!("name\tagents\tknown from");
     for r in groups::rooms(&grouping, &agents, &session, &mut orgs) {
-        let mut from = Vec::new();
-        if r.configured {
-            from.push("config");
-        }
-        if r.history {
-            from.push("history");
-        }
-        // Neither: a room that exists only because an agent is standing in
-        // it right now, derived from its repository origin.
-        if from.is_empty() {
-            from.push("live agents");
-        }
+        // Straight from `Room::sources`, which `rooms` also sorts by, so
+        // this column cannot disagree with the order it is printed in.
+        let from: Vec<&str> = r.sources().iter().map(|s| s.label()).collect();
         println!(
             "{}\t{}\t{}",
             r.name.as_deref().unwrap_or("(ungrouped)"),
