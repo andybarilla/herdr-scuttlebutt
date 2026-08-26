@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
@@ -121,163 +122,220 @@ fn is_joint(c: char) -> bool {
 /// Whether a line *is* a horizontal rule, which is how a composer box is
 /// drawn.
 ///
-/// The line has to open and close with box-drawing characters and carry a
-/// run of horizontals. Between them it may carry one label: Claude Code
-/// centres the session title in the top border of its composer
-/// (`\u{2500}\u{2500} clear-conversation-state \u{2500}\u{2500}`), which is #36 — requiring every
-/// character to be box-drawing rejected that border, left one rule in the
-/// pane, and identified no composer at all.
+/// The line has to open and close with box-drawing characters and carry an
+/// unbroken run of `RULE_RUN` horizontals. Between them it may carry one
+/// label: Claude Code writes the session title into the top border of its
+/// composer, right-aligned rather than centred — `\u{2500}\u{2500}\u{2500} clear-conversation-state \u{2500}`
+/// is 274 horizontals, the title, and one more — which is #36. Requiring
+/// every character to be box-drawing rejected that border, left one rule in
+/// the pane, and identified no composer at all.
 ///
-/// One label, not any number of them, and never at either end. That is what
-/// still separates furniture from content: a message body carrying
-/// box-drawn terminal output reaches the composer with its line breaks
-/// intact, and treating one of its lines as furniture would move a region
-/// boundary onto it. Such a line all but always has text outside the run —
-/// `like "\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}", dashed variants` opens with a word.
+/// The unbroken run is measured per run rather than summed, so that a short
+/// centred label between two stubs — `\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}`, the shape a
+/// pasted transcript actually carries — stays content. That is a bound, not
+/// a guarantee: a body line carrying a long enough run and one label is
+/// indistinguishable from a titled border, and reading it as furniture
+/// splits the composer in two. Nothing in a line can settle that, so
+/// `rule_bounded` keeps the half without the marker rather than discarding
+/// it, and `composer_holds` still finds our text on it.
 fn is_rule(line: &str) -> bool {
     let line = line.trim();
     let boxed = |c: char| is_horizontal(c) || is_joint(c);
     if !line.starts_with(boxed) || !line.ends_with(boxed) {
         return false;
     }
-    let mut horizontals = 0;
+    // Horizontals per run of box-drawing characters, so a label breaks the
+    // run it interrupts rather than being summed across.
+    let mut runs = vec![0usize];
     let mut labels = 0;
     let mut in_label = false;
     for c in line.chars() {
         if boxed(c) {
-            in_label = false;
-            horizontals += usize::from(is_horizontal(c));
+            if in_label {
+                runs.push(0);
+                in_label = false;
+            }
+            *runs.last_mut().expect("a run is always open") += usize::from(is_horizontal(c));
         } else if !in_label {
             in_label = true;
             labels += 1;
         }
     }
-    horizontals >= RULE_RUN && labels <= 1
+    labels <= 1 && runs.iter().any(|r| *r >= RULE_RUN)
 }
 
-/// Every composer identified in `pane`, each as its own lines, normalized
-/// and stripped of the marker or gutter that identified it.
+/// What a pane's rules and gutters divide it into.
+///
+/// `composers` are the regions a marker or a gutter identified as one.
+/// `others` is every remaining rule-bounded region, and it exists because a
+/// region boundary can move: a rule inside a message body splits the
+/// composer, and the half carrying our text is then the half without the
+/// marker. Those regions can say our text is still on the composer; they
+/// can never say a composer is clear. Discarding them, which is what this
+/// did before, turned a moved boundary into `Some(false)` and dropped the
+/// batch.
+struct Regions {
+    composers: Vec<Vec<String>>,
+    others: Vec<Vec<String>>,
+}
+
+/// Every region of `pane` a composer could be, each as its own lines,
+/// normalized and stripped of the marker or gutter that identified it.
 ///
 /// Lines rather than one joined string because the two decisions want
 /// different views of a composer. Whether it holds our text reads best
 /// across the whole thing, since the composer wraps mid-sentence. Whether
 /// it is *clear* has to read line by line: a box that prints furniture of
-/// its own below the text — OpenCode's model footer — pads a two-word
-/// unsubmitted prompt past the word count that would otherwise call it too
-/// short to classify.
+/// its own below the text — OpenCode's model footer — is text that is not
+/// ours sitting beside a short unsubmitted prompt, and read as one string
+/// the two together are long enough to classify.
 ///
 /// The two layouts here are the two this fleet runs, and neither is a
 /// guess: a rule-bounded box that opens with a known prompt marker, and a
-/// gutter-bounded box at the bottom edge of the pane. A layout matching
-/// neither identifies nothing, which costs a repeat delivery.
-fn composer_regions(pane: &str) -> Vec<Vec<String>> {
+/// gutter-bounded box closed by a rule. A layout matching neither
+/// identifies nothing, which costs a repeat delivery.
+fn composer_regions(pane: &str) -> Regions {
     let lines: Vec<&str> = pane.lines().collect();
     let mut regions = rule_bounded(&lines);
-    regions.extend(gutter_bounded(&lines));
+    regions.composers.extend(gutter_bounded(&lines));
     regions
 }
 
-/// Every rule-bounded region that opens with a prompt marker.
+/// Every rule-bounded region, split by whether it opens with a prompt
+/// marker.
 ///
-/// Every such region is returned, not just the last one, and that is the
-/// point. A message body ending in a rule of its own, or a bordered box
-/// drawn below the composer, both put a *different* region last; picking one
+/// Every region is returned, not just the last one, and that is the point.
+/// A message body ending in a rule of its own, or a bordered box drawn
+/// below the composer, both put a *different* region last; picking one
 /// region by position is a guess, and a wrong guess here reports a batch
 /// submitted that is sitting on a composer two lines up. A transcript echo
-/// of a submitted prompt cannot be mistaken for one of these, because the
-/// transcript draws no rules around it.
-fn rule_bounded(lines: &[&str]) -> Vec<Vec<String>> {
+/// of a submitted prompt cannot be mistaken for a composer, because the
+/// transcript draws no rules around it — but it can still land in `others`,
+/// where the worst it costs is a repeat delivery.
+fn rule_bounded(lines: &[&str]) -> Regions {
     let rules: Vec<usize> = lines
         .iter()
         .enumerate()
         .filter(|(_, l)| is_rule(l))
         .map(|(i, _)| i)
         .collect();
-    rules
-        .windows(2)
-        .filter_map(|w| {
-            let mut region: Vec<String> = lines[w[0] + 1..w[1]]
-                .iter()
-                .map(|l| normalize(l))
-                .filter(|l| !l.is_empty())
-                .collect();
-            let first = region.first()?;
-            let marker = MARKERS.iter().find(|m| first.starts_with(**m))?.len();
-            region[0] = region[0][marker..].trim().to_string();
-            Some(region)
-        })
-        .collect()
+    let mut regions = Regions {
+        composers: Vec::new(),
+        others: Vec::new(),
+    };
+    for w in rules.windows(2) {
+        let mut region: Vec<String> = lines[w[0] + 1..w[1]]
+            .iter()
+            .map(|l| normalize(l))
+            .filter(|l| !l.is_empty())
+            .collect();
+        let marker = region
+            .first()
+            .and_then(|first| MARKERS.iter().find(|m| first.starts_with(**m)))
+            .map(|m| m.len());
+        match marker {
+            Some(marker) => {
+                region[0] = region[0][marker..].trim().to_string();
+                regions.composers.push(region);
+            }
+            None if !region.is_empty() => regions.others.push(region),
+            None => {}
+        }
+    }
+    regions
 }
 
-/// The columns a box occupies, read off the bottom edge that closes it.
+/// The columns a box occupies, read off the rule that closes it.
 ///
 /// A pane right-aligns furniture of its own outside that edge — OpenCode
 /// wraps a long working directory up the right margin, across the rows the
 /// composer is drawn on — and clipping to the box is what keeps that out of
 /// the composer's contents. Left in, it reads as text that is not ours: a
-/// two-word unsubmitted prompt beside it is no longer too short to
-/// classify, which is `Some(false)` and the batch gone.
+/// two-word unsubmitted prompt with a fragment of a path beside it is three
+/// words, which is no longer too short to classify, which is `Some(false)`
+/// and the batch gone.
 ///
-/// Columns are counted in characters. A row carrying a double-width
-/// character is clipped a little late and keeps a fragment of what sits
-/// beyond the edge, which can only add words to a row that already had our
-/// text on it. It cannot empty a row: nothing the composer draws lies
-/// outside its own box.
+/// Columns are display cells rather than characters, because that is what
+/// the pane was drawn in. Counting characters clips a row carrying a
+/// double-width character late, by one column per such character, and the
+/// fragment it keeps is exactly the furniture this exists to remove.
 fn box_span(border: &str) -> (usize, usize) {
     let start = border.chars().take_while(|c| c.is_whitespace()).count();
-    (start, border.trim_end().chars().count())
+    (start, display_width(border.trim_end()))
 }
 
-/// One row of a gutter-bounded box, clipped to the box, gutter stripped and
-/// normalized.
+/// Display width in terminal cells, which is what a pane's columns are.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// One row of a gutter-bounded box, clipped to the box's columns, gutter
+/// stripped and normalized.
 fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
-    let clipped: String = row.chars().take(end).skip(start).collect();
-    normalize(clipped.trim_start_matches(|c| GUTTERS.contains(&c)))
+    let mut col = 0;
+    let mut clipped = String::new();
+    for c in row.chars() {
+        if col >= end {
+            break;
+        }
+        if col >= start {
+            clipped.push(c);
+        }
+        col += c.width().unwrap_or(0);
+    }
+    // Trimmed before the gutter is stripped, because the clip starts at the
+    // rule's own indent and a box's rows may be indented further than the
+    // rule that closes it.
+    normalize(
+        clipped
+            .trim_start()
+            .trim_start_matches(|c| GUTTERS.contains(&c)),
+    )
 }
 
-/// The composer of an editor that draws a vertical down every row of its
-/// input box instead of a rule above it. OpenCode draws one, and puts a
-/// single horizontal in the whole pane: the bottom edge of that box. One
-/// rule bounds no region, which is the other half of #36 — and no widening
+/// Every box drawn with a vertical down each of its rows and closed by a
+/// rule beneath them. OpenCode draws its composer that way and puts a
+/// single horizontal in the whole pane — the bottom edge of that box. One
+/// rule bounds no region, which is the other half of #36, and no widening
 /// of `is_rule` can reach it, because the rules it would need are not
 /// drawn.
 ///
-/// Identification is positional, and it has to be: this layout gives the
-/// composer no marker of its own, and it draws *submitted* messages in the
-/// transcript inside the same gutter. Sitting against the pane's bottom
-/// edge is what separates the composer from those echoes — an echo always
-/// has the rest of the transcript below it.
-fn gutter_bounded(lines: &[&str]) -> Option<Vec<String>> {
+/// Closed by a rule, rather than sitting at the bottom of the pane: this
+/// layout gives the composer no marker of its own and draws *submitted*
+/// messages in the transcript inside the same gutter, so something has to
+/// separate the two, and it is the rule underneath. An echo has the rest of
+/// the transcript below it instead. The composer is not always the lowest
+/// thing in the pane either — OpenCode centres its box on a fresh session,
+/// with the transcript hint and status line below — so "lowest" would be
+/// wrong as well as unpinned.
+///
+/// Every such box is returned rather than the last, for the same reason
+/// `rule_bounded` returns every region: a bordered overlay drawn below the
+/// composer is another box closed by a rule, and returning only the lowest
+/// would replace the composer with the overlay and report the batch
+/// submitted from under it.
+fn gutter_bounded(lines: &[&str]) -> Vec<Vec<String>> {
     let gutter = |l: &&str| l.trim_start().starts_with(|c| GUTTERS.contains(&c));
-    let bottom = lines.iter().rposition(|l| is_rule(l))?;
-    let mut top = bottom;
-    while top > 0 && gutter(&lines[top - 1]) {
-        top -= 1;
+    let mut boxes = Vec::new();
+    for (bottom, _) in lines.iter().enumerate().filter(|(_, l)| is_rule(l)) {
+        let mut top = bottom;
+        while top > 0 && gutter(&lines[top - 1]) {
+            top -= 1;
+        }
+        // A box, not a single bordered line: one gutter row above a rule is
+        // as easily a transcript echo that happens to end there.
+        if bottom - top < 2 {
+            continue;
+        }
+        let span = box_span(lines[bottom]);
+        boxes.push(
+            lines[top..bottom]
+                .iter()
+                .map(|l| boxed_row(l, span))
+                .collect(),
+        );
     }
-    // A box, not a single bordered line: one gutter line above the bottom
-    // edge is as easily a transcript echo that happens to end there.
-    if bottom - top < 2 {
-        return None;
-    }
-    let span = box_span(lines[bottom]);
-    let mut region: Vec<String> = lines[top..bottom]
-        .iter()
-        .map(|l| boxed_row(l, span))
-        .collect();
-    // OpenCode prints the agent and model inside the box, below a blank row
-    // and under anything typed. That is furniture: left in, it pads an
-    // empty composer to three words, and a short unsubmitted prompt beside
-    // it would read as too long to be ours rather than too short to
-    // classify — `Some(false)`, and the batch gone. It is dropped only when
-    // that exact shape is present, because dropping a line that turned out
-    // to be ours is the one error here that could also lose a batch.
-    let footer = region.len() >= 2
-        && !region[region.len() - 1].is_empty()
-        && region[region.len() - 2].is_empty();
-    if footer {
-        region.pop();
-    }
-    Some(region)
+    boxes
 }
 
 /// Whether `content` is a run of `sent` rather than something else on the
@@ -318,19 +376,25 @@ fn is_our_text(content: &str, sent: &str) -> bool {
 /// case that failed to match and fell through to `Submitted`. There is no
 /// fall-through here — a layout this does not understand cannot reach it.
 fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
-    let regions = composer_regions(pane);
-    if regions.is_empty() {
+    let Regions { composers, others } = composer_regions(pane);
+    if composers.is_empty() {
         return None;
     }
     let sent = normalize(sent);
-    if regions.iter().any(|c| is_our_text(&c.join(" "), &sent)) {
+    if composers
+        .iter()
+        .chain(&others)
+        .any(|c| is_our_text(&c.join(" "), &sent))
+    {
         return Some(true);
     }
-    let lines = || regions.iter().flatten();
+    // Only a region something identified as a composer can say a composer
+    // is clear. `others` has already had its say above.
+    let rows = || composers.iter().flatten();
     // A composer showing a queue hint is showing neither our text nor a
     // clear box: the queue it names may hold our batch or may not, and
     // nothing in the pane says which.
-    if lines().any(|l| QUEUE_HINTS.iter().any(|h| l.contains(h))) {
+    if rows().any(|l| QUEUE_HINTS.iter().any(|h| l.contains(h))) {
         return None;
     }
     // Non-empty but too short to tell ours from a placeholder or a menu.
@@ -344,7 +408,7 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
             .count();
         words == 0 || words >= OVERLAP_WORDS
     };
-    match lines().all(classifiable) {
+    match rows().all(classifiable) {
         true => Some(false),
         false => None,
     }
@@ -720,7 +784,7 @@ mod tests {
             ("opencode, a wrapped working directory", OC_WRAPPED_CWD),
         ] {
             assert!(
-                !composer_regions(pane).is_empty(),
+                !composer_regions(pane).composers.is_empty(),
                 "{name}: no composer identified"
             );
         }
@@ -794,8 +858,15 @@ mod tests {
         // composer. Confirming here is half the point of the fix: an echo
         // read as a composer answers `Some(true)` on every tick, and the
         // unconfirmed streak skips a batch just as surely as a failed
-        // delivery does. One region, and it is the composer.
-        assert_eq!(composer_regions(OC_LIVE).len(), 1);
+        // delivery does.
+        //
+        // What excludes them is the rule: no rule is drawn beneath an echo,
+        // so no echo closes a box. That is a weaker guarantee than it
+        // sounds — an overlay bordered below an echo would close one — and
+        // `an_overlay_below_a_gutter_composer_does_not_hide_the_batch` is
+        // what makes that survivable, by keeping every box rather than the
+        // lowest. One region here, and it is the composer.
+        assert_eq!(composer_regions(OC_LIVE).composers.len(), 1);
         assert_eq!(composer_holds(OC_LIVE, OC_SENT), Some(false));
     }
 
@@ -810,7 +881,7 @@ mod tests {
         // classify, and the pane is unconfirmable for as long as its
         // working directory is that long.
         for (name, pane) in [("an ic pane", OC_WRAPPED_CWD), ("a scratch pane", OC_EMPTY)] {
-            assert_eq!(composer_regions(pane).len(), 1, "{name}");
+            assert_eq!(composer_regions(pane).composers.len(), 1, "{name}");
             assert_eq!(composer_holds(pane, OC_SENT), Some(false), "{name}");
         }
     }
@@ -842,6 +913,129 @@ mod tests {
                 "{name}: a held batch reported submitted"
             );
         }
+    }
+
+    // ---- a boundary that moved never loses the batch --------------------
+
+    #[test]
+    fn a_short_centred_label_between_stubs_is_not_a_rule() {
+        // The shape a pasted transcript carries. Summing horizontals across
+        // the label instead of measuring the run would make this furniture,
+        // and furniture inside the composer splits it.
+        assert!(!is_rule("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"));
+        assert!(is_rule(&format!(
+            "{} Context \u{2500}",
+            "\u{2500}".repeat(RULE_RUN)
+        )));
+    }
+
+    #[test]
+    fn a_line_with_two_labels_is_not_a_rule() {
+        // One label is the session title. Two is a table row, a progress
+        // bar, or a body line, and each label it is allowed moves the bound
+        // further from anything a composer border does.
+        let run = "\u{2500}".repeat(RULE_RUN);
+        assert!(is_rule(&format!("{run} one {run}")));
+        assert!(!is_rule(&format!("{run} one {run} two {run}")));
+    }
+
+    #[test]
+    fn a_rule_inside_the_batch_does_not_hide_the_half_without_the_marker() {
+        // A message body carrying a titled rule of its own splits the
+        // composer, and our text ends up in the half the marker is not in.
+        // That half used to be discarded, which left the half holding a
+        // label — three words, none of them ours — to answer for the
+        // composer: `Some(false)`, cursor advanced, batch gone.
+        let titled = format!("{} Context \u{2500}", "\u{2500}".repeat(RULE_RUN));
+        let composer = [
+            format!("\u{276f} {titled}"),
+            titled,
+            "Reply only if you have information others don't".to_string(),
+        ];
+        assert_eq!(holds(&composer, RULE), Some(true));
+    }
+
+    #[test]
+    fn an_overlay_below_a_gutter_composer_does_not_hide_the_batch() {
+        // A bordered box drawn under an OpenCode composer is another
+        // gutter box closed by a rule. Taking only the lowest one replaces
+        // the composer with the overlay and reports the batch submitted
+        // from under it.
+        let overlay = format!(
+            "  \u{2503}\n  \u{2503}  Allow this command? [y/N]\n  \u{2503}\n{}",
+            "\u{2500}".repeat(60)
+        );
+        let pane = format!("{OC_HOLDS}{overlay}");
+        assert_eq!(composer_holds(&pane, OC_SENT), Some(true));
+    }
+
+    #[test]
+    fn a_single_gutter_row_above_a_rule_is_not_a_composer() {
+        // One bordered row is as easily the last line of a transcript echo
+        // that happens to end above a rule. Read as a composer it is four
+        // words that are not ours, which is a confirmation.
+        let pane = format!(
+            "  \u{2503}  someone else was here\n{}\n  status",
+            "\u{2500}".repeat(60)
+        );
+        assert_eq!(composer_holds(&pane, RULE), None);
+    }
+
+    #[test]
+    fn a_gutter_composer_is_found_above_the_bottom_of_the_pane() {
+        // OpenCode centres its box on a fresh session, with a transcript
+        // hint and a status line below it. The rule beneath the rows is
+        // what closes the box; being lowest in the pane is not.
+        let rule = OC_HINT
+            .lines()
+            .position(is_rule)
+            .expect("fixture lost its box");
+        assert!(
+            rule < OC_HINT.lines().count() - 2,
+            "fixture no longer has content below the box"
+        );
+        assert_eq!(composer_regions(OC_HINT).composers.len(), 1);
+    }
+
+    #[test]
+    fn a_double_width_character_does_not_pull_furniture_into_a_row() {
+        // Clipping by characters rather than display cells runs one column
+        // late per double-width character, and what it keeps is the first
+        // character of the working directory wrapped up the right margin.
+        // Beside two words of ours that fragment is a third word, which is
+        // enough to classify — and classified, an unsubmitted prompt is
+        // submitted. Built on the real pane that wraps its cwd, with one
+        // row of the box replaced.
+        let mut lines: Vec<String> = OC_WRAPPED_CWD.lines().map(String::from).collect();
+        let bottom = lines
+            .iter()
+            .position(|l| is_rule(l))
+            .expect("fixture lost its box");
+        let span = box_span(&lines[bottom]);
+        let held = "  \u{2503}  Reply\u{1f389} only";
+        let furniture = "~/.herdr/worktrees/alare/issue-1076:";
+        lines[bottom - 3] = format!(
+            "{held}{}{furniture}",
+            " ".repeat(span.1 - display_width(held))
+        );
+        let pane = lines.join("\n");
+
+        assert_eq!(boxed_row(&lines[bottom - 3], span), "Reply\u{1f389} only");
+        assert_eq!(composer_holds(&pane, OC_SENT), None);
+    }
+
+    #[test]
+    fn a_gutter_box_without_a_footer_still_holds_what_is_in_it() {
+        // The model footer used to be popped off the last row on its shape
+        // alone — non-empty, blank row above it. A composer holding two
+        // words has exactly that shape, and popping it left rows that were
+        // all empty, which is a cleared composer. Per-row classification
+        // does the work the pop was there for, so there is nothing to pop.
+        let pane = format!(
+            "  \u{2503}\n  \u{2503}\n  \u{2503}  Reply only\n{}\n  status",
+            "\u{2500}".repeat(60)
+        );
+        assert_eq!(composer_holds(&pane, RULE), None);
     }
 
     // ---- nothing identified is never a confirmation ---------------------
