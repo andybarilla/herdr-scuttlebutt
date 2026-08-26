@@ -226,8 +226,26 @@ fn is_rule(line: &str) -> bool {
 /// drop, and every layout this has been wrong about so far was one nobody
 /// had captured either.
 struct Regions {
-    composers: Vec<Vec<String>>,
-    others: Vec<Vec<String>>,
+    composers: Vec<Vec<Row>>,
+    others: Vec<Vec<Row>>,
+}
+
+/// One row of an identified region, in the two forms the verdict needs.
+///
+/// They differ only where a clip ran, which is `gutter_bounded`: a
+/// rule-bounded box spans the pane and is read whole, so `bare` and `text`
+/// are the same string. Where they differ, the difference is exactly what a
+/// measurement decided, which is what `composer_holds` refuses to let a row
+/// vote on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Row {
+    /// The row clipped to its box, its gutter or marker stripped, and
+    /// normalized. What `is_our_text` reads and what a word count measures.
+    text: String,
+    /// The same row with only its indent and its gutter or marker removed,
+    /// and no column arithmetic anywhere. Equal to `text` when the clip
+    /// took nothing off the row.
+    bare: String,
 }
 
 /// Every region of `pane` a composer could be, each as its own lines,
@@ -297,24 +315,31 @@ fn rule_bounded(lines: &[&str]) -> Regions {
         .filter(|(_, l)| is_rule(l))
         .map(|(i, _)| i)
         .collect();
-    let mut boxed: Vec<Option<(bool, Vec<String>)>> = Vec::new();
+    let mut boxed: Vec<Option<(bool, Vec<Row>)>> = Vec::new();
     for w in rules.windows(2) {
         if !same_box(lines[w[0]], lines[w[1]]) {
             boxed.push(None);
             continue;
         }
-        let mut region: Vec<String> = lines[w[0] + 1..w[1]]
+        // No clip runs here — the box spans the pane — so each row reads
+        // the same way whether or not a measurement is trusted.
+        let mut region: Vec<Row> = lines[w[0] + 1..w[1]]
             .iter()
             .map(|l| normalize(l))
             .filter(|l| !l.is_empty())
+            .map(|text| Row {
+                bare: text.clone(),
+                text,
+            })
             .collect();
         let marker = region
             .first()
-            .and_then(|first| MARKERS.iter().find(|m| first.starts_with(**m)))
+            .and_then(|first| MARKERS.iter().find(|m| first.text.starts_with(**m)))
             .map(|m| m.len());
         match marker {
             Some(marker) => {
-                region[0] = region[0][marker..].trim().to_string();
+                region[0].text = region[0].text[marker..].trim().to_string();
+                region[0].bare = region[0].text.clone();
                 boxed.push(Some((true, region)));
             }
             None if region.is_empty() => boxed.push(None),
@@ -418,6 +443,19 @@ fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
     )
 }
 
+/// The same row with its furniture stripped and nothing measured: the
+/// indent and the gutter go, the columns are left alone.
+///
+/// This is what says whether a row is empty, and whether the clip above
+/// took anything off it. Both questions have to be answerable without a
+/// measurement, because a measurement is what #47 stops a row voting on.
+fn bare_row(row: &str) -> String {
+    normalize(
+        row.trim_start()
+            .trim_start_matches(|c| GUTTERS.contains(&c)),
+    )
+}
+
 /// Every box drawn with a vertical down each of its rows and closed by a
 /// rule beneath them. OpenCode draws its composer that way and puts a
 /// single horizontal in the whole pane — the bottom edge of that box. One
@@ -439,7 +477,7 @@ fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
 /// composer is another box closed by a rule, and returning only the lowest
 /// would replace the composer with the overlay and report the batch
 /// submitted from under it.
-fn gutter_bounded(lines: &[&str]) -> Vec<Vec<String>> {
+fn gutter_bounded(lines: &[&str]) -> Vec<Vec<Row>> {
     let gutter = |l: &&str| l.trim_start().starts_with(|c| GUTTERS.contains(&c));
     let mut boxes = Vec::new();
     for (bottom, _) in lines.iter().enumerate().filter(|(_, l)| is_rule(l)) {
@@ -456,7 +494,10 @@ fn gutter_bounded(lines: &[&str]) -> Vec<Vec<String>> {
         boxes.push(
             lines[top..bottom]
                 .iter()
-                .map(|l| boxed_row(l, span))
+                .map(|l| Row {
+                    text: boxed_row(l, span),
+                    bare: bare_row(l),
+                })
                 .collect(),
         );
     }
@@ -506,11 +547,15 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
         return None;
     }
     let sent = normalize(sent);
-    if composers
-        .iter()
-        .chain(&others)
-        .any(|c| is_our_text(&c.join(" "), &sent))
-    {
+    let joined = |c: &Vec<Row>| {
+        c.iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if composers.iter().chain(&others).any(|c| {
+        is_our_text(&joined(c), &sent)
+    }) {
         return Some(true);
     }
     // A region kept in `others` is a rule inside the box with content on
@@ -527,21 +572,30 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     // A composer showing a queue hint is showing neither our text nor a
     // clear box: the queue it names may hold our batch or may not, and
     // nothing in the pane says which.
-    if rows().any(|l| QUEUE_HINTS.iter().any(|h| l.contains(h))) {
+    if rows().any(|r| QUEUE_HINTS.iter().any(|h| r.text.contains(h))) {
         return None;
     }
-    // Non-empty but too short to tell ours from a placeholder or a menu.
-    // Per line, because a composer that draws furniture of its own below
-    // the text would otherwise carry every short line past this on the
-    // strength of the furniture's word count.
-    let classifiable = |c: &String| {
-        let words = c
+    // A row may say a composer is clear only on evidence no measurement
+    // could have manufactured. Either it is empty before any clip, span or
+    // width calculation ran, or it carries enough words to be recognized as
+    // text that is not ours *and* the clip took nothing off it, so no width
+    // calculation contributed one of those words.
+    //
+    // Per row, because a composer that draws furniture of its own below the
+    // text — OpenCode's model footer — would otherwise carry every short
+    // row past this on the strength of the furniture's word count.
+    let says_clear = |r: &Row| {
+        if r.bare.is_empty() {
+            return true;
+        }
+        let words = r
+            .text
             .trim_end_matches(['\u{2026}', '.', ' '])
             .split_whitespace()
             .count();
-        words == 0 || words >= OVERLAP_WORDS
+        words >= OVERLAP_WORDS && r.bare == r.text
     };
-    match rows().all(classifiable) {
+    match rows().all(says_clear) {
         true => Some(false),
         false => None,
     }
@@ -1002,13 +1056,21 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_gutter_drawn_composer_confirms_submission() {
+    fn an_echo_in_the_composers_own_gutter_is_not_a_composer() {
         // A working lead pane carrying three transcript echoes of batches
         // it has already taken, each drawn in the same gutter as the
-        // composer. Confirming here is half the point of the fix: an echo
-        // read as a composer answers `Some(true)` on every tick, and the
-        // unconfirmed streak skips a batch just as surely as a failed
+        // composer. Identifying exactly one region is what this pins: an
+        // echo read as a composer answers `Some(true)` on every tick, and
+        // the unconfirmed streak skips a batch just as surely as a failed
         // delivery does.
+        //
+        // The verdict is `None` where this pane gave `Some(false)` before
+        // #47. Its footer row carries the working directory wrapped up the
+        // right margin, so the clip took something off the only row that
+        // could have voted, and a row a measurement had a hand in may no
+        // longer say a composer is clear —
+        // `furniture_right_aligned_over_the_composer_stops_it_confirming`
+        // is where that is argued.
         //
         // What excludes them here is that no rule is drawn beneath any of
         // them. That is a property of this pane, not a guarantee, and two
@@ -1035,22 +1097,30 @@ mod tests {
         // lowest never enters into this. That serves the opposite case, an
         // overlay drawn below a real composer.
         assert_eq!(composer_regions(OC_LIVE).composers.len(), 1);
-        assert_eq!(composer_holds(OC_LIVE, OC_SENT), Some(false));
+        assert_eq!(composer_holds(OC_LIVE, OC_SENT), None);
     }
 
     #[test]
-    fn furniture_right_aligned_over_the_composer_is_not_its_contents() {
+    fn furniture_right_aligned_over_the_composer_stops_it_confirming() {
         // Two clear composers in panes whose working directory is long
         // enough that OpenCode wraps it up the right margin, across the
         // rows the box is drawn on. `opencode-wrapped-cwd` is a live IC
         // pane, and it was found by running this locator over every pane in
-        // the fleet rather than over the captures: read as composer
-        // contents, those fragments are one word each, too short to
-        // classify, and the pane is unconfirmable for as long as its
-        // working directory is that long.
+        // the fleet rather than over the captures.
+        //
+        // The clip still keeps those fragments out of the contents: one
+        // composer is identified and its rows are what the box holds. What
+        // #47 changed is which rows may vote on that reading. A row the
+        // clip took something off had a width calculation decide part of
+        // what it says, and every batch #36 lost was that decision going
+        // wrong — a fragment kept, a short row of ours padded to three
+        // words that match nothing we sent, and a composer read as clear.
+        // So these panes confirm nothing for as long as their working
+        // directory is that long. Under #42 that holds the batch and
+        // re-prompts it rather than dropping it.
         for (name, pane) in [("an ic pane", OC_WRAPPED_CWD), ("a scratch pane", OC_EMPTY)] {
             assert_eq!(composer_regions(pane).composers.len(), 1, "{name}");
-            assert_eq!(composer_holds(pane, OC_SENT), Some(false), "{name}");
+            assert_eq!(composer_holds(pane, OC_SENT), None, "{name}");
         }
     }
 
@@ -1187,7 +1257,11 @@ mod tests {
                 .collect();
             let pane = pane.join("\n");
             assert_eq!(composer_regions(&pane).composers.len(), 1);
-            assert_eq!(composer_holds(&pane, OC_SENT), Some(false));
+            // `None` rather than a confirmation because this is built on
+            // `opencode-empty`, whose composer rows carry the wrapped
+            // working directory; the region count is what the injected
+            // rule is being tested against.
+            assert_eq!(composer_holds(&pane, OC_SENT), None);
         }
     }
 
@@ -1473,6 +1547,105 @@ mod tests {
             "\u{2500}".repeat(60)
         );
         assert_eq!(composer_holds(&pane, RULE), None);
+    }
+
+    /// One row of an OpenCode-shaped box: the gutter, the row's contents,
+    /// then whatever the pane draws up its right margin outside the box.
+    /// The box is `BOX_WIDTH` cells wide, so `margin` is what the clip is
+    /// there to remove.
+    fn gutter_row(content: &str, margin: &str) -> String {
+        let body = format!("  \u{2503}  {content}");
+        format!(
+            "{body}{}{margin}",
+            " ".repeat(BOX_WIDTH - display_width(&body))
+        )
+    }
+
+    fn gutter_box(rows: &[String]) -> String {
+        let mut lines = rows.to_vec();
+        lines.push("\u{2500}".repeat(BOX_WIDTH));
+        lines.push("  status".into());
+        lines.join("\n")
+    }
+
+    const BOX_WIDTH: usize = 60;
+
+    /// Every identified composer's rows as the clip leaves them.
+    fn texts(pane: &str) -> Vec<Vec<String>> {
+        composer_regions(pane)
+            .composers
+            .iter()
+            .map(|c| c.iter().map(|r| r.text.clone()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_row_the_clip_left_alone_reads_the_same_either_way() {
+        // `bare_row` and `boxed_row` strip the same furniture off the same
+        // row and have to do it the same way, so that the only thing left
+        // between them is the clip. Two functions reading one row two ways
+        // is #36's two-metrics defect one function over, and here it would
+        // be silent in the expensive direction: every row would read as one
+        // the clip had touched, and no gutter-drawn composer could confirm
+        // anything again.
+        let span = box_span(&"\u{2500}".repeat(BOX_WIDTH));
+        for row in [
+            "  \u{2503}",
+            "  \u{2503}  Reply only",
+            "    \u{2503}  indented further than its own closing rule",
+            "  \u{2503}  Build \u{b7} GPT-5.6 Sol OpenAI",
+        ] {
+            assert_eq!(bare_row(row), boxed_row(row, span), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_row_the_clip_touched_cannot_say_a_composer_is_clear() {
+        // The measurement layer's actual mechanism, from #36: the clip kept
+        // a fragment of the right margin, which padded a row up to a word
+        // count that reads as text long enough to be recognized as not
+        // ours — and a composer holding only text that is not ours is a
+        // composer we call clear. Whether the clip got those columns right
+        // or wrong, a row it took something off is a row whose word count
+        // a width calculation had a hand in, so it may not cast that vote.
+        let footer = "Build \u{b7} GPT-5.6 Sol OpenAI";
+        let clean = gutter_box(&[
+            gutter_row("", ""),
+            gutter_row("", ""),
+            gutter_row(footer, ""),
+        ]);
+        let overlapped = gutter_box(&[
+            gutter_row("", ""),
+            gutter_row("", ""),
+            gutter_row(footer, "~/dev/alare:main"),
+        ]);
+        // Identical inside the box: the clip removes the difference, and
+        // what is left is the same rows read the same way.
+        assert_eq!(texts(&clean), texts(&overlapped));
+        assert_eq!(composer_holds(&clean, RULE), Some(false));
+        assert_eq!(composer_holds(&overlapped, RULE), None);
+    }
+
+    #[test]
+    fn a_row_blank_only_after_clipping_is_not_an_empty_row() {
+        // The other half of the same rule. An empty row is the evidence
+        // that a composer is clear, so it has to be evidence no clip, span
+        // or width calculation could have manufactured: the row is empty
+        // only if it is empty before any of them ran.
+        let footer = "Build \u{b7} GPT-5.6 Sol OpenAI";
+        let clean = gutter_box(&[
+            gutter_row("", ""),
+            gutter_row("", ""),
+            gutter_row(footer, ""),
+        ]);
+        let overlapped = gutter_box(&[
+            gutter_row("", "~/dev/alare:main"),
+            gutter_row("", "~/dev/alare:main"),
+            gutter_row(footer, ""),
+        ]);
+        assert_eq!(texts(&clean), texts(&overlapped));
+        assert_eq!(composer_holds(&clean, RULE), Some(false));
+        assert_eq!(composer_holds(&overlapped, RULE), None);
     }
 
     // ---- nothing identified is never a confirmation ---------------------
