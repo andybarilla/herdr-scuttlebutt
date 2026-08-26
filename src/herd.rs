@@ -40,12 +40,20 @@ const MARKERS: [&str; 3] = ["\u{276f}", ">", "\u{203a}"];
 /// every row, in place of a rule above it. OpenCode uses the heavy one.
 const GUTTERS: [char; 2] = ['\u{2503}', '\u{2502}'];
 
-/// Text a composer shows in place of its contents while a queue is holding
-/// messages. It is not ours and not a human's, and — this is the point —
-/// it hides the queue rather than describing it, so it cannot tell us
-/// whether our batch reached that queue or never left `herdr agent prompt`.
-/// Recognized so a word count cannot read it as a cleared composer.
-const QUEUE_HINTS: [&str; 1] = ["Press up to edit queued messages"];
+/// Fragments of what a composer shows in place of its contents while a
+/// queue is holding messages — Claude Code shows `\u{276f} Press up to edit queued
+/// messages`. Such a hint is not ours and not a human's, and — this is the
+/// point — it hides the queue rather than describing it, so it cannot tell
+/// us whether our batch reached that queue or never left `herdr agent
+/// prompt`. Recognized so a word count cannot read it as a cleared
+/// composer.
+///
+/// A fragment rather than the whole line, because the whole line is the
+/// part that moves: a count, a plural, or an appended key hint would stop
+/// an exact match firing, and the pane would fall back to `Some(false)` —
+/// silently, since nothing in the delivery path can tell a hint it failed
+/// to recognize from a composer that is genuinely clear.
+const QUEUE_HINTS: [&str; 1] = ["queued messages"];
 
 /// Words of the composer that must reappear, in order, in what we sent
 /// before the composer counts as holding our text. Three rather than a
@@ -201,28 +209,30 @@ fn rule_bounded(lines: &[&str]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// One row of a gutter-bounded box, gutter stripped and normalized.
+/// The columns a box occupies, read off the bottom edge that closes it.
 ///
-/// A pane may right-align furniture of its own across the box's rows —
-/// OpenCode wraps a long working directory up the right edge, over the
-/// composer — and a gap of several spaces is what separates the two. The
-/// row is cut at the first such gap.
+/// A pane right-aligns furniture of its own outside that edge — OpenCode
+/// wraps a long working directory up the right margin, across the rows the
+/// composer is drawn on — and clipping to the box is what keeps that out of
+/// the composer's contents. Left in, it reads as text that is not ours: a
+/// two-word unsubmitted prompt beside it is no longer too short to
+/// classify, which is `Some(false)` and the batch gone.
 ///
-/// A row whose *whole* content is right-aligned furniture keeps it instead
-/// of being cut to nothing, and that asymmetry is the safe direction: an
-/// empty row is evidence of a clear composer, and a cut must never
-/// manufacture that evidence out of a row that had something on it. Held
-/// text keeps matching either way, because `is_our_text` reads the region
-/// as one string and our text is what sits left of the gap.
-fn boxed_row(row: &str) -> String {
-    let row = row
-        .trim_start()
-        .trim_start_matches(|c| GUTTERS.contains(&c));
-    let left = normalize(row.split("   ").next().unwrap_or_default());
-    match left.is_empty() {
-        true => normalize(row),
-        false => left,
-    }
+/// Columns are counted in characters. A row carrying a double-width
+/// character is clipped a little late and keeps a fragment of what sits
+/// beyond the edge, which can only add words to a row that already had our
+/// text on it. It cannot empty a row: nothing the composer draws lies
+/// outside its own box.
+fn box_span(border: &str) -> (usize, usize) {
+    let start = border.chars().take_while(|c| c.is_whitespace()).count();
+    (start, border.trim_end().chars().count())
+}
+
+/// One row of a gutter-bounded box, clipped to the box, gutter stripped and
+/// normalized.
+fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
+    let clipped: String = row.chars().take(end).skip(start).collect();
+    normalize(clipped.trim_start_matches(|c| GUTTERS.contains(&c)))
 }
 
 /// The composer of an editor that draws a vertical down every row of its
@@ -249,7 +259,11 @@ fn gutter_bounded(lines: &[&str]) -> Option<Vec<String>> {
     if bottom - top < 2 {
         return None;
     }
-    let mut region: Vec<String> = lines[top..bottom].iter().map(|l| boxed_row(l)).collect();
+    let span = box_span(lines[bottom]);
+    let mut region: Vec<String> = lines[top..bottom]
+        .iter()
+        .map(|l| boxed_row(l, span))
+        .collect();
     // OpenCode prints the agent and model inside the box, below a blank row
     // and under anything typed. That is furniture: left in, it pads an
     // empty composer to three words, and a short unsubmitted prompt beside
@@ -316,7 +330,7 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     // A composer showing a queue hint is showing neither our text nor a
     // clear box: the queue it names may hold our batch or may not, and
     // nothing in the pane says which.
-    if lines().any(|l| QUEUE_HINTS.contains(&l.as_str())) {
+    if lines().any(|l| QUEUE_HINTS.iter().any(|h| l.contains(h))) {
         return None;
     }
     // Non-empty but too short to tell ours from a placeholder or a menu.
@@ -610,6 +624,7 @@ mod tests {
     const OC_SHORT: &str = include_str!("../tests/fixtures/opencode-short.txt");
     const OC_HINT: &str = include_str!("../tests/fixtures/opencode-hint.txt");
     const OC_LIVE: &str = include_str!("../tests/fixtures/opencode-live-room.txt");
+    const OC_WRAPPED_CWD: &str = include_str!("../tests/fixtures/opencode-wrapped-cwd.txt");
 
     /// What was typed into the OpenCode panes: `RULE` as a real delivery
     /// carries it, with the sentence that follows it in the preamble.
@@ -702,6 +717,7 @@ mod tests {
             ("opencode, clear", OC_EMPTY),
             ("opencode, holding a batch", OC_HOLDS),
             ("opencode, a working lead", OC_LIVE),
+            ("opencode, a wrapped working directory", OC_WRAPPED_CWD),
         ] {
             assert!(
                 !composer_regions(pane).is_empty(),
@@ -739,6 +755,21 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_hint_that_has_moved_still_confirms_nothing() {
+        // Synthetic, and that is the point: the hint's wording is the part
+        // most likely to change under us, and an exact match failing to
+        // fire fails toward `Some(false)`, which is the verdict that loses
+        // the batch. Pinned so that shape cannot come back.
+        for hint in [
+            "Press up to edit 3 queued messages",
+            "Press up to edit queued messages (esc to clear)",
+        ] {
+            let composer = [format!("\u{276f} {hint}")];
+            assert_eq!(holds(&composer, RULE), None, "{hint:?} was classified");
+        }
+    }
+
+    #[test]
     fn a_gutter_drawn_composer_holding_a_batch_is_not_confirmed() {
         assert_eq!(composer_holds(OC_HOLDS, OC_SENT), Some(true));
     }
@@ -769,15 +800,19 @@ mod tests {
     }
 
     #[test]
-    fn furniture_right_aligned_over_the_composer_costs_confirmation() {
-        // `opencode-empty` is the same clear composer, in a pane whose
-        // working directory is long enough that OpenCode wraps it up the
-        // right edge, across the composer's rows. Its rows are cut at the
-        // gap, but a row that is *only* furniture keeps it rather than
-        // reading as blank — so this costs a repeat delivery instead of
-        // confirming a composer nothing was read from.
-        assert_eq!(composer_regions(OC_EMPTY).len(), 1);
-        assert_eq!(composer_holds(OC_EMPTY, OC_SENT), None);
+    fn furniture_right_aligned_over_the_composer_is_not_its_contents() {
+        // Two clear composers in panes whose working directory is long
+        // enough that OpenCode wraps it up the right margin, across the
+        // rows the box is drawn on. `opencode-wrapped-cwd` is a live IC
+        // pane, and it was found by running this locator over every pane in
+        // the fleet rather than over the captures: read as composer
+        // contents, those fragments are one word each, too short to
+        // classify, and the pane is unconfirmable for as long as its
+        // working directory is that long.
+        for (name, pane) in [("an ic pane", OC_WRAPPED_CWD), ("a scratch pane", OC_EMPTY)] {
+            assert_eq!(composer_regions(pane).len(), 1, "{name}");
+            assert_eq!(composer_holds(pane, OC_SENT), Some(false), "{name}");
+        }
     }
 
     #[test]
