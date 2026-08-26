@@ -1,5 +1,5 @@
 use crate::git_org::OrgCache;
-use crate::groups::{self, Grouping};
+use crate::groups::{self, CurrentRoom, Grouping};
 use crate::herd::{AgentInfo, HerdControl};
 use crate::log_store::{self, Message};
 use anyhow::{bail, Result};
@@ -9,12 +9,21 @@ use std::path::Path;
 /// origin organization. Refusing an unresolvable cwd under an active config
 /// rather than falling back to a default room is deliberate: a silent fallback
 /// would show one group's traffic to a caller nothing places there.
-pub fn resolve_group(
+/// The room a caller lands in, as the three-state room a chat pane holds.
+///
+/// `Broken` still bails: `groups::rooms` lists nothing there, so the picker
+/// this feeds could only offer rooms swept off disk — every company's — from
+/// a config we could not parse.
+///
+/// An active config that matches nothing is `NoneSelected` rather than an
+/// error. Only a chat pane can use that state, which is why `resolve_group`
+/// below still refuses it for every one-shot command.
+pub fn resolve_room(
     explicit: Option<&str>,
     cwd: &Path,
     grouping: &Grouping,
     orgs: &mut OrgCache,
-) -> Result<Option<String>> {
+) -> Result<CurrentRoom> {
     if let Grouping::Broken(msg) = grouping {
         bail!("groups config is unusable: {msg}");
     }
@@ -29,13 +38,30 @@ pub fn resolve_group(
         if !groups::valid_group_name(g) {
             bail!("invalid group name {g:?} (allowed: [a-z0-9][a-z0-9_-]*)");
         }
-        return Ok(Some(g.to_string()));
+        return Ok(CurrentRoom::Named(g.to_string()));
     }
-    match groups::resolve(cwd, grouping, orgs) {
-        Some(g) => Ok(Some(g)),
+    Ok(match groups::resolve(cwd, grouping, orgs) {
+        Some(g) => CurrentRoom::Named(g),
         // No config and no repo is v1's single shared room, not an error.
-        None if matches!(grouping, Grouping::Inactive) => Ok(None),
-        None => bail!(
+        None if matches!(grouping, Grouping::Inactive) => CurrentRoom::Ungrouped,
+        None => CurrentRoom::NoneSelected,
+    })
+}
+
+/// The group a one-shot command operates on. Everything but the chat pane
+/// needs a room right now, so the state a pane opens a picker in is an error
+/// here. Delegates to `resolve_room` so the precedence — an explicit name,
+/// then a configured prefix, then the repo's origin — is written once.
+pub fn resolve_group(
+    explicit: Option<&str>,
+    cwd: &Path,
+    grouping: &Grouping,
+    orgs: &mut OrgCache,
+) -> Result<Option<String>> {
+    match resolve_room(explicit, cwd, grouping, orgs)? {
+        CurrentRoom::Named(g) => Ok(Some(g)),
+        CurrentRoom::Ungrouped => Ok(None),
+        CurrentRoom::NoneSelected => bail!(
             "cwd {} matches no group and its repo has no origin remote; \
              add a prefix for it to groups.toml or pass --group",
             cwd.display()
@@ -425,6 +451,58 @@ mod tests {
             &mut orgs(fake_org)
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_chat_pane_opens_with_no_room_where_a_command_would_be_refused() {
+        // The same cwd `ungrouped_cwd_outside_a_repo_is_refused_not_defaulted`
+        // rejects. A pane can offer a picker there; a one-shot command cannot.
+        let room = resolve_room(
+            None,
+            Path::new("/tmp/scratch"),
+            &active(),
+            &mut orgs(no_org),
+        )
+        .unwrap();
+        assert_eq!(room, CurrentRoom::NoneSelected);
+    }
+
+    #[test]
+    fn no_config_and_no_repo_is_the_shared_room_not_an_absent_one() {
+        let room = resolve_room(
+            None,
+            Path::new("/tmp/scratch"),
+            &Grouping::Inactive,
+            &mut orgs(no_org),
+        )
+        .unwrap();
+        assert_eq!(room, CurrentRoom::Ungrouped);
+    }
+
+    #[test]
+    fn a_broken_config_is_refused_a_room_even_for_a_pane() {
+        // `groups::rooms` lists nothing under `Broken`, so the picker this
+        // would open could only offer rooms swept off disk — every
+        // company's — from a config we could not parse.
+        assert!(resolve_room(
+            None,
+            Path::new("/w/alare"),
+            &Grouping::Broken("bad".into()),
+            &mut orgs(fake_org)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_explicit_group_names_the_room_for_a_pane_too() {
+        let room = resolve_room(
+            Some("acme"),
+            Path::new("/tmp/scratch"),
+            &active(),
+            &mut orgs(no_org),
+        )
+        .unwrap();
+        assert_eq!(room, CurrentRoom::Named("acme".into()));
     }
 
     fn agents() -> Vec<AgentInfo> {

@@ -1,12 +1,72 @@
+use crate::groups::{CurrentRoom, Grouping, Room};
 use crate::herd::{AgentInfo, HerdControl, RealHerd};
 use crate::log_store::{self, Message};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
+
+/// One row of the room picker, built once when the picker opens.
+///
+/// Everything a row displays is settled here rather than at draw time: the
+/// unread dot would otherwise stat a file on every keystroke, and `sources`
+/// would be a second derivation of the provenance `Room` already sorted by
+/// — the drift that `Room::sources` exists to make impossible.
+pub struct PickerRow {
+    pub room: CurrentRoom,
+    pub agents: usize,
+    /// `Room::sources` labels, primary first, joined for display.
+    pub sources: String,
+    /// The room's `room.jsonl` has grown since this pane started. Never set
+    /// for the room being viewed, whose log grows past its seed as you read.
+    pub unread: bool,
+}
+
+/// The modal room list. Its presence is the pane's only mode: `handle_key`
+/// returns early into `handle_picker_key` while it is `Some`.
+pub struct PickerState {
+    /// Rebuilt on every open, `herdr agent list` subprocess included. It
+    /// runs on a human keystroke, so the cost is invisible and the list is
+    /// fresh at the only moment anyone reads it.
+    pub rows: Vec<PickerRow>,
+    /// Case-insensitive substring, not prefix: group names here share stems
+    /// and hyphens, so `scuttle` has to find `herdr-scuttlebutt`.
+    pub filter: String,
+    /// Index into the *filtered* rows. Every mutation of `filter` resets it,
+    /// so it can never point past a narrowed list or at a row the human did
+    /// not put the cursor on.
+    pub cursor: usize,
+}
+
+impl PickerState {
+    fn matches(&self) -> Vec<&PickerRow> {
+        let needle = self.filter.to_lowercase();
+        self.rows
+            .iter()
+            .filter(|r| r.room.label().to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    fn selected(&self) -> Option<CurrentRoom> {
+        self.matches().get(self.cursor).map(|r| r.room.clone())
+    }
+}
+
+/// What a keystroke asks the run loop to do. The picker's work — listing
+/// agents, reading another room's log — is IO that `handle_key` cannot do
+/// and that tests should not need a terminal for, so keys name the action
+/// and `run` performs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Post(String),
+    OpenPicker,
+    Switch(CurrentRoom),
+}
 
 #[derive(Default)]
 pub struct App {
@@ -21,21 +81,48 @@ pub struct App {
     /// Message-pane title, always naming the resolved group so the human
     /// can never mistake which room's input line they are typing into.
     pub title: String,
+    /// The room being viewed, and the one a post goes to.
+    pub room: CurrentRoom,
+    /// The room this pane opened in, `--group` included. Never recomputed
+    /// from the live cwd: a pane opened with `--group` would then be
+    /// permanently "away" from a home it is sitting in, inverting the
+    /// away-from-home marker on the input border.
+    pub home: CurrentRoom,
+    /// `room`'s directory, `None` while no room is selected.
+    pub dir: Option<PathBuf>,
+    pub picker: Option<PickerState>,
+    /// Unsent input per room, stashed on switch-out and restored on
+    /// switch-in. Without it a draft either follows you into the next room
+    /// or is silently dropped.
+    pub drafts: HashMap<CurrentRoom, String>,
+    /// `room.jsonl` length per room when this pane started, refreshed for a
+    /// room as you leave it. An unread dot is this compared against the
+    /// file's length now, so it means "arrived while this pane has been
+    /// open" rather than "history exists".
+    pub unread_seeds: HashMap<CurrentRoom, u64>,
 }
 
-pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
+pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
+    // The pane's one mode check. A branch per key would leave whichever key
+    // was added next routing into `app.input` behind an open modal.
+    if app.picker.is_some() {
+        return handle_picker_key(app, code, modifiers);
+    }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
             app.quit = true;
             None
         }
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => Some(Action::OpenPicker),
         (KeyCode::Enter, _) => {
-            if app.input.trim().is_empty() {
+            // Nowhere to post to, and clearing the input would discard what
+            // was typed with nothing written anywhere.
+            if app.room.selected().is_none() || app.input.trim().is_empty() {
                 None
             } else {
                 let text = std::mem::take(&mut app.input);
                 app.scroll_from_bottom = 0;
-                Some(text)
+                Some(Action::Post(text))
             }
         }
         (KeyCode::Backspace, _) => {
@@ -55,6 +142,52 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Opti
             None
         }
         _ => None,
+    }
+}
+
+/// Keys while the room picker is open. `Esc` closes the modal instead of
+/// quitting the pane — safe only because the modal is on screen; an
+/// unconditional quit would train people to lose the pane.
+fn handle_picker_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
+    match (code, modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            app.quit = true;
+            None
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+            app.picker = None;
+            None
+        }
+        (KeyCode::Enter, _) => {
+            // A filter matching nothing leaves no room to select; the modal
+            // stays open rather than closing onto an unchanged pane.
+            let chosen = app.picker.as_ref()?.selected()?;
+            app.picker = None;
+            Some(Action::Switch(chosen))
+        }
+        _ => {
+            let picker = app.picker.as_mut()?;
+            match (code, modifiers) {
+                (KeyCode::Up, _) => picker.cursor = picker.cursor.saturating_sub(1),
+                (KeyCode::Down, _) => {
+                    picker.cursor =
+                        (picker.cursor + 1).min(picker.matches().len().saturating_sub(1))
+                }
+                (KeyCode::Backspace, _) => {
+                    picker.filter.pop();
+                    picker.cursor = 0;
+                }
+                (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    picker.filter.push(c);
+                    // Widening or narrowing changes which room each index
+                    // names, so holding the old index would move the cursor
+                    // to a room nobody pointed it at.
+                    picker.cursor = 0;
+                }
+                _ => {}
+            }
+            None
+        }
     }
 }
 
@@ -174,7 +307,9 @@ fn scroll_start(total_rows: usize, visible_rows: usize, scroll_from_bottom: usiz
 fn title_for(resolved: Option<&str>) -> String {
     match resolved {
         Some(g) => format!(" scuttlebutt · {g} "),
-        None => " scuttlebutt ".to_string(),
+        // Parenthesised because `valid_group_name` forbids parentheses, so
+        // it can never collide with a real group's name.
+        None => " scuttlebutt · (ungrouped) ".to_string(),
     }
 }
 
@@ -199,44 +334,195 @@ fn scoped_members(
     )
 }
 
+/// A room's directory under `session_dir`. The ungrouped room is
+/// `session_dir` itself, mirroring `paths::room_dir`.
+fn room_path(session_dir: &Path, room: &CurrentRoom) -> Option<PathBuf> {
+    match room {
+        CurrentRoom::Named(n) => Some(session_dir.join(n)),
+        CurrentRoom::Ungrouped => Some(session_dir.to_path_buf()),
+        CurrentRoom::NoneSelected => None,
+    }
+}
+
+/// Bytes in a room's `room.jsonl`, 0 if it has none.
+///
+/// Length, never `log_store::last_id`: that answers the same question by
+/// parsing the whole file — 292 KB for one real room — and the unread check
+/// runs for every room each time the picker opens.
+fn room_len(session_dir: &Path, room: &CurrentRoom) -> u64 {
+    room_path(session_dir, room)
+        .and_then(|d| std::fs::metadata(d.join("room.jsonl")).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Every room's log length at pane start, which is what an unread dot is
+/// measured against. Swept straight off disk: this runs before the first
+/// draw, and `groups::rooms` would spend a `herdr agent list` subprocess to
+/// answer a question about file sizes.
+///
+/// A room created after this sweep has no seed and reads as 0, so it is
+/// dotted — correct, since everything in it did arrive while the pane was
+/// open.
+fn seed_unread(session_dir: &Path) -> HashMap<CurrentRoom, u64> {
+    let mut seeds = HashMap::new();
+    seeds.insert(
+        CurrentRoom::Ungrouped,
+        room_len(session_dir, &CurrentRoom::Ungrouped),
+    );
+    if let Ok(entries) = std::fs::read_dir(session_dir) {
+        for e in entries.flatten() {
+            if let Ok(name) = e.file_name().into_string() {
+                let room = CurrentRoom::Named(name);
+                let len = room_len(session_dir, &room);
+                seeds.insert(room, len);
+            }
+        }
+    }
+    seeds
+}
+
+/// Builds the modal's rows. Called on every open so the list — live agent
+/// counts included — is current at the moment someone reads it.
+fn open_picker(
+    app: &App,
+    session_dir: &Path,
+    herd: &dyn HerdControl,
+    grouping: &Grouping,
+    orgs: &mut crate::git_org::OrgCache,
+) -> PickerState {
+    let agents = herd.list_agents().unwrap_or_default();
+    let rooms: Vec<Room> = crate::groups::rooms(grouping, &agents, session_dir, orgs);
+    let rows = rooms
+        .iter()
+        .map(|r| {
+            let room = CurrentRoom::from(r);
+            PickerRow {
+                agents: r.agents,
+                // The one derivation of provenance, shared with the order
+                // `rooms` already sorted these into.
+                sources: r
+                    .sources()
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                unread: room != app.room
+                    && room_len(session_dir, &room)
+                        > app.unread_seeds.get(&room).copied().unwrap_or(0),
+                room,
+            }
+        })
+        .collect();
+    PickerState {
+        rows,
+        filter: String::new(),
+        cursor: 0,
+    }
+}
+
+/// Points the pane at `target`, moving everything that is scoped to a room.
+///
+/// Members are refreshed here rather than left to the 3-second tick, which
+/// would otherwise leave one room's agent names beside another room's title
+/// — the leak `scoped_members` exists to prevent. The caller resets its
+/// refresh timer for the same reason.
+fn switch_room(
+    app: &mut App,
+    target: CurrentRoom,
+    session_dir: &Path,
+    herd: &dyn HerdControl,
+    grouping: &Grouping,
+    orgs: &mut crate::git_org::OrgCache,
+) -> Result<()> {
+    if target == app.room {
+        return Ok(());
+    }
+    if app.room.selected().is_some() {
+        app.drafts
+            .insert(app.room.clone(), std::mem::take(&mut app.input));
+        // Re-seed the room being left so visiting it clears its dot; its log
+        // has been read up to here.
+        let len = room_len(session_dir, &app.room);
+        app.unread_seeds.insert(app.room.clone(), len);
+    }
+    app.input = app.drafts.remove(&target).unwrap_or_default();
+    app.scroll_from_bottom = 0;
+    // A write failure belonged to the room it was attempted in.
+    app.post_error = None;
+
+    match target.selected() {
+        Some(group) => {
+            let dir = crate::paths::room_dir(group)?;
+            // A clean read of the whole file, never `should_reseed`: that
+            // asks whether *this* room's log was truncated, and it would be
+            // comparing this room's cursor against another room's last id.
+            app.messages = log_store::read_since(&dir, 0)?;
+            app.members = scoped_members(herd, group, grouping, orgs).unwrap_or_default();
+            app.title = title_for(group);
+            app.dir = Some(dir);
+        }
+        None => {
+            // `scoped_members(None, ..)` is the *ungrouped* room's roster,
+            // so it is not the answer here: no room is selected, and nobody
+            // is in one.
+            app.messages = Vec::new();
+            app.members = Vec::new();
+            app.title = " scuttlebutt · no room selected ".to_string();
+            app.dir = None;
+        }
+    }
+    app.room = target;
+    Ok(())
+}
+
 pub fn run(group: Option<&str>) -> Result<()> {
     let grouping = crate::groups::load(&crate::paths::base_dir()?);
     let mut orgs = crate::git_org::OrgCache::default();
-    let resolved =
-        crate::cli::resolve_group(group, &std::env::current_dir()?, &grouping, &mut orgs)?;
-    let dir = crate::paths::room_dir(resolved.as_deref())?;
-    let title = title_for(resolved.as_deref());
+    // Not `resolve_group`: an active config matching nothing opens the pane
+    // with no room selected and the picker up, which is the one state where
+    // a switcher is the whole point. `Broken` still bails inside.
+    let home = crate::cli::resolve_room(group, &std::env::current_dir()?, &grouping, &mut orgs)?;
+    let session_dir = crate::paths::session_dir()?;
     let herd = RealHerd;
     let mut app = App {
-        messages: log_store::read_since(&dir, 0)?,
-        members: scoped_members(&herd, resolved.as_deref(), &grouping, &mut orgs)
-            .unwrap_or_default(),
-        title,
+        unread_seeds: seed_unread(&session_dir),
+        // Seeded by the switch below, which is the same code path every
+        // later switch takes.
+        title: " scuttlebutt · no room selected ".to_string(),
+        home: home.clone(),
         ..App::default()
     };
+    switch_room(&mut app, home, &session_dir, &herd, &grouping, &mut orgs)?;
+    if app.room.selected().is_none() {
+        app.picker = Some(open_picker(&app, &session_dir, &herd, &grouping, &mut orgs));
+    }
 
     let mut terminal = ratatui::init();
     let mut last_member_refresh = std::time::Instant::now();
     let result = (|| -> Result<()> {
         while !app.quit {
             // tail new messages every loop; members on a slow tick
-            let last = app.messages.last().map(|m| m.id).unwrap_or(0);
-            let file_last = log_store::last_id(&dir)?;
-            if should_reseed(last, file_last) {
-                // room.jsonl was truncated or replaced (ids restarted lower
-                // than our cursor); discard the stale in-memory tail and
-                // re-seed from the start of the file instead of filtering
-                // every future message out forever.
-                app.messages = log_store::read_since(&dir, 0)?;
-            } else {
-                let mut fresh = log_store::read_since(&dir, last)?;
-                app.messages.append(&mut fresh);
-            }
-            if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
-                if let Some(m) = scoped_members(&herd, resolved.as_deref(), &grouping, &mut orgs) {
-                    app.members = m;
+            if let Some(dir) = app.dir.clone() {
+                let last = app.messages.last().map(|m| m.id).unwrap_or(0);
+                let file_last = log_store::last_id(&dir)?;
+                if should_reseed(last, file_last) {
+                    // room.jsonl was truncated or replaced (ids restarted
+                    // lower than our cursor); discard the stale in-memory
+                    // tail and re-seed from the start of the file instead of
+                    // filtering every future message out forever.
+                    app.messages = log_store::read_since(&dir, 0)?;
+                } else {
+                    let mut fresh = log_store::read_since(&dir, last)?;
+                    app.messages.append(&mut fresh);
                 }
-                last_member_refresh = std::time::Instant::now();
+                if last_member_refresh.elapsed() > std::time::Duration::from_secs(3) {
+                    let group = app.room.selected().flatten().map(str::to_string);
+                    if let Some(m) = scoped_members(&herd, group.as_deref(), &grouping, &mut orgs) {
+                        app.members = m;
+                    }
+                    last_member_refresh = std::time::Instant::now();
+                }
             }
 
             terminal.draw(|f| draw(f, &app))?;
@@ -244,11 +530,44 @@ pub fn run(group: Option<&str>) -> Result<()> {
             if event::poll(std::time::Duration::from_millis(250))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        if let Some(text) = handle_key(&mut app, key.code, key.modifiers) {
-                            app.post_error = match log_store::append(&dir, "human", &text) {
-                                Ok(_) => None,
-                                Err(e) => Some(e.to_string()),
-                            };
+                        match handle_key(&mut app, key.code, key.modifiers) {
+                            Some(Action::Post(text)) => {
+                                // `handle_key` only returns this with a room
+                                // selected, so a pane with none never reaches
+                                // an append with no directory.
+                                if let Some(dir) = &app.dir {
+                                    app.post_error = match log_store::append(dir, "human", &text) {
+                                        Ok(_) => None,
+                                        Err(e) => Some(e.to_string()),
+                                    };
+                                }
+                            }
+                            Some(Action::OpenPicker) => {
+                                app.picker = Some(open_picker(
+                                    &app,
+                                    &session_dir,
+                                    &herd,
+                                    &grouping,
+                                    &mut orgs,
+                                ));
+                            }
+                            Some(Action::Switch(target)) => {
+                                switch_room(
+                                    &mut app,
+                                    target,
+                                    &session_dir,
+                                    &herd,
+                                    &grouping,
+                                    &mut orgs,
+                                )?;
+                                // `switch_room` just refreshed the roster;
+                                // without this the tick could fire again
+                                // immediately and is wasted work, and a
+                                // failed listing would blank the pane it
+                                // just filled.
+                                last_member_refresh = std::time::Instant::now();
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -316,14 +635,94 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         top[1],
     );
 
-    let input_title = match &app.post_error {
-        Some(e) => format!(" post failed: {e} "),
-        None => " message (Enter to send, Esc to quit) ".to_string(),
+    // The input line is where a post is committed, so it carries the
+    // away-from-home marker: a colour *and* the room's name, because a
+    // colour alone says nothing about which room you are about to post in.
+    let away = app.room.selected().is_some() && app.room != app.home;
+    let (input_title, border) = match (&app.post_error, app.room.selected().is_some(), away) {
+        (Some(e), _, _) => (format!(" post failed: {e} "), Color::Red),
+        (None, false, _) => (
+            " no room selected — Ctrl-K to pick a room ".to_string(),
+            Color::DarkGray,
+        ),
+        (None, true, true) => (
+            format!(
+                " message → {} (Enter to send, Ctrl-K to switch) ",
+                app.room.label()
+            ),
+            Color::Yellow,
+        ),
+        (None, true, false) => (
+            " message (Enter to send, Ctrl-K rooms, Esc to quit) ".to_string(),
+            Color::Reset,
+        ),
     };
     f.render_widget(
-        Paragraph::new(app.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(input_title)),
+        Paragraph::new(app.input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .title(input_title),
+        ),
         outer[1],
+    );
+
+    if let Some(picker) = &app.picker {
+        draw_picker(f, picker);
+    }
+}
+
+/// The modal room list, drawn last and over a cleared rectangle so the chat
+/// behind it cannot bleed through and be mistaken for a row.
+fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
+    let area = f.area();
+    // `.min(area.*)` is not redundant with the subtraction: a pane only a
+    // few cells tall subtracts to 0 and the lower clamp bound pushes it back
+    // above the buffer.
+    let w = area.width.saturating_sub(8).clamp(1, 64).min(area.width);
+    let h = area.height.saturating_sub(4).clamp(3, 16).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    let matches = picker.matches();
+    let items: Vec<ListItem> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let row = if i == picker.cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(
+                Line::from(vec![
+                    Span::styled(
+                        if r.unread { "● " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{:<20}", r.room.label()),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("{} agents · {}", r.agents, r.sources)),
+                ])
+                .style(row),
+            )
+        })
+        .collect();
+    let title = format!(" rooms · filter: {}_ ", picker.filter);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        ),
+        rect,
     );
 }
 
@@ -332,8 +731,14 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
 
+    /// A pane in the ungrouped room. Explicit because `App::default()` is a
+    /// pane with *no* room selected, where posting is disabled by design.
     fn app() -> App {
-        App::default()
+        App {
+            room: CurrentRoom::Ungrouped,
+            home: CurrentRoom::Ungrouped,
+            ..App::default()
+        }
     }
 
     #[test]
@@ -349,7 +754,7 @@ mod tests {
         let mut a = app();
         a.input = "hello".into();
         let submitted = handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(submitted.as_deref(), Some("hello"));
+        assert_eq!(submitted, Some(Action::Post("hello".into())));
         assert_eq!(a.input, "");
     }
 
@@ -546,10 +951,17 @@ mod tests {
     }
 
     #[test]
-    fn title_for_ungrouped_has_no_stray_group_label() {
-        let title = title_for(None);
-        assert!(!title.contains("·"));
-        assert!(title.contains("scuttlebutt"));
+    fn title_for_names_the_ungrouped_room() {
+        // Every room is named in the title, the ungrouped one included; a
+        // bare " scuttlebutt " left the one room with no label on screen.
+        assert_eq!(title_for(None), " scuttlebutt · (ungrouped) ");
+    }
+
+    #[test]
+    fn the_ungrouped_label_can_never_collide_with_a_real_group() {
+        assert!(!crate::groups::valid_group_name(
+            CurrentRoom::Ungrouped.label()
+        ));
     }
 
     /// Renders `draw` into an off-screen terminal and returns the rows as
@@ -676,6 +1088,517 @@ mod tests {
         let rows = wrap_text(text, 8, 8);
         let rejoined: String = rows.concat();
         assert_eq!(rejoined, text);
+    }
+
+    // --- picker ---
+
+    fn picker_of(names: &[&str]) -> PickerState {
+        PickerState {
+            rows: names
+                .iter()
+                .map(|n| PickerRow {
+                    room: CurrentRoom::Named((*n).into()),
+                    agents: 0,
+                    sources: "config".into(),
+                    unread: false,
+                })
+                .collect(),
+            filter: String::new(),
+            cursor: 0,
+        }
+    }
+
+    #[test]
+    fn ctrl_k_asks_to_open_the_picker() {
+        let mut a = app();
+        assert_eq!(
+            handle_key(&mut a, KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Some(Action::OpenPicker)
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_picker_instead_of_quitting_the_pane() {
+        // An unconditional quit here would train people to lose the pane.
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare"]));
+        handle_key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(a.picker.is_none());
+        assert!(!a.quit);
+        // and only then does Esc quit
+        handle_key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn typing_behind_an_open_picker_never_reaches_the_message_input() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare"]));
+        handle_key(&mut a, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(a.input, "");
+        assert_eq!(a.picker.as_ref().unwrap().filter, "h");
+    }
+
+    #[test]
+    fn the_filter_matches_a_substring_not_a_prefix() {
+        // Group names here share stems and hyphens, so prefix matching would
+        // make the longest names the hardest to reach.
+        let mut a = app();
+        a.picker = Some(picker_of(&["herdr-scuttlebutt", "alare"]));
+        for c in "scuttle".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let p = a.picker.as_ref().unwrap();
+        let shown: Vec<&str> = p.matches().iter().map(|r| r.room.label()).collect();
+        assert_eq!(shown, vec!["herdr-scuttlebutt"]);
+    }
+
+    #[test]
+    fn the_filter_ignores_case_in_both_directions() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["Alare"]));
+        for c in "aLaR".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.picker.as_ref().unwrap().matches().len(), 1);
+    }
+
+    #[test]
+    fn enter_selects_the_room_under_the_cursor() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["acme", "alare"]));
+        handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Switch(CurrentRoom::Named("alare".into())))
+        );
+        assert!(a.picker.is_none());
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends_of_the_list() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["acme", "alare"]));
+        for _ in 0..5 {
+            handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(a.picker.as_ref().unwrap().cursor, 1);
+        for _ in 0..5 {
+            handle_key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(a.picker.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn narrowing_the_filter_cannot_leave_the_cursor_on_a_room_nobody_chose() {
+        // The bug this prevents: cursor on row 2, type until only row 0
+        // survives, press Enter, and switch to whatever the stale index now
+        // names — or index past the list entirely.
+        let mut a = app();
+        a.picker = Some(picker_of(&["acme", "alare", "zebra"]));
+        handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Switch(CurrentRoom::Named("acme".into())))
+        );
+    }
+
+    #[test]
+    fn enter_on_a_filter_that_matches_nothing_leaves_the_picker_open() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare"]));
+        for c in "zzz".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(a.picker.is_some());
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn backspace_widens_the_filter_again() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare", "acme"]));
+        for c in "al".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.picker.as_ref().unwrap().matches().len(), 1);
+        handle_key(&mut a, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(a.picker.as_ref().unwrap().matches().len(), 2);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_inside_the_picker() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare"]));
+        handle_key(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(a.quit);
+    }
+
+    // --- no room selected ---
+
+    #[test]
+    fn a_pane_with_no_room_selected_cannot_post() {
+        // Not merely "nothing is written": the draft must survive, because
+        // clearing the input would discard it with nothing written anywhere.
+        let mut a = App {
+            input: "hello".into(),
+            ..App::default()
+        };
+        assert_eq!(handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(a.input, "hello");
+    }
+
+    #[test]
+    fn a_pane_with_no_room_selected_says_so_and_offers_the_picker() {
+        let a = App {
+            title: " scuttlebutt · no room selected ".into(),
+            ..App::default()
+        };
+        let screen = render(&a, 60, 12).join("\n");
+        assert!(screen.contains("no room selected"), "{screen}");
+        assert!(screen.contains("Ctrl-K"), "{screen}");
+    }
+
+    #[test]
+    fn away_from_home_the_input_line_names_the_room_it_would_post_to() {
+        let a = App {
+            room: CurrentRoom::Named("acme".into()),
+            home: CurrentRoom::Named("alare".into()),
+            ..App::default()
+        };
+        let screen = render(&a, 60, 12).join("\n");
+        assert!(screen.contains("acme"), "{screen}");
+    }
+
+    #[test]
+    fn at_home_the_input_line_carries_no_room_marker() {
+        let a = App {
+            room: CurrentRoom::Named("alare".into()),
+            home: CurrentRoom::Named("alare".into()),
+            ..App::default()
+        };
+        assert!(!render(&a, 60, 12).join("\n").contains("→"));
+    }
+
+    #[test]
+    fn the_picker_renders_over_the_chat_behind_it() {
+        let mut a = app();
+        a.messages = (0..8)
+            .map(|i| msg("bob", &format!("chatter number {i} in the room")))
+            .collect();
+        a.picker = Some(PickerState {
+            rows: vec![PickerRow {
+                room: CurrentRoom::Named("alare".into()),
+                agents: 2,
+                sources: "live agents, config".into(),
+                unread: true,
+            }],
+            filter: String::new(),
+            cursor: 0,
+        });
+        let screen = render(&a, 90, 14).join("\n");
+        assert!(screen.contains("alare"), "{screen}");
+        assert!(screen.contains("2 agents"), "{screen}");
+        assert!(screen.contains("live agents, config"), "{screen}");
+        assert!(screen.contains("●"), "no unread dot:\n{screen}");
+    }
+
+    // --- switch mechanics ---
+
+    /// A scratch session dir wired up as the process's `SCUTTLEBUTT_DIR`, so
+    /// `switch_room` resolves rooms through `paths::room_dir` exactly as it
+    /// does in a real pane.
+    fn scratch() -> (
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+        PathBuf,
+    ) {
+        let env = crate::paths::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SCUTTLEBUTT_DIR", dir.path());
+        std::env::set_var("HERDR_SOCKET_PATH", "/tmp/switch-test.sock");
+        let session = crate::paths::session_dir().unwrap();
+        (dir, env, session)
+    }
+
+    fn switch(
+        app: &mut App,
+        target: CurrentRoom,
+        session: &Path,
+        herd: &dyn HerdControl,
+    ) -> Result<()> {
+        switch_room(
+            app,
+            target,
+            session,
+            herd,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        )
+    }
+
+    fn named(n: &str) -> CurrentRoom {
+        CurrentRoom::Named(n.into())
+    }
+
+    #[test]
+    fn switching_shows_the_target_rooms_messages_and_title() {
+        let (_d, _env, session) = scratch();
+        log_store::append(
+            &crate::paths::room_dir(Some("acme")).unwrap(),
+            "bob",
+            "in acme",
+        )
+        .unwrap();
+        let mut a = app();
+        a.messages = vec![msg("bob", "in the old room")];
+        switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
+
+        let texts: Vec<&str> = a.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["in acme"]);
+        assert_eq!(a.title, " scuttlebutt · acme ");
+        assert_eq!(a.dir, Some(crate::paths::room_dir(Some("acme")).unwrap()));
+    }
+
+    #[test]
+    fn a_draft_waits_in_the_room_it_was_typed_in() {
+        // Both failure modes at once: a draft following you into another
+        // room, and a draft silently discarded on the way out.
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(vec![], false);
+        let mut a = app();
+        a.room = named("alare");
+        a.input = "half-written note for alare".into();
+
+        switch(&mut a, named("acme"), &session, &herd).unwrap();
+        assert_eq!(a.input, "");
+        a.input = "something for acme".into();
+
+        switch(&mut a, named("alare"), &session, &herd).unwrap();
+        assert_eq!(a.input, "half-written note for alare");
+        switch(&mut a, named("acme"), &session, &herd).unwrap();
+        assert_eq!(a.input, "something for acme");
+    }
+
+    #[test]
+    fn switching_returns_to_the_newest_message() {
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.scroll_from_bottom = 7;
+        switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
+        assert_eq!(a.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn a_post_failure_does_not_follow_you_into_the_next_room() {
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.post_error = Some("disk on fire".into());
+        switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
+        assert_eq!(a.post_error, None);
+    }
+
+    #[test]
+    fn the_roster_changes_with_the_room_rather_than_on_the_next_tick() {
+        // The 3-second tick would otherwise leave one room's agent names
+        // beside another room's title.
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(
+            vec![at("issue-590", "/w/alare/api"), at("acme-x", "/w/acme")],
+            false,
+        );
+        let mut a = app();
+        a.members = vec![at("stale", "/w/alare/api")];
+        switch_room(
+            &mut a,
+            named("acme"),
+            &session,
+            &herd,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(fake_org),
+        )
+        .unwrap();
+        let names: Vec<&str> = a.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["acme-x"]);
+    }
+
+    #[test]
+    fn an_unresolvable_pane_can_pick_its_way_into_a_room() {
+        // The state that is dead today: no room selected, nothing to post
+        // to, and the picker as the only way out.
+        let (_d, _env, session) = scratch();
+        let mut a = App::default();
+        assert!(a.room.selected().is_none());
+        assert_eq!(handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE), None);
+
+        switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
+        assert_eq!(a.room, named("acme"));
+        a.input = "now I can post".into();
+        assert_eq!(
+            handle_key(&mut a, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::Post("now I can post".into()))
+        );
+    }
+
+    #[test]
+    fn leaving_a_room_for_no_room_empties_the_pane_rather_than_showing_the_shared_room() {
+        // `scoped_members(None, ..)` is the *ungrouped* room's roster, so
+        // passing the absence straight through would fill a roomless pane
+        // with every agent outside a repository.
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(vec![at("nowhere", "/elsewhere")], false);
+        let mut a = app();
+        a.room = named("acme");
+        a.messages = vec![msg("bob", "acme chatter")];
+        a.members = vec![at("acme-x", "/w/acme")];
+        switch(&mut a, CurrentRoom::NoneSelected, &session, &herd).unwrap();
+        assert!(a.messages.is_empty());
+        assert!(a.members.is_empty());
+        assert_eq!(a.dir, None);
+        assert_eq!(a.title, " scuttlebutt · no room selected ");
+    }
+
+    // --- unread dots ---
+
+    fn post_to(room: &str, text: &str) {
+        log_store::append(&crate::paths::room_dir(Some(room)).unwrap(), "bob", text).unwrap();
+    }
+
+    #[test]
+    fn a_room_that_grew_since_the_pane_opened_is_dotted() {
+        let (_d, _env, session) = scratch();
+        post_to("acme", "history from before");
+        let mut a = app();
+        a.unread_seeds = seed_unread(&session);
+        post_to("acme", "arrived while the pane was open");
+
+        let p = open_picker(
+            &a,
+            &session,
+            &FakeHerd(vec![], false),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(acme.unread, "acme grew since the seed and is not dotted");
+    }
+
+    #[test]
+    fn history_that_predates_the_pane_is_not_unread() {
+        let (_d, _env, session) = scratch();
+        post_to("acme", "history from before");
+        let mut a = app();
+        a.unread_seeds = seed_unread(&session);
+        let p = open_picker(
+            &a,
+            &session,
+            &FakeHerd(vec![], false),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(!acme.unread, "a dot here would mean 'history exists'");
+    }
+
+    #[test]
+    fn the_room_being_read_is_never_dotted() {
+        // Its log grows past its seed as you read it.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.unread_seeds = seed_unread(&session);
+        a.room = named("acme");
+        post_to("acme", "a message you are looking at");
+        let p = open_picker(
+            &a,
+            &session,
+            &FakeHerd(vec![], false),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(!acme.unread);
+    }
+
+    #[test]
+    fn visiting_a_room_clears_its_dot() {
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(vec![], false);
+        let mut a = app();
+        a.unread_seeds = seed_unread(&session);
+        a.room = named("alare");
+        post_to("acme", "unread while you were in alare");
+
+        switch(&mut a, named("acme"), &session, &herd).unwrap();
+        switch(&mut a, named("alare"), &session, &herd).unwrap();
+
+        let p = open_picker(
+            &a,
+            &session,
+            &herd,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(!acme.unread, "acme was visited and should be caught up");
+    }
+
+    #[test]
+    fn a_room_created_after_the_pane_opened_is_dotted() {
+        let (_d, _env, session) = scratch();
+        let a = App {
+            unread_seeds: seed_unread(&session),
+            room: named("alare"),
+            ..App::default()
+        };
+        post_to("acme", "a room that did not exist at pane start");
+        let p = open_picker(
+            &a,
+            &session,
+            &FakeHerd(vec![], false),
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(no_org),
+        );
+        let acme = p.rows.iter().find(|r| r.room == named("acme")).unwrap();
+        assert!(acme.unread);
+    }
+
+    #[test]
+    fn picker_rows_take_their_provenance_from_the_order_they_are_listed_in() {
+        // One derivation, shared with the sort: a row labelled "config"
+        // sitting above a row with agents in it is the drift `Room::sources`
+        // exists to prevent.
+        let (_d, _env, session) = scratch();
+        post_to("acme", "history only");
+        let herd = FakeHerd(vec![at("alare-1", "/w/alare/api")], false);
+        let a = App::default();
+        let p = open_picker(
+            &a,
+            &session,
+            &herd,
+            &crate::groups::Grouping::Inactive,
+            &mut orgs(fake_org),
+        );
+        let labelled: Vec<(&str, &str)> = p
+            .rows
+            .iter()
+            .map(|r| (r.room.label(), r.sources.as_str()))
+            .collect();
+        assert_eq!(
+            labelled,
+            vec![("alare", "live agents"), ("acme", "history")]
+        );
+    }
+
+    #[test]
+    fn the_picker_survives_a_pane_too_small_to_hold_it() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["alare"]));
+        for (w, h) in [(1, 1), (4, 2), (10, 3), (0, 0)] {
+            render(&a, w, h);
+        }
     }
 
     #[test]
