@@ -307,8 +307,10 @@ fn has_history(dir: &Path) -> bool {
 }
 
 /// The accumulating entry for one room name, created blank on first touch.
-/// Every source goes through this, which is what makes the union a dedup
-/// rather than three lists concatenated.
+/// Only the session-directory sweep reaches for this now — the config and the
+/// live roster are already deduped against each other by `memberships`, and
+/// this is what folds the third source into that same map rather than
+/// concatenating a second list onto it.
 fn entry_for(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -> &mut Room {
     found.entry(name.clone()).or_insert(Room {
         name,
@@ -318,48 +320,117 @@ fn entry_for(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -
     })
 }
 
+/// One room's membership as the config and the live roster see it. These are
+/// the two sources `rooms` and the `groups` listing both derive from, and
+/// deriving them twice is what let the two commands disagree about which
+/// rooms exist. The session-directory sweep is `rooms`' third source and is
+/// deliberately not here: a room surviving only as history has no membership
+/// to hold, and sweeping the disk on the `groups` path would mean listing
+/// rooms the config never named.
+#[derive(Debug, Default)]
+pub struct Membership<'a> {
+    /// Named by `groups.toml`.
+    pub configured: bool,
+    /// Live agents whose cwd resolves here, in the order the roster gave them.
+    /// `rooms` wants only the count; the `groups` listing prints each one.
+    pub agents: Vec<&'a crate::herd::AgentInfo>,
+}
+
+/// Every room the config names or a live agent stands in, keyed by group name
+/// with `None` for the ungrouped room. The `None` key holds agents that
+/// resolve nowhere under *any* grouping — that bucket means "receiving
+/// nothing" under an active config and "the single shared room" without one,
+/// and the two callers want it read differently, so the split stays with
+/// them.
+///
+/// That makes the `None` key a real entry every caller must decide about,
+/// where `rooms` used to simply never construct one under an active config.
+/// Dropping it is now the caller's job, not this function's: `rooms` filters
+/// the entry out, the `groups` listing prints it as a diagnostic, and a third
+/// caller that forgets would offer a room whose members can never be reached
+/// in it.
+///
+/// `None` for the whole map under `Broken`, and the two callers lean on that
+/// differently. `rooms` has no other refusal: it returns on this `None`, and
+/// deleting the guard would carry it past the config into the disk sweep,
+/// which never reads the config and would list every company's room. The
+/// `groups` listing refuses `Broken` above with its own message, so the arm
+/// is unreachable from there and is belt and braces behind that early-out.
+///
+/// The two therefore differ on purpose rather than by accident: `rooms` must
+/// return, because falling through reaches a disk sweep that never reads the
+/// config and would list every company's room, while the listing's default
+/// only ever produces an empty section under a message that already said the
+/// config is unreadable. `rooms` fails open where the listing fails closed,
+/// which is why one gets a hard return and the other tolerates a default.
+pub fn memberships<'a>(
+    grouping: &Grouping,
+    agents: &'a [crate::herd::AgentInfo],
+    orgs: &mut crate::git_org::OrgCache,
+) -> Option<BTreeMap<Option<String>, Membership<'a>>> {
+    if matches!(grouping, Grouping::Broken(_)) {
+        return None;
+    }
+    let mut found: BTreeMap<Option<String>, Membership<'a>> = BTreeMap::new();
+    if let Grouping::Active(rules) = grouping {
+        for name in rules.names() {
+            found.entry(Some(name.to_string())).or_default().configured = true;
+        }
+    }
+    for a in agents {
+        found
+            .entry(resolve(Path::new(&a.cwd), grouping, orgs))
+            .or_default()
+            .agents
+            .push(a);
+    }
+    Some(found)
+}
+
 /// Every room this session could open, deduped across the three sources that
 /// know about rooms and genuinely disagree: the config, the live agents, and
 /// the session directory. In a real config `jackdaw` is configured with no
 /// room file and `andybarilla` has 42 KB of history and appears in no config,
 /// so no one source is the list.
 ///
-/// `Broken` yields nothing, mirroring `visible_agents`. The disk sweep below
-/// never consults the config, so enumerating under a config we could not
-/// parse would list every company's room — the outcome this module exists to
-/// prevent.
+/// The first two come from `memberships`, shared with the `groups` listing so
+/// the two commands cannot drift about which rooms exist. The session
+/// directory is this function's own source.
+///
+/// `Broken` yields nothing, mirroring `visible_agents`: `memberships` builds
+/// no union there and this returns on that rather than falling through. The
+/// disk sweep below never consults the config, so reaching it under a config
+/// we could not parse would list every company's room — the outcome this
+/// module exists to prevent.
 pub fn rooms(
     grouping: &Grouping,
     agents: &[crate::herd::AgentInfo],
     session_dir: &Path,
     orgs: &mut crate::git_org::OrgCache,
 ) -> Vec<Room> {
-    if matches!(grouping, Grouping::Broken(_)) {
-        return Vec::new();
-    }
-    let mut found: BTreeMap<Option<String>, Room> = BTreeMap::new();
-
-    if let Grouping::Active(rules) = grouping {
-        for name in rules.names() {
-            entry_for(&mut found, Some(name.to_string())).configured = true;
-        }
-    }
-
-    for a in agents {
-        match resolve(Path::new(&a.cwd), grouping, orgs) {
-            Some(g) => entry_for(&mut found, Some(g)).agents += 1,
-            // Without a config, an agent in no repository belongs to the
-            // single shared room, so it is a member like any other.
-            None if matches!(grouping, Grouping::Inactive) => {
-                entry_for(&mut found, None).agents += 1
-            }
-            // Under a config the same agent is enrolled nowhere, and the
-            // ungrouped room receives nothing. Counting it would conjure a
-            // room out of one stray cwd whose only member can never be
-            // reached in it.
-            None => {}
-        }
-    }
+    let union = match memberships(grouping, agents, orgs) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+    let mut found: BTreeMap<Option<String>, Room> = union
+        .into_iter()
+        // Without a config, an agent in no repository belongs to the single
+        // shared room, so it is a member like any other. Under a config the
+        // same agent is enrolled nowhere and the ungrouped room receives
+        // nothing, so the whole entry goes rather than just its count:
+        // keeping it at zero would still conjure a room out of one stray cwd
+        // whose only member can never be reached in it.
+        .filter(|(name, _)| name.is_some() || matches!(grouping, Grouping::Inactive))
+        .map(|(name, m)| {
+            let room = Room {
+                name: name.clone(),
+                agents: m.agents.len(),
+                configured: m.configured,
+                history: false,
+            };
+            (name, room)
+        })
+        .collect();
 
     if let Ok(entries) = std::fs::read_dir(session_dir) {
         for e in entries.flatten() {

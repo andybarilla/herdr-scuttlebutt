@@ -3,6 +3,7 @@ use crate::groups::{self, CurrentRoom, Grouping};
 use crate::herd::{AgentInfo, HerdControl};
 use crate::log_store::{self, Message};
 use anyhow::{bail, Result};
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Which room this invocation talks to: a configured prefix, else the repo's
@@ -109,77 +110,118 @@ pub fn visible_agents<'a>(
 
 pub fn cmd_groups(herd: &dyn HerdControl) -> Result<()> {
     let grouping = current_grouping()?;
-    if let Grouping::Broken(msg) = &grouping {
-        println!("groups config BROKEN — no agent is enrolled: {msg}");
-        return Ok(());
+    // Not asked for under `Broken`: the listing names no agent there, so a
+    // round trip to herdr could only produce a roster we would not print.
+    let agents = match grouping {
+        Grouping::Broken(_) => Ok(Vec::new()),
+        _ => herd.list_agents().map_err(|e| e.to_string()),
+    };
+    let mut orgs = OrgCache::default();
+    print!(
+        "{}",
+        render_groups(
+            &grouping,
+            agents.as_deref().map_err(String::as_str),
+            &mut orgs
+        )
+    );
+    Ok(())
+}
+
+/// The `groups` listing as text, so every shape of it can be asserted on.
+/// `current_grouping` reads a fixed path and the roster comes from a live
+/// herdr, so the three shapes that carry the most logic — a group named by no
+/// config, agents the config enrolls nowhere, and a herd that will not answer
+/// — are unreachable through `cmd_groups` itself. The real config on this
+/// machine produces none of them.
+///
+/// `agents` carries the listing failure rather than an empty roster because
+/// the two print differently: telling "nobody is enrolled" apart from "I could
+/// not ask" is what this auditing surface is for.
+fn render_groups(
+    grouping: &Grouping,
+    agents: std::result::Result<&[AgentInfo], &str>,
+    orgs: &mut OrgCache,
+) -> String {
+    // Writing to a String cannot fail, hence the discarded results throughout.
+    let mut out = String::new();
+    if let Grouping::Broken(msg) = grouping {
+        let _ = writeln!(out, "groups config BROKEN — no agent is enrolled: {msg}");
+        return out;
     }
-    match &grouping {
-        Grouping::Inactive => {
-            println!("no groups.toml — each agent's group is its repository's origin organization")
-        }
-        _ => println!("groups.toml rules first, then each agent's repository origin"),
-    }
-    let agents = match herd.list_agents() {
+    let _ = match grouping {
+        Grouping::Inactive => writeln!(
+            out,
+            "no groups.toml — each agent's group is its repository's origin organization"
+        ),
+        _ => writeln!(
+            out,
+            "groups.toml rules first, then each agent's repository origin"
+        ),
+    };
+    let agents: &[AgentInfo] = match agents {
         Ok(a) => a,
         Err(e) => {
             // Distinguish "nobody is enrolled" from "I could not ask": this is
             // the auditing surface, and an empty roster that really means herdr
             // is down must not read as isolation.
-            println!(
+            let _ = writeln!(
+                out,
                 "cannot list agents ({e}) — membership below is unknown; \
                  only the configured prefixes are shown"
             );
-            Vec::new()
+            &[]
         }
     };
-    let mut orgs = OrgCache::default();
-    let mut members: std::collections::BTreeMap<Option<String>, Vec<&AgentInfo>> =
-        std::collections::BTreeMap::new();
-    for a in &agents {
-        members
-            .entry(groups::resolve(Path::new(&a.cwd), &grouping, &mut orgs))
-            .or_default()
-            .push(a);
-    }
-    let print_members =
-        |name: &Option<String>,
-         members: &std::collections::BTreeMap<Option<String>, Vec<&AgentInfo>>| {
-            for a in members.get(name).unwrap_or(&Vec::new()) {
-                println!("  {}\t{}\t{}", a.name, a.status, a.cwd);
-            }
-        };
-    let mut configured: Vec<String> = Vec::new();
-    if let Grouping::Active(rules) = &grouping {
+    // `Broken` returned above with its own message, and it is the only
+    // grouping without a union, so this default never fires from here. The
+    // early-out is what keeps a config we could not parse from printing as an
+    // empty roster; this is belt and braces behind it.
+    let members = groups::memberships(grouping, agents, orgs).unwrap_or_default();
+    let print_members = |out: &mut String, m: Option<&groups::Membership>| {
+        for a in m.map(|m| m.agents.as_slice()).unwrap_or_default() {
+            let _ = writeln!(out, "  {}\t{}\t{}", a.name, a.status, a.cwd);
+        }
+    };
+    // Two passes, not one over the map: every configured group prints before
+    // any org-derived one, and a single pass would interleave them by name.
+    if let Grouping::Active(rules) = grouping {
         for name in rules.names() {
             let paths: Vec<String> = rules
                 .prefixes_for(name)
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect();
-            println!("{name}\t{}", paths.join(" "));
-            print_members(&Some(name.to_string()), &members);
-            configured.push(name.to_string());
+            let _ = writeln!(out, "{name}\t{}", paths.join(" "));
+            print_members(&mut out, members.get(&Some(name.to_string())));
         }
     }
     // Groups nothing in the config names: they exist because an agent's repo
     // points at that organization, and they appear and vanish with the agents.
-    for name in members.keys().flatten() {
-        if configured.iter().any(|c| c == name) {
+    // `configured` is the union's record of which groups the config names,
+    // which is what the pass above walked, so the two passes cannot disagree
+    // about where the boundary between them falls.
+    for (name, m) in &members {
+        let (Some(name), false) = (name, m.configured) else {
             continue;
-        }
-        println!("{name}\t(from repo origin)");
-        print_members(&Some(name.clone()), &members);
+        };
+        let _ = writeln!(out, "{name}\t(from repo origin)");
+        print_members(&mut out, Some(m));
     }
+    // The union keys agents that resolve nowhere under `None` whatever the
+    // grouping. Under a config that is a diagnostic — those agents receive
+    // nothing — which is why this listing shows it where `groups::rooms`,
+    // enumerating rooms you can open, drops it.
     if let Some(ungrouped) = members.get(&None) {
-        match grouping {
-            Grouping::Inactive => println!("ungrouped (shared room — no repository origin)"),
-            _ => println!("ungrouped (receiving nothing)"),
-        }
-        for a in ungrouped {
-            println!("  {}\t{}\t{}", a.name, a.status, a.cwd);
-        }
+        let _ = match grouping {
+            Grouping::Inactive => {
+                writeln!(out, "ungrouped (shared room — no repository origin)")
+            }
+            _ => writeln!(out, "ungrouped (receiving nothing)"),
+        };
+        print_members(&mut out, Some(ungrouped));
     }
-    Ok(())
+    out
 }
 
 /// The rooms this session could open. Not scoped to the caller's group:
@@ -736,6 +778,129 @@ mod tests {
         assert_eq!(
             format_messages(&msgs),
             "[#3 2026-08-18T12:00:00+00:00] reviewer: done\n"
+        );
+    }
+
+    /// Adds the shapes the real config cannot produce: an agent whose repo
+    /// origin names a group no config does, and an agent under no repo at all.
+    fn mixed_agents() -> Vec<AgentInfo> {
+        let mut v = grouped_agents();
+        v.push(AgentInfo {
+            name: "beta-1".into(),
+            pane_id: "w4:p1".into(),
+            status: "working".into(),
+            cwd: "/w/beta/api".into(),
+            focused: Some(false),
+            session: None,
+        });
+        v
+    }
+
+    #[test]
+    fn a_broken_config_says_so_rather_than_listing_nothing() {
+        let out = render_groups(
+            &Grouping::Broken("bad toml".into()),
+            Ok(&mixed_agents()),
+            &mut orgs(fake_org),
+        );
+        assert_eq!(
+            out,
+            "groups config BROKEN — no agent is enrolled: bad toml\n"
+        );
+    }
+
+    #[test]
+    fn configured_groups_come_before_org_derived_ones_with_their_members() {
+        let out = render_groups(&active(), Ok(&mixed_agents()), &mut orgs(fake_org));
+        assert_eq!(
+            out,
+            "groups.toml rules first, then each agent's repository origin\n\
+             acme\t/w/acme\n  \
+             acme-secret-issue\tidle\t/w/acme/web\n\
+             alare\t/w/alare\n  \
+             issue-590\tidle\t/w/alare/api\n\
+             beta\t(from repo origin)\n  \
+             beta-1\tworking\t/w/beta/api\n\
+             ungrouped (receiving nothing)\n  \
+             stray\tidle\t/tmp/scratch\n"
+        );
+    }
+
+    /// The shape every other fixture hides. Both passes emit sorted names, so
+    /// a config naming `acme` and `alare` prints identically whether the
+    /// passes are separate or folded into one walk of the map — only a
+    /// configured name that sorts *after* an org-derived one can tell them
+    /// apart, and the real config has none.
+    #[test]
+    fn a_configured_group_prints_first_even_when_its_name_sorts_last() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nzulu = [\"/w/zulu\"]\n",
+        )
+        .unwrap();
+        let g = crate::groups::load(dir.path());
+        std::mem::forget(dir);
+        let agents = vec![
+            AgentInfo {
+                name: "acme-1".into(),
+                pane_id: "w1:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/acme/web".into(),
+                focused: Some(false),
+                session: None,
+            },
+            AgentInfo {
+                name: "zulu-1".into(),
+                pane_id: "w2:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/zulu/api".into(),
+                focused: Some(false),
+                session: None,
+            },
+        ];
+        let out = render_groups(&g, Ok(&agents), &mut orgs(fake_org));
+        assert_eq!(
+            out,
+            "groups.toml rules first, then each agent's repository origin\n\
+             zulu\t/w/zulu\n  \
+             zulu-1\tidle\t/w/zulu/api\n\
+             acme\t(from repo origin)\n  \
+             acme-1\tidle\t/w/acme/web\n"
+        );
+    }
+
+    #[test]
+    fn without_a_config_every_group_is_an_org_and_ungrouped_is_the_shared_room() {
+        let out = render_groups(
+            &Grouping::Inactive,
+            Ok(&mixed_agents()),
+            &mut orgs(fake_org),
+        );
+        assert_eq!(
+            out,
+            "no groups.toml — each agent's group is its repository's origin organization\n\
+             acme\t(from repo origin)\n  \
+             acme-secret-issue\tidle\t/w/acme/web\n\
+             alare\t(from repo origin)\n  \
+             issue-590\tidle\t/w/alare/api\n\
+             beta\t(from repo origin)\n  \
+             beta-1\tworking\t/w/beta/api\n\
+             ungrouped (shared room — no repository origin)\n  \
+             stray\tidle\t/tmp/scratch\n"
+        );
+    }
+
+    #[test]
+    fn a_herd_that_will_not_answer_still_prints_the_configured_prefixes() {
+        let out = render_groups(&active(), Err("herdr not running"), &mut orgs(fake_org));
+        assert_eq!(
+            out,
+            "groups.toml rules first, then each agent's repository origin\n\
+             cannot list agents (herdr not running) — membership below is unknown; \
+             only the configured prefixes are shown\n\
+             acme\t/w/acme\n\
+             alare\t/w/alare\n"
         );
     }
 }
