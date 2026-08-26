@@ -190,17 +190,20 @@ pub struct Room {
     pub history: bool,
 }
 
-/// Sort rank: rooms with agents in them, then rooms the config names, then
-/// rooms that are only history. A single named function rather than an
-/// inline comparator so a second caller ordering rooms cannot rank them
-/// differently from this list.
-fn provenance_rank(r: &Room) -> u8 {
-    if r.agents > 0 {
-        0
-    } else if r.configured {
-        1
-    } else {
-        2
+impl Room {
+    /// Sort rank: rooms with agents in them, then rooms the config names,
+    /// then rooms that are only history. Public because `rooms` orders by it
+    /// and a caller grouping the list under headings needs the same
+    /// three-way split — deriving it a second time from the fields is how
+    /// the headings come to disagree with the order.
+    pub fn provenance_rank(&self) -> u8 {
+        if self.agents > 0 {
+            0
+        } else if self.configured {
+            1
+        } else {
+            2
+        }
     }
 }
 
@@ -275,6 +278,10 @@ pub fn rooms(
             };
             // A directory whose name is not a legal group can never be given
             // back to `--group`, so listing it offers a room nothing can open.
+            // Only this source needs the check: source 1's names came through
+            // `load`, which rejects illegal ones, and source 2's come from
+            // `load` or from `git_org::sanitize`, which maps an arbitrary
+            // repository owner onto exactly this predicate.
             if !valid_group_name(&name) {
                 continue;
             }
@@ -296,7 +303,7 @@ pub fn rooms(
     // Never by mtime: a list that reorders between readings defeats muscle
     // memory in the picker this feeds.
     out.sort_by(|a, b| {
-        provenance_rank(a).cmp(&provenance_rank(b)).then_with(|| {
+        a.provenance_rank().cmp(&b.provenance_rank()).then_with(|| {
             a.name
                 .as_deref()
                 .unwrap_or("")
