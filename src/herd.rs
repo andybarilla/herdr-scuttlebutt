@@ -1005,9 +1005,12 @@ mod tests {
         // in a message body — is covered, by
         // `a_rule_inside_a_gutter_row_does_not_box_the_transcript`. A rule
         // drawn on its own line directly beneath an echo's block is not:
-        // inserting one `\u{2579}\u{2580}\u{2580}\u{2580}` line below an echo here yields that echo as
-        // a region holding our batch, and `Some(true)` on a clear composer
-        // for as long as the pane stands.
+        // inserting one line of `\u{2579}\u{2580}\u{2580}\u{2580}...` below an echo here yields that
+        // echo as a region holding our batch, and `Some(true)` on a clear
+        // composer for as long as the pane stands. Elided — as written
+        // those are three horizontals, under `RULE_RUN`, so pasting them
+        // into a test reproduces nothing; the real line is the width of
+        // the pane.
         //
         // Accepted rather than closed. No capture shows a rule beside an
         // echo, every OpenCode pane we have carries exactly one rule, the
@@ -1180,15 +1183,20 @@ mod tests {
     fn both_ends_of_a_box_span_are_measured_in_cells() {
         // The sibling of the two-metric defect, in the same function: the
         // indent was counted in characters while the far edge was measured
-        // in cells. Whitespace wider than one cell then makes two boxes at
-        // different columns compare as one, and a rule that is not the
-        // composer's edge pairs with it.
-        let run = "\u{2500}".repeat(RULE_RUN);
-        let wide = format!("\u{3000}{run}");
-        let narrow = format!(" {run}");
-        assert_eq!(display_width("\u{3000}"), 2, "the indents measure alike");
-        assert_eq!(box_span(&wide).0, 2);
+        // in cells.
+        //
+        // These two rules are drawn at different columns, and counting the
+        // indent is exactly what hides it. An ideographic space is one
+        // character and two cells, so under the old metric both spans came
+        // out (1, 10) — same start, same end — and `same_box` called them
+        // one box, pairing a rule that is not the composer's edge with it.
+        // The pair matters: two rules differing in both fields would fail
+        // `same_box` under either metric and prove nothing.
+        let wide = format!("\u{3000}{}", "\u{2500}".repeat(8));
+        let narrow = format!(" {}", "\u{2500}".repeat(9));
         assert!(!same_box(&wide, &narrow));
+        assert_eq!(box_span(&wide), (2, 10));
+        assert_eq!(box_span(&narrow), (1, 10));
     }
 
     #[test]
