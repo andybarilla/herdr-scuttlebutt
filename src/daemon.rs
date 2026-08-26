@@ -1235,16 +1235,25 @@ pub fn tick(
                 // a batch that grows neither lifts the stall nor shortens
                 // the wait.
                 stall.batch = max_id;
-                // Falls back to what the stall already holds, not to the
-                // newest id herdr has reported. `last_session` is written
-                // for every listed agent, including on the ticks this loop
-                // skips — a busy or focused pane — so a pane that restarted
-                // while the agent was busy has a newer id recorded there
-                // than the reader has ever compared against. Preferring it
-                // here would overwrite the stall's own id with the new one
-                // and the reader would then find them equal, holding a
-                // stall that should have lifted. This writer's job is to
-                // preserve what the reader compares against.
+                // A defensive no-op today, and worth saying so rather than
+                // implying it decides something. The reader ran earlier in
+                // this same iteration over this same listing and lifted the
+                // stall on every case where `a.session` differed from what
+                // the stall holds — so by here `a.session` is either equal
+                // to it or `None`, and both branches write back the value
+                // already there. Deleting the line passes every test.
+                //
+                // It stays because the invariant is that this writer must
+                // not change the recorded id, and a line that preserves it
+                // reads better to whoever loosens one of the reader's lift
+                // conditions than an absence would. What it must never
+                // become is the newest id herdr has reported:
+                // `last_session` is written for every listed agent,
+                // including on the ticks this loop skips, so a pane that
+                // restarted while its agent was busy has a newer id there
+                // than the reader has ever compared against — writing that
+                // in would make the reader find them equal and hold a stall
+                // that should have lifted.
                 stall.session = a.session.clone().or_else(|| stall.session.clone());
                 let retries = stall.retries;
                 let next = retry_after(retries);
