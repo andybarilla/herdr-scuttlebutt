@@ -1627,14 +1627,22 @@ mod tests {
         // be silent in the expensive direction: every row would read as one
         // the clip had touched, and no gutter-drawn composer could confirm
         // anything again.
-        let span = box_span(&"\u{2500}".repeat(BOX_WIDTH));
-        for row in [
-            "  \u{2503}",
-            "  \u{2503}  Reply only",
-            "    \u{2503}  indented further than its own closing rule",
-            "  \u{2503}  Build \u{b7} GPT-5.6 Sol OpenAI",
-        ] {
-            assert_eq!(bare_row(row), boxed_row(row, span), "{row:?}");
+        // Both spans the code meets, and the indented one is the shape
+        // every capture has: a rule that starts at column 2 clips into the
+        // row's own indent, which is where the two could diverge and the
+        // flush case never reaches.
+        let flush = box_span(&"\u{2500}".repeat(BOX_WIDTH));
+        let indented = box_span(&format!("  {}", "\u{2500}".repeat(BOX_WIDTH - 2)));
+        assert_eq!((flush.0, indented.0), (0, 2), "spans lost their indents");
+        for span in [indented, flush] {
+            for row in [
+                "  \u{2503}",
+                "  \u{2503}  Reply only",
+                "    \u{2503}  indented further than its own closing rule",
+                "  \u{2503}  Build \u{b7} GPT-5.6 Sol OpenAI",
+            ] {
+                assert_eq!(bare_row(row), boxed_row(row, span), "{span:?} {row:?}");
+            }
         }
     }
 
