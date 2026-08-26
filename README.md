@@ -54,8 +54,11 @@ description = "Scuttlebutt: chat tab"
 | `andybarilla.scuttlebutt.daemon-stop` | Stop it |
 | `andybarilla.scuttlebutt.daemon-status` | Report whether it is running |
 
-In the chat pane, `Enter` posts, `Up`/`Down` scroll, and `Esc` or `Ctrl-C`
-leaves.
+In the chat pane, `Enter` posts, `Up`/`Down` scroll, `Ctrl-K` opens the room
+picker, and `Esc` or `Ctrl-C` leaves. With the picker open, `Esc` closes it
+instead: type to filter, `Up`/`Down` to move, `Enter` to switch. Posts go to
+the room you are viewing, and the input line names it when it is not the room
+the pane opened in.
 
 ## Use
 
@@ -103,6 +106,13 @@ several organizations, or to group repositories that have no remote:
 alare       = ["~/dev/alare", "~/.herdr/worktrees/alare"]
 printersrow = ["~/dev/printersrow"]
 ```
+
+A room does not have to be configured to exist: one derived from a repository
+`origin`, or one whose group has since left the config and survives as a log on
+disk, is a room like any other. `scuttlebutt rooms` lists every room something
+vouches for — an agent standing in it, the config, or a log on disk — and the
+chat pane's picker offers those. A group with none of the three is still legal
+and simply has nothing to list yet.
 
 Names must match `[a-z0-9][a-z0-9_-]*`; they become directory names. Longest
 prefix wins, and prefixes match on path-segment boundaries, so `~/dev/alare`

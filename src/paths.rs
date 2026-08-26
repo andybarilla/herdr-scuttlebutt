@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn session_key() -> String {
     match std::env::var("HERDR_SOCKET_PATH") {
@@ -33,13 +33,27 @@ pub fn session_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The directory holding one room's `room.jsonl` and `state.json`. `None` is
-/// the ungrouped layout (grouping inactive) and keeps v1's paths exactly.
+/// Where one room's `room.jsonl` and `state.json` live under `session`.
+/// `None` is the ungrouped layout (grouping inactive) and keeps v1's paths
+/// exactly.
+///
+/// Pure, and deliberately so: `room_dir` below creates the directory, which
+/// a caller that only wants to *look* at a room must not do. Sweeping every
+/// room's log length on each picker open would otherwise conjure a
+/// directory per room per open — the empty-directory-forever problem
+/// `groups::has_history` exists to filter out.
+pub fn room_dir_in(session: &Path, group: Option<&str>) -> PathBuf {
+    match group {
+        Some(g) => session.join(g),
+        None => session.to_path_buf(),
+    }
+}
+
+/// The directory holding one room's `room.jsonl` and `state.json`, created
+/// if it does not exist. For a room about to be written to or read as the
+/// current room; use `room_dir_in` to merely name one.
 pub fn room_dir(group: Option<&str>) -> Result<PathBuf> {
-    let dir = match group {
-        Some(g) => session_dir()?.join(g),
-        None => session_dir()?,
-    };
+    let dir = room_dir_in(&session_dir()?, group);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

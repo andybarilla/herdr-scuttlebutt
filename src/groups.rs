@@ -243,6 +243,59 @@ impl Room {
     }
 }
 
+/// The room a chat pane is currently viewing.
+///
+/// Three states rather than `Option<String>`, which conflates the last two:
+/// the ungrouped room is a real room with a real directory that can be read
+/// and posted to, while `NoneSelected` is a pane whose cwd resolved to no
+/// group and which has nowhere to post until a human picks a room. Collapsed
+/// into one `None`, a draft map and `title_for` would disagree about that
+/// pane the first time anyone ran without a `groups.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum CurrentRoom {
+    Named(String),
+    /// `session_dir()` itself — v1's single shared room, offered only when
+    /// grouping is `Inactive`.
+    Ungrouped,
+    #[default]
+    NoneSelected,
+}
+
+impl CurrentRoom {
+    /// The `Option<&str>` group that `room_dir`, `title_for` and
+    /// `visible_agents` all take, or `None` when no room is selected. The
+    /// nesting is the point: the inner `None` is the ungrouped room, so a
+    /// caller has to deal with "nothing selected" before it can ask which
+    /// group it is looking at.
+    pub fn selected(&self) -> Option<Option<&str>> {
+        match self {
+            CurrentRoom::Named(n) => Some(Some(n.as_str())),
+            CurrentRoom::Ungrouped => Some(None),
+            CurrentRoom::NoneSelected => None,
+        }
+    }
+
+    /// How this room is written wherever a room is named to a human: the
+    /// picker rows, the substring filter that searches them, and the pane
+    /// title all use this, so what you can see is what you can type.
+    pub fn label(&self) -> &str {
+        match self {
+            CurrentRoom::Named(n) => n.as_str(),
+            CurrentRoom::Ungrouped => "(ungrouped)",
+            CurrentRoom::NoneSelected => "no room selected",
+        }
+    }
+}
+
+impl From<&Room> for CurrentRoom {
+    fn from(r: &Room) -> Self {
+        match &r.name {
+            Some(n) => CurrentRoom::Named(n.clone()),
+            None => CurrentRoom::Ungrouped,
+        }
+    }
+}
+
 /// Whether a room directory holds a `room.jsonl` with anything in it.
 /// Emptiness is the filter that matters: `paths::room_dir` calls
 /// `create_dir_all` before the first post, so one mistyped `--group` leaves a
@@ -329,10 +382,11 @@ pub fn rooms(
         }
     }
     // The ungrouped room is `session_dir()` itself, so it has no entry in the
-    // sweep above. Under an active config it receives nothing and
-    // `resolve_group` can never return `None`, so its history is the record
-    // of a room that can no longer be posted to; offering it would invite
-    // posting into a dead room.
+    // sweep above. Under an active config it receives nothing and neither
+    // `resolve_group` nor `resolve_room` can land in it, so its history is
+    // the record of a room that can no longer be posted to; offering it —
+    // to the chat pane's picker above all, which posts wherever it is
+    // pointed — would invite posting into a dead room.
     if matches!(grouping, Grouping::Inactive) && has_history(session_dir) {
         entry_for(&mut found, None).history = true;
     }
@@ -957,7 +1011,9 @@ mod tests {
     fn the_order_of_a_rooms_sources_matches_the_order_rooms_are_sorted_in() {
         // the invariant that keeps a label and a sort position honest: for
         // any two rooms, the one whose primary source comes first in
-        // provenance order sorts first
+        // provenance order sorts first. Written out longhand on purpose —
+        // asserting the list is sorted by its own key would hold however
+        // that key was declared, and it is the declared order that skews.
         let session = tempfile::tempdir().unwrap();
         write_room(session.path(), Some("zeta"), "{}\n");
         let g = Grouping::Active(rules(&[("busy", &["/w/busy"]), ("quiet", &["/w/quiet"])]));
@@ -975,8 +1031,5 @@ mod tests {
             primaries,
             vec![Source::Agents, Source::Config, Source::History]
         );
-        let mut sorted = primaries.clone();
-        sorted.sort();
-        assert_eq!(primaries, sorted, "list order must follow primary source");
     }
 }
