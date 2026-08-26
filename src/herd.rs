@@ -45,8 +45,18 @@ pub trait HerdControl {
 const MARKERS: [&str; 2] = ["\u{276f}", "\u{203a}"];
 
 /// Verticals an editor may draw down the left edge of its input box on
-/// every row, in place of a rule above it. OpenCode uses the heavy one.
-const GUTTERS: [char; 2] = ['\u{2503}', '\u{2502}'];
+/// every row, in place of a rule above it. OpenCode draws the heavy one.
+///
+/// The light `\u{2502}` was here and is not one. It is what a rendered markdown
+/// table draws its rows with, and a table cell that wraps puts two of them
+/// straight above the table's own bottom rule — a gutter box, by every test
+/// this applies. `gutter_bounded` has no second rule to measure a box
+/// against, so nothing downstream would have caught it: the region is a
+/// composer, and a cell quoting `DELIVERY_RULE` is a composer holding our
+/// batch forever. Same defect as a bare `>` in `MARKERS`, one function
+/// over. An editor that really did draw a light gutter would identify
+/// nothing here, which costs a repeat.
+const GUTTERS: [char; 1] = ['\u{2503}'];
 
 /// Fragments of what a composer shows in place of its contents while a
 /// queue is holding messages — Claude Code shows `\u{276f} Press up to edit queued
@@ -182,6 +192,15 @@ fn is_rule(line: &str) -> bool {
 /// neither can they ever say one is. Discarding them, which is what this
 /// did before, turned a moved boundary into `Some(false)` and dropped the
 /// batch.
+///
+/// No captured pane produces an `other`, and the tests that reach one are
+/// synthetic. Reaching one takes a rule inside the composer drawn at the
+/// box's own column and width, and a real composer indents what it holds,
+/// so a pasted rule lands a column or two in and matches nothing. Kept
+/// anyway, deliberately: nothing else stands between that shape and a
+/// dropped batch, what it costs when it does fire is a repeat rather than a
+/// drop, and every layout this has been wrong about so far was one nobody
+/// had captured either.
 struct Regions {
     composers: Vec<Vec<String>>,
     others: Vec<Vec<String>>,
@@ -220,14 +239,20 @@ fn same_box(top: &str, bottom: &str) -> bool {
 /// Every rule-bounded region that could be a composer, split by whether it
 /// opens with a prompt marker.
 ///
-/// A region counts only when its two rules could be the edges of one box.
-/// That is what keeps a transcript out: a rendered markdown table draws
-/// rules of its own, and this room's traffic is full of tables — the region
-/// between two of those rules carries a row that begins with `DELIVERY_RULE`
-/// and therefore matches every batch we ever send, forever. Matching edges
-/// exclude it, because a table's border is not the composer's width. Read
-/// without that test, the pane in `composer-below-a-table` answers
-/// `Some(true)` on a clear composer on every tick.
+/// What has to be kept out is the transcript. A rendered markdown table
+/// draws rules of its own, and this room's traffic is full of tables — the
+/// region between two of those rules carries a row that begins with
+/// `DELIVERY_RULE` and therefore matches every batch we ever send, forever.
+/// Two separate tests keep it out, and they do different jobs. Measured on
+/// `composer-below-a-table`, whose table separators all span `(2, 90)`:
+///
+/// - The table's own regions *do* match as boxes — a table is a box. What
+///   excludes them is that neither sits beside a composer. Without that,
+///   the pane answers `Some(true)` on a clear composer on every tick.
+/// - Matching edges exclude the region between the table and the composer,
+///   which spans two rules of different widths and would otherwise be an
+///   `other` beside the composer, vetoing forever. Without it, the same
+///   pane answers `None` on every tick.
 ///
 /// Every qualifying region is returned, not just the last one, and that is
 /// the point. A message body ending in a rule of its own, or a bordered box
@@ -309,8 +334,23 @@ fn box_span(border: &str) -> (usize, usize) {
 }
 
 /// Display width in terminal cells, which is what a pane's columns are.
+///
+/// `U+FE0F` promotes what precedes it: `unicode-width` reports the variation
+/// selector as zero and leaves `\u{26a0}` at one cell, while a terminal draws
+/// the emoji presentation in two. It matters because a composer's two rules
+/// are measured independently and have to agree — a label a cell narrower
+/// than it is drawn makes them disagree, and identifies no composer at all.
 fn display_width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+    let mut width = 0;
+    let mut last = 0;
+    for c in s.chars() {
+        last = match c {
+            '\u{fe0f}' => 2 - last.min(2),
+            _ => c.width().unwrap_or(0),
+        };
+        width += last;
+    }
+    width
 }
 
 /// One row of a gutter-bounded box, clipped to the box's columns, gutter
@@ -742,6 +782,8 @@ mod tests {
     const OC_LIVE: &str = include_str!("../tests/fixtures/opencode-live-room.txt");
     const OC_WRAPPED_CWD: &str = include_str!("../tests/fixtures/opencode-wrapped-cwd.txt");
     const TABLE: &str = include_str!("../tests/fixtures/composer-below-a-table.txt");
+    const WRAPPED_TABLE: &str =
+        include_str!("../tests/fixtures/composer-below-a-wrapped-table.txt");
 
     /// What was typed into the OpenCode panes: `RULE` as a real delivery
     /// carries it, with the sentence that follows it in the preamble.
@@ -996,6 +1038,51 @@ mod tests {
     }
 
     #[test]
+    fn an_emoji_presentation_label_measures_the_cells_it_is_drawn_in() {
+        // A composer's two rules are measured independently and have to
+        // agree. `unicode-width` reports `\u{26a0}\u{fe0f}` as one cell and a terminal
+        // draws two, so a title carrying one would make the top border
+        // measure narrower than the bottom, pair with nothing, and identify
+        // no composer for as long as the session kept that title.
+        assert_eq!(display_width("\u{26a0}\u{fe0f}"), 2);
+        let run = "\u{2500}".repeat(RULE_RUN);
+        let titled = format!("{run} \u{26a0}\u{fe0f} {run}");
+        let plain = "\u{2500}".repeat(display_width(&titled));
+        assert!(same_box(&titled, &plain));
+        let pane = format!("{titled}\n\u{276f} Reply only if you have\n{plain}\n  status");
+        assert_eq!(composer_holds(&pane, RULE), Some(true));
+    }
+
+    #[test]
+    fn a_wrapped_table_cell_is_not_a_gutter_composer() {
+        // A real Claude Code pane, narrow enough that a table cell wraps,
+        // so three light-vertical rows sit straight above the table's own
+        // bottom rule. That is a gutter box by every test `gutter_bounded`
+        // applies, and it has no second rule for `same_box` to measure — so
+        // the cell, which quotes `DELIVERY_RULE`, is a composer holding our
+        // batch on every tick. Read with the light vertical still a gutter,
+        // this pane gives two composers and `Some(true)`.
+        assert!(WRAPPED_TABLE.contains('\u{2502}'), "fixture lost its table");
+        assert_eq!(composer_regions(WRAPPED_TABLE).composers.len(), 1);
+        assert_eq!(composer_holds(WRAPPED_TABLE, RULE), Some(false));
+    }
+
+    #[test]
+    fn two_rules_ending_at_one_column_are_not_one_box() {
+        // `box_span` reads both edges of the box, and both are load-bearing.
+        // A rule quoted into the batch, indented and shorter, can end at
+        // exactly the column the composer's border ends at — comparing only
+        // where they end pairs the two and splits the box between them.
+        let rule = "\u{2500}".repeat(60);
+        let inset = format!("    {}", "\u{2500}".repeat(56));
+        assert_eq!(box_span(&rule).1, box_span(&inset).1);
+        assert!(same_box(&rule, &rule));
+        assert!(!same_box(&rule, &inset));
+        let composer = ["\u{276f}".to_string(), inset, "  Done.".to_string()];
+        assert_eq!(holds(&composer, RULE), None);
+    }
+
+    #[test]
     fn a_blockquote_is_not_a_prompt_marker() {
         // `>` opens a markdown blockquote and a shell continuation line as
         // readily as it opens anyone's composer, and no agent this fleet
@@ -1227,7 +1314,7 @@ mod tests {
         // repeats. Drawn to the same width, the half without the marker is
         // kept beside the half with it, and it still holds us.
         let narrow = held(&[&"\u{2500}".repeat(30)]);
-        assert_ne!(holds(&narrow, RULE), Some(false));
+        assert_eq!(holds(&narrow, RULE), None);
         let matching = held(&[&"\u{2500}".repeat(60)]);
         assert_eq!(holds(&matching, RULE), Some(true));
     }
@@ -1237,10 +1324,15 @@ mod tests {
         // A tail too short to be recognized as ours, below a rule that
         // arrived inside the batch. Whether the rule matches the box or not,
         // the answer may never be that the composer is clear.
-        for body in [30, 60] {
-            let composer = held(&[&"\u{2500}".repeat(body), "  -"]);
-            assert_ne!(holds(&composer, RULE), Some(false), "body rule of {body}");
-        }
+        let narrow = held(&[&"\u{2500}".repeat(30), "  -"]);
+        assert_eq!(holds(&narrow, RULE), None);
+        let matching = held(&[&"\u{2500}".repeat(60), "  -"]);
+        assert_eq!(holds(&matching, RULE), Some(true));
+        // The rule a pasted transcript actually carries: one short label
+        // between two stubs, which is not furniture at all, so the composer
+        // is never split and still reads as holding us.
+        let titled = held(&["\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"]);
+        assert_eq!(holds(&titled, RULE), Some(true));
     }
 
     #[test]

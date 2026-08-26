@@ -1,0 +1,57 @@
+           Claude Code v2.1.246
+ ▐▛███▛█   Opus 5 (1M context)…
+▝▜██████▀  Claude Max
+  ▝▝ ▝▝    /…/scratchpad/rig
+
+
+❯ Output only this table, no
+  other text:
+
+  | id | text |
+  | --- | --- |
+  | 318 | Reply only if you
+  have information others do
+  not |
+
+● ┌─────┬───────────────────┐
+  │ id  │       text        │
+  ├─────┼───────────────────┤
+  │     │ Reply only if you │
+  │ 318 │  have information │
+  │     │  others do not    │
+  └─────┴───────────────────┘
+
+✻ Churned for 1s · done 2:16 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────
+❯
+───────────────────────────────
+  andy@apbfw16 /tmp/claude-1…
+  ⏵⏵ auto mode on          ·
