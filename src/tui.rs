@@ -539,6 +539,23 @@ fn switch_room(
     Ok(())
 }
 
+/// Reads whatever has arrived in the room on screen since the last loop.
+fn tail(app: &mut App, dir: &Path) -> Result<()> {
+    let last = app.messages.last().map(|m| m.id).unwrap_or(0);
+    let file_last = log_store::last_id(dir)?;
+    if should_reseed(last, file_last) {
+        // room.jsonl was truncated or replaced (ids restarted lower than our
+        // cursor); discard the stale in-memory tail and re-seed from the
+        // start of the file instead of filtering every future message out
+        // forever.
+        app.messages = log_store::read_since(dir, 0)?;
+    } else {
+        let mut fresh = log_store::read_since(dir, last)?;
+        app.messages.append(&mut fresh);
+    }
+    Ok(())
+}
+
 pub fn run(group: Option<&str>) -> Result<()> {
     let grouping = crate::groups::load(&crate::paths::base_dir()?);
     let mut orgs = crate::git_org::OrgCache::default();
@@ -567,18 +584,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
         while !app.quit {
             // tail new messages every loop; members on a slow tick
             if let Some(dir) = app.dir.clone() {
-                let last = app.messages.last().map(|m| m.id).unwrap_or(0);
-                let file_last = log_store::last_id(&dir)?;
-                if should_reseed(last, file_last) {
-                    // room.jsonl was truncated or replaced (ids restarted
-                    // lower than our cursor); discard the stale in-memory
-                    // tail and re-seed from the start of the file instead of
-                    // filtering every future message out forever.
-                    app.messages = log_store::read_since(&dir, 0)?;
-                } else {
-                    let mut fresh = log_store::read_since(&dir, last)?;
-                    app.messages.append(&mut fresh);
-                }
+                tail(&mut app, &dir)?;
                 // `selected()` is destructured, never flattened: flattening
                 // would hand `scoped_members` the ungrouped room's roster
                 // for a pane that has selected no room, which is the
@@ -1710,6 +1716,53 @@ mod tests {
         a.scroll_from_bottom = 7;
         switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
         assert_eq!(a.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn a_failed_tail_read_leaves_the_pane_alive_holding_every_draft() {
+        // What is lost here is not the read: it is the `?` the run loop
+        // applies to it. That Err leaves `run`, ratatui restores the
+        // terminal, and `App` is dropped with it — every room's stashed
+        // draft included, silently, with nothing written anywhere. The
+        // per-room `drafts` map is what turned that from one half-typed line
+        // into all of them.
+        //
+        // A regular file where the room directory belongs is the honest way
+        // into the Err branch: it is ENOTDIR for any uid, root included,
+        // where `chmod 000` stops failing under a CI running as root and
+        // leaves a green no-op. A *missing* directory reads as `Ok(vec![])`,
+        // so there is no other route.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.messages = vec![msg("bob", "already on screen")];
+        a.input = "half-typed, not sent".into();
+        a.drafts.insert(named("alare"), "unsent to alare".into());
+        a.drafts.insert(named("acme"), "unsent to acme".into());
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+
+        let _ = tail(&mut a, &wall);
+
+        // The pane is still here, and it says what failed in its own words:
+        // a fixed prefix is what once had a failed switch claiming "post
+        // failed".
+        let reported = a.last_error.clone();
+        assert!(
+            reported
+                .as_deref()
+                .is_some_and(|e| e.contains("could not read this room")),
+            "a failed tail read left the pane with nothing to say: {reported:?}"
+        );
+        // Blanking the list would make a transient read error look like a
+        // room somebody emptied.
+        assert_eq!(
+            a.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            vec!["already on screen"]
+        );
+        assert_eq!(a.input, "half-typed, not sent");
+        let mut stashed: Vec<&str> = a.drafts.values().map(String::as_str).collect();
+        stashed.sort();
+        assert_eq!(stashed, vec!["unsent to acme", "unsent to alare"]);
     }
 
     #[test]
