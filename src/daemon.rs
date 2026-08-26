@@ -1232,8 +1232,9 @@ pub fn tick(
                 // The counters are left exactly as the stall found them,
                 // and `unconfirmed` goes unread for the same reason: they
                 // record how the threshold was reached, and counting
-                // retries into them would print `batch 6/5` and make the
-                // numbers mean two different things.
+                // retries into them would print a batch count past the cap
+                // it is shown against and make the numbers mean two
+                // different things.
                 let stall = state
                     .stalled
                     .get_mut(&a.name)
@@ -1293,8 +1294,9 @@ pub fn tick(
                 // every tick cannot keep an unconfirmable agent below the
                 // threshold forever. Only unconfirmed deliveries advance it,
                 // but the stored value is what gets reported either way: a
-                // hard error in the middle of a streak must not log 0/5 and
-                // make the eventual stall look like it came from nowhere.
+                // hard error in the middle of a streak must not log a
+                // streak of 0 and make the eventual stall look like it came
+                // from nowhere.
                 if unconfirmed {
                     *state.unconfirmed_streak.entry(a.name.clone()).or_insert(0) += 1;
                 }

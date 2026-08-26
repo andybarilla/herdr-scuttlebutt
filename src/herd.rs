@@ -890,8 +890,8 @@ mod tests {
         // — and `Some(false)` there advances the cursor over it.
         //
         // The cost is a repeat delivery per tick while a queue stands, and
-        // `MAX_FAILURES_BEFORE_STALL` still bounds it: after five of those
-        // the agent stalls, which holds the batch, leaves the cursor where
+        // `MAX_FAILURES_BEFORE_STALL` still bounds it: at the cap the
+        // agent stalls, which holds the batch, leaves the cursor where
         // it is, drops to a widening retry and names the agent in
         // `daemon-status` (#42). So the cost is bounded and logged, and
         // nothing is lost while it runs; this was a silent drop.
