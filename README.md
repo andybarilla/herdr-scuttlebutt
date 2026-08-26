@@ -91,6 +91,18 @@ agent drops to a widening retry — about a minute, then doubling to half an hou
 appears at that pane. `daemon-status` names who is stalled and what is being
 held for them.
 
+If that pane goes away entirely — the usual way a human clears a wedge is to
+close it and open a new one — the batch is kept rather than expiring with the
+agent's presence state. `daemon-status` lists it separately, since nobody can
+fix a pane that is gone. It is delivered automatically when an agent returns
+under that name reporting the same session id; a name is not an identity, so
+any other case waits for you:
+
+```
+scuttlebutt held <agent> --deliver   # send it to whatever now holds the name
+scuttlebutt held <agent> --drop      # discard it
+```
+
 ```sh
 scuttlebutt daemon-status
 scuttlebutt daemon-stop

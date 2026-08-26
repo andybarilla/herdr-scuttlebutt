@@ -14,10 +14,10 @@ use std::sync::{Arc, OnceLock};
 /// `unconfirmed_streak` counts only unconfirmed deliveries and ignores the
 /// batch. Either reaching this stalls the agent — its batch is held, its
 /// cursor left alone, and delivery drops to `retry_after`'s widening backoff
-/// for as long as the agent is still listed (#39). The
-/// absence purge is the one door still open: an agent missing from
-/// `herdr agent list` for `MAX_ABSENCES` passes loses its cursor and its
-/// stall with the rest of its state, and re-enrolls at the tail.
+/// for as long as the agent is still listed (#39). An agent missing from
+/// `herdr agent list` for `MAX_ABSENCES` passes loses its presence state,
+/// but its batch and the cursor to redeliver it move to `state.held` and
+/// wait there (#43): the purge is a bound on presence, not on data.
 ///
 /// The cost of reaching it is delivery itself: nothing else lands at that
 /// pane until the stall lifts. `MAX_INTRO_FAILURES` gates the other,
@@ -792,8 +792,11 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
 /// what `run_once` logs when it enrolls into one.
 const UNGROUPED_ROOM: &str = "(ungrouped room)";
 
-/// Every held batch under a session, as (room, agent, batch id), ordered by
-/// room then agent so the listing is stable between runs.
+/// What one session is holding, split by whether the agent is still there
+/// to receive it: `stalled` agents are present and not taking deliveries,
+/// `absent` ones have gone from `herdr agent list` entirely and their batch
+/// is being kept for them (#43). Both are ordered by room then agent so the
+/// listing is stable between runs.
 ///
 /// Rooms are the session dir itself — the ungrouped layout — plus one level
 /// of group dirs beneath it; nothing deeper is a room. Swept here rather
@@ -806,7 +809,15 @@ const UNGROUPED_ROOM: &str = "(ungrouped room)";
 /// than through `state::load` because that reports a reset warning into
 /// `daemon.log` on an unreadable file, and asking for status must not write
 /// to the log the daemon owns. An unreadable room contributes nothing.
-fn held_batches(session: &Path) -> Vec<(String, String, u64)> {
+#[derive(Default)]
+struct Holds {
+    /// (room, agent, batch id)
+    stalled: Vec<(String, String, u64)>,
+    /// (room, agent, batch id, id the hold opened on)
+    absent: Vec<(String, String, u64, u64)>,
+}
+
+fn rooms_under(session: &Path) -> Vec<(String, PathBuf)> {
     let mut rooms = vec![(UNGROUPED_ROOM.to_string(), session.to_path_buf())];
     if let Ok(entries) = std::fs::read_dir(session) {
         for e in entries.flatten() {
@@ -815,8 +826,12 @@ fn held_batches(session: &Path) -> Vec<(String, String, u64)> {
             }
         }
     }
-    let mut held = vec![];
-    for (room, path) in rooms {
+    rooms
+}
+
+fn held_batches(session: &Path) -> Holds {
+    let mut holds = Holds::default();
+    for (room, path) in rooms_under(session) {
         let Ok(text) = std::fs::read_to_string(path.join("state.json")) else {
             continue;
         };
@@ -824,11 +839,17 @@ fn held_batches(session: &Path) -> Vec<(String, String, u64)> {
             continue;
         };
         for (name, stall) in st.stalled {
-            held.push((room.clone(), name, stall.batch));
+            holds.stalled.push((room.clone(), name, stall.batch));
+        }
+        for (name, held) in st.held {
+            holds
+                .absent
+                .push((room.clone(), name, held.batch, held.held_since));
         }
     }
-    held.sort();
-    held
+    holds.stalled.sort();
+    holds.absent.sort();
+    holds
 }
 
 pub fn status(dir: &Path) {
@@ -844,19 +865,89 @@ pub fn status(dir: &Path) {
     // is the answer to the question this command gets asked, and a section
     // that appears only when something is wrong reads as a missing feature
     // the rest of the time.
-    let held = held_batches(dir);
-    if held.is_empty() {
+    let holds = held_batches(dir);
+    if holds.stalled.is_empty() {
         println!("stalled agents: none");
+    } else {
+        println!(
+            "stalled agents: {} (batch held, delivery slowed to a widening retry; \
+             resumes when a retry is confirmed or a new session appears)",
+            holds.stalled.len()
+        );
+        for (room, name, batch) in holds.stalled {
+            println!("  {name} in {room}: holding messages up to #{batch}");
+        }
+    }
+    // Separate section, not a footnote on the one above: an agent that is
+    // still there can be fixed at its pane, and one that is gone cannot.
+    // Silent when empty — the absent case is the unusual one, and a "none"
+    // line for it every time would bury the stalled list it sits under.
+    if holds.absent.is_empty() {
         return;
     }
     println!(
-        "stalled agents: {} (batch held, delivery slowed to a widening retry; \
-         resumes when a retry is confirmed or a new session appears)",
-        held.len()
+        "held batches (agent no longer present): {} (kept until delivered or \
+         dropped, never on a timer; `scuttlebutt held <agent> --deliver` sends \
+         one to whatever now holds the name, `--drop` discards it)",
+        holds.absent.len()
     );
-    for (room, name, batch) in held {
-        println!("  {name} in {room}: holding messages up to #{batch}");
+    for (room, name, batch, since) in holds.absent {
+        println!("  {name} in {room}: holding messages up to #{batch}, held since #{since}");
     }
+}
+
+/// `scuttlebutt held <agent> --deliver|--drop`. A held batch is cleared by
+/// delivery or by a human, never by a timer, and this is the human half:
+/// `--deliver` releases the hold so the next listing that carries the name
+/// resumes from its cursor whatever the session ids say, and `--drop`
+/// discards it. Acts in every room holding that name, since a name is only
+/// unique within a room.
+///
+/// Reads and rewrites `state.json` directly. The daemon reloads state from
+/// disk every pass, so the only window where this can be clobbered is the
+/// sub-millisecond gap between one pass's load and its save; losing this
+/// costs a retype, and a durable request queue would be a second
+/// concurrency design to review inside a data-loss fix.
+pub fn held_action(session: &Path, agent: &str, deliver: bool) -> Result<()> {
+    let mut acted = false;
+    for (room, path) in rooms_under(session) {
+        let Ok(text) = std::fs::read_to_string(path.join("state.json")) else {
+            continue;
+        };
+        // An unparseable room is skipped rather than reset: `state::load`
+        // would report a cursor reset into the daemon's log, and a status
+        // or admin command must not write there.
+        let Ok(mut st) = serde_json::from_str::<DaemonState>(&text) else {
+            continue;
+        };
+        let Some(held) = st.held.get_mut(agent) else {
+            continue;
+        };
+        let (batch, since) = (held.batch, held.held_since);
+        if deliver {
+            held.released = true;
+            // Re-armed with the release: whoever picks the name up next
+            // deserves the same line if the ids still do not match.
+            held.warned = false;
+        } else {
+            st.held.remove(agent);
+        }
+        crate::state::save(&path, &st)?;
+        acted = true;
+        let what = if deliver {
+            "will be delivered to whatever now holds that name, at its next \
+             delivery opportunity"
+        } else {
+            "has been discarded; the messages are still in the room log"
+        };
+        println!("{agent} in {room}: the batch up to #{batch} (held since #{since}) {what}");
+    }
+    if !acted {
+        anyhow::bail!(
+            "no batch is held for {agent}; `scuttlebutt daemon-status` lists what is held"
+        );
+    }
+    Ok(())
 }
 
 pub fn stop(dir: &Path) -> Result<()> {
@@ -929,11 +1020,136 @@ fn focus_blocked(a: &AgentInfo) -> bool {
 }
 
 /// Consecutive absences from `herdr agent list` tolerated before an agent's
-/// state (cursor, intro flag, fail count, held batch) is purged. At the 2s
-/// tick interval that is roughly six seconds, which is shorter than closing
-/// and reopening a pane: a batch held for a stalled agent does not survive
-/// that.
+/// presence state (cursor, intro flag, fail counts, absence streak) is
+/// purged. At the 2s tick interval that is roughly six seconds, which is
+/// deliberately shorter than closing and reopening a pane: presence should
+/// expire fast so the roster stays honest.
+///
+/// A batch held for a stalled agent is not presence state and does not go
+/// with it — that six-second window was losing it on the most ordinary way
+/// a human clears a wedge (#43). The stall moves to `state.held` instead,
+/// bounded by `MAX_HELD_BATCHES`.
 const MAX_ABSENCES: u32 = 3;
+
+/// Held batches one room keeps at once. This is the bound on `state.held`,
+/// and it is a count rather than an age because the whole point of #43 is
+/// that a batch must not expire on a timer while its pane is being fixed.
+/// Reaching it evicts the hold that has waited longest and says so: a room
+/// with this many agents that never came back has a problem the seventeenth
+/// hold would not have told anyone about.
+const MAX_HELD_BATCHES: usize = 16;
+
+/// Moves a stalled agent's batch out of presence state as the purge takes
+/// the rest of it. Merging rather than replacing when the name already
+/// holds one: the older record's cursor is the lower of the two, so
+/// resuming from it covers both batches.
+fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::state::Stall) {
+    // Falls back to `held_since` only if the cursor is somehow already
+    // gone; a stall standing without a cursor is not reachable today.
+    let cursor = state.cursors.get(name).copied().unwrap_or(stall.held_since);
+    let entry = state
+        .held
+        .entry(name.to_string())
+        .or_insert_with(|| crate::state::Held {
+            cursor,
+            held_since: stall.held_since,
+            batch: stall.batch,
+            session: stall.session.clone(),
+            warned: false,
+            released: false,
+        });
+    entry.cursor = entry.cursor.min(cursor);
+    entry.held_since = entry.held_since.min(stall.held_since);
+    entry.batch = entry.batch.max(stall.batch);
+    // Newest known id wins, because the gate compares against the process
+    // most recently seen under this name.
+    entry.session = stall.session.or_else(|| entry.session.clone());
+    let (batch, held_since) = (entry.batch, entry.held_since);
+    report(
+        dir,
+        &format!(
+            "[scuttlebutt] {name} is gone from the listing with a batch still held \
+             (messages up to #{batch}, held since #{held_since}); keeping it. The \
+             absence purge clears presence, not data. It resumes if that agent \
+             comes back reporting the same session id, and \
+             `scuttlebutt daemon-status` lists it until then."
+        ),
+    );
+    evict_oldest_held(state, dir);
+}
+
+/// Enforces `MAX_HELD_BATCHES`. Oldest by `held_since`, tie-broken by name
+/// so two holds opened on the same message evict in a stable order.
+fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
+    while state.held.len() > MAX_HELD_BATCHES {
+        let Some(name) = state
+            .held
+            .iter()
+            .min_by_key(|(n, h)| (h.held_since, (*n).clone()))
+            .map(|(n, _)| n.clone())
+        else {
+            return;
+        };
+        let dropped = state.held.remove(&name).expect("just chosen from the map");
+        report(
+            dir,
+            &format!(
+                "[scuttlebutt] DROPPING the batch held for {name} (messages up to \
+                 #{}, held since #{}): {MAX_HELD_BATCHES} held batches is this \
+                 room's cap and {name} has waited longest. Those messages are \
+                 still in the room log; nothing will deliver them to {name}.",
+                dropped.batch, dropped.held_since
+            ),
+        );
+    }
+}
+
+/// Whether a batch held for a name may be delivered to the agent now using
+/// it. A name is not an identity: panes are reused and `herdr agent rename`
+/// exists, so the returning agent may be someone else entirely. The only
+/// automatic yes is an agent reporting the same `agent_session` id the hold
+/// recorded — the one case where the name provably still means the same
+/// process. A different id after an absence is not evidence of a restart
+/// the way it is for a pane that never left the listing: the pane was gone,
+/// so a new id is equally consistent with a different agent taking the
+/// name. An id missing on either side is indistinguishable outright, which
+/// is the ordinary case for the agent kinds herdr reports no id for.
+///
+/// Both of those fail toward not delivering, because handing one agent's
+/// batch to an unrelated pane is worse than making a human confirm it.
+/// `released` is that confirmation: `scuttlebutt held <agent> --deliver`.
+fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
+    if held.released {
+        return true;
+    }
+    match (&held.session, &a.session) {
+        (Some(was), Some(now)) => was == now,
+        _ => false,
+    }
+}
+
+/// The stall a resumed hold comes back as. Primed to retry at the first
+/// delivery opportunity rather than waiting out a fresh backoff: the wait
+/// exists so a wedged pane does not burn a turn every tick, and a pane that
+/// has just come back is not that case.
+///
+/// Reinstating a stall at all — rather than handing the cursor back to the
+/// ordinary delivery path — is what stops the batch falling through the
+/// purge a second time. A stalled agent's batch is held again if it
+/// vanishes; an agent merely failing deliveries below the threshold loses
+/// its cursor at `MAX_ABSENCES` like any other.
+fn resuming_stall(held: &crate::state::Held, a: &AgentInfo) -> crate::state::Stall {
+    crate::state::Stall {
+        held_since: held.held_since,
+        batch: held.batch,
+        // Never a newer id than the one compared against above: writing one
+        // in would make the delivery loop's reader find them equal and hold
+        // a stall that should have lifted.
+        session: a.session.clone().or_else(|| held.session.clone()),
+        waited: retry_after(0),
+        retries: 0,
+    }
+}
 
 /// Consecutive deliverable sightings required before an agent's first
 /// prompt. `herdr agent prompt` can return Ok while dropping the text into a
@@ -1013,6 +1229,49 @@ pub fn tick(
     // enroll new agents (cursor starts at tail: no history dump) and clear
     // any absence streak for agents that are present again.
     for a in &agents {
+        // A held batch outranks a fresh enrolment: an agent whose stall
+        // survived the purge is not new, and starting it at tail is what
+        // lost the batch (#43). Checked on every listing rather than only
+        // on the tick it re-enrols, so an agent that came back before herdr
+        // reported its session id, or before a human released the hold, is
+        // still resumed when either arrives.
+        if let Some(held) = state.held.get(&a.name) {
+            if may_resume(held, a) {
+                let held = state.held.remove(&a.name).expect("just read");
+                let stall = resuming_stall(&held, a);
+                // Overwrites rather than fills in: an agent that already
+                // re-enrolled at tail has a cursor above the batch, and
+                // leaving it there is the loss this whole change is about.
+                // Moving it back can redeliver messages seen in between,
+                // which the room tolerates and losing a batch does not.
+                state.cursors.insert(a.name.clone(), held.cursor);
+                state.stalled.insert(a.name.clone(), stall);
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] {} is back with a batch still held for it \
+                         (up to #{}, held since #{}); delivery resumes from #{} at \
+                         its next opportunity.",
+                        a.name, held.batch, held.held_since, held.cursor
+                    ),
+                );
+            } else if !held.warned {
+                let (batch, held_since) = (held.batch, held.held_since);
+                state.held.get_mut(&a.name).expect("just read").warned = true;
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] a batch is held for {name} (up to #{batch}, \
+                         held since #{held_since}) but the agent at that name now \
+                         cannot be matched to the session it was held for; not \
+                         delivering it. `scuttlebutt daemon-status` lists it. \
+                         `scuttlebutt held {name} --deliver` sends it anyway; \
+                         `scuttlebutt held {name} --drop` discards it.",
+                        name = a.name
+                    ),
+                );
+            }
+        }
         state.cursors.entry(a.name.clone()).or_insert(tail);
         state.absences.remove(&a.name);
         if let Some(id) = &a.session {
@@ -1053,6 +1312,12 @@ pub fn tick(
 
     // agents we have any state for but that are missing from this listing:
     // tolerate transient absences, purge only after MAX_ABSENCES in a row.
+    //
+    // `state.held` is deliberately not in here. Presence state is what this
+    // loop retires, and a held batch is not presence state: an agent whose
+    // only remaining record is a held batch has already been purged once,
+    // and counting its absences again would only churn. What bounds that
+    // map is `MAX_HELD_BATCHES`, not this.
     let known: std::collections::HashSet<String> = state
         .cursors
         .keys()
@@ -1074,11 +1339,18 @@ pub fn tick(
         let count = state.absences.entry(name.clone()).or_insert(0);
         *count += 1;
         if *count >= MAX_ABSENCES {
+            // The stall does not go with the presence state: its batch is
+            // data, and data must not expire on the timer that keeps the
+            // roster honest (#43). It moves to `state.held`, carrying the
+            // cursor delivery has to resume from, and is bounded there by
+            // `MAX_HELD_BATCHES` rather than by this purge.
+            if let Some(stall) = state.stalled.remove(&name) {
+                hold_batch(state, dir, &name, stall);
+            }
             state.cursors.remove(&name);
             state.introduced.remove(&name);
             state.fail_counts.remove(&name);
             state.unconfirmed_streak.remove(&name);
-            state.stalled.remove(&name);
             state.last_session.remove(&name);
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
@@ -2052,6 +2324,225 @@ mod tests {
         );
     }
 
+    /// Drives an agent to the stall threshold and then off the listing
+    /// entirely, which is the shape every #43 test starts from: a wedged
+    /// pane a human closes. Returns the room dir and the state left behind.
+    fn stalled_then_vanished(session: Option<&str>) -> (tempfile::TempDir, DaemonState) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        if let Some(id) = session {
+            herd.set_session("reviewer", id);
+        }
+        herd.fail_prompts = true;
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "the batch that must survive").unwrap();
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"), "never stalled");
+        let gone = FakeHerd::new(vec![]);
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        (dir, state)
+    }
+
+    /// The agent comes back able to receive, reporting `session`.
+    fn comes_back(
+        state: &mut DaemonState,
+        dir: &Path,
+        session: Option<&str>,
+        ticks: u32,
+    ) -> FakeHerd {
+        let mut back = FakeHerd::new(vec![("reviewer", "idle")]);
+        if let Some(id) = session {
+            back.set_session("reviewer", id);
+        }
+        for _ in 0..ticks {
+            tick(state, &back, dir, &AgentFilter::default(), None).unwrap();
+        }
+        back
+    }
+
+    fn was_delivered(herd: &FakeHerd) -> bool {
+        herd.prompts
+            .borrow()
+            .iter()
+            .any(|(n, t)| n == "reviewer" && t.contains("the batch that must survive"))
+    }
+
+    #[test]
+    fn the_purge_keeps_the_batch_and_the_cursor_it_needs() {
+        // Presence state goes on its own schedule; the batch does not.
+        let (_dir, state) = stalled_then_vanished(Some("sess-1"));
+        assert!(
+            state.absences.is_empty(),
+            "presence state outlived the purge"
+        );
+        assert!(state.cursors.is_empty());
+        assert!(state.introduced.is_empty());
+        assert!(state.stalled.is_empty());
+        let held = &state.held["reviewer"];
+        assert_eq!(held.cursor, 0, "resuming from here would skip the batch");
+        assert_eq!(held.batch, 1);
+        assert_eq!(held.session.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn a_vanished_agent_with_no_stall_holds_nothing() {
+        // The purge's ordinary job is untouched: only a held batch survives
+        // it, and an agent that was simply finished leaves nothing behind.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = FakeHerd::new(vec![]);
+        let mut state = DaemonState::default();
+        state.cursors.insert("ghost".into(), 3);
+        state.introduced.insert("ghost".into());
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.cursors.is_empty());
+        assert!(
+            state.held.is_empty(),
+            "held a batch for an agent with no stall"
+        );
+    }
+
+    #[test]
+    fn a_returning_agent_under_a_different_session_gets_nothing() {
+        // A name is not an identity: panes are reused and `herdr agent
+        // rename` exists, and after an absence a new id is as consistent
+        // with a different agent as with a restart. Delivering here would
+        // be a cross-delivery, so it is refused and stays visible instead.
+        let (dir, mut state) = stalled_then_vanished(Some("sess-1"));
+        let back = comes_back(
+            &mut state,
+            dir.path(),
+            Some("sess-2"),
+            REQUIRED_SIGHTINGS + 3,
+        );
+        assert!(!was_delivered(&back), "delivered another session's batch");
+        assert_eq!(
+            state.held["reviewer"].batch, 1,
+            "the batch was dropped instead"
+        );
+        assert!(state.held["reviewer"].warned);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("cannot be matched to the session"),
+            "log was: {log}"
+        );
+        // Once per record: a standing mismatch must not print a line a tick.
+        assert_eq!(log.matches("cannot be matched to the session").count(), 1);
+    }
+
+    #[test]
+    fn a_returning_agent_with_no_session_id_gets_nothing() {
+        // herdr reports no `agent_session` for some agent kinds at all, so
+        // this is the ordinary case rather than the exotic one, and it is
+        // indistinguishable from a reused name. It fails toward not
+        // delivering, and `held --deliver` is the way out.
+        let (dir, mut state) = stalled_then_vanished(None);
+        let back = comes_back(&mut state, dir.path(), None, REQUIRED_SIGHTINGS + 3);
+        assert!(!was_delivered(&back));
+        assert_eq!(state.held["reviewer"].batch, 1);
+    }
+
+    #[test]
+    fn a_human_can_release_a_held_batch_to_the_name() {
+        let (dir, mut state) = stalled_then_vanished(None);
+        // The agent is back and enrolled at tail, holding nothing.
+        comes_back(&mut state, dir.path(), None, REQUIRED_SIGHTINGS + 3);
+        assert_eq!(state.cursors["reviewer"], 1);
+        crate::state::save(dir.path(), &state).unwrap();
+
+        held_action(dir.path(), "reviewer", true).unwrap();
+        let mut state = crate::state::load(dir.path());
+        assert!(state.held["reviewer"].released);
+
+        // and the next listing resumes from the held cursor, ids or no ids
+        let back = comes_back(&mut state, dir.path(), None, 3);
+        assert!(
+            was_delivered(&back),
+            "a released batch was still not delivered"
+        );
+        assert!(state.held.is_empty());
+    }
+
+    #[test]
+    fn a_human_can_drop_a_held_batch() {
+        let (dir, state) = stalled_then_vanished(None);
+        crate::state::save(dir.path(), &state).unwrap();
+        held_action(dir.path(), "reviewer", false).unwrap();
+        assert!(crate::state::load(dir.path()).held.is_empty());
+        // and saying so about a name holding nothing is an error, not a
+        // silent success that reads as "done".
+        assert!(held_action(dir.path(), "reviewer", false).is_err());
+    }
+
+    #[test]
+    fn held_batches_are_bounded_by_a_count() {
+        // Nothing here expires on a timer, so the cap is the whole bound:
+        // the oldest hold is evicted, loudly, rather than state.json growing
+        // for every agent that never comes back.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        for i in 0..=MAX_HELD_BATCHES {
+            let name = format!("agent-{i:02}");
+            state.cursors.insert(name.clone(), i as u64);
+            hold_batch(
+                &mut state,
+                dir.path(),
+                &name,
+                crate::state::Stall::new(i as u64 + 100, None),
+            );
+        }
+        assert_eq!(state.held.len(), MAX_HELD_BATCHES);
+        assert!(
+            !state.held.contains_key("agent-00"),
+            "evicted something other than the oldest hold"
+        );
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("DROPPING the batch held for agent-00"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn daemon_status_separates_held_batches_from_stalled_agents() {
+        // A held batch nobody can see is the same failure in a different
+        // costume, and an agent that is gone cannot be fixed at its pane the
+        // way a stalled one can — so the two are listed apart.
+        let session = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        state
+            .stalled
+            .insert("present".into(), crate::state::Stall::new(9, None));
+        state.held.insert(
+            "gone".into(),
+            crate::state::Held {
+                cursor: 3,
+                held_since: 4,
+                batch: 7,
+                session: Some("sess-1".into()),
+                warned: false,
+                released: false,
+            },
+        );
+        crate::state::save(session.path(), &state).unwrap();
+        let holds = held_batches(session.path());
+        assert_eq!(
+            holds.stalled,
+            vec![("(ungrouped room)".to_string(), "present".to_string(), 9)]
+        );
+        assert_eq!(
+            holds.absent,
+            vec![("(ungrouped room)".to_string(), "gone".to_string(), 7, 4)]
+        );
+    }
+
     /// A prompt herdr accepted while leaving the text on the composer. This
     /// is the #26 defect: the batch never reached the agent, so treating the
     /// `Ok` as delivery advances the cursor past messages nobody saw.
@@ -2746,7 +3237,7 @@ mod tests {
         crate::state::save(&room, &grouped).unwrap();
 
         assert_eq!(
-            held_batches(session.path()),
+            held_batches(session.path()).stalled,
             vec![
                 (
                     "(ungrouped room)".to_string(),
@@ -2769,7 +3260,8 @@ mod tests {
         // over.
         let session = tempfile::tempdir().unwrap();
         std::fs::write(session.path().join("state.json"), "garbage").unwrap();
-        assert!(held_batches(session.path()).is_empty());
+        let holds = held_batches(session.path());
+        assert!(holds.stalled.is_empty() && holds.absent.is_empty());
         assert!(daemon_log(session.path()).is_empty());
     }
 

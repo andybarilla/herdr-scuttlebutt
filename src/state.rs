@@ -49,6 +49,10 @@ pub struct DaemonState {
     /// Keyed by agent and never by batch: an entry that re-armed when the
     /// batch grew would restart the run-up to the cap on every new room
     /// message, which is the redelivery loop the threshold exists to stop.
+    ///
+    /// Every agent in here is one herdr is still listing. An entry whose
+    /// agent goes away is moved to `held` rather than purged with the
+    /// presence state (#43), and comes back here if that name is resumed.
     #[serde(default)]
     pub stalled: HashMap<String, Stall>,
     /// The most recent `agent_session` id herdr reported for each agent.
@@ -62,6 +66,17 @@ pub struct DaemonState {
     /// which is the case for the agent kinds that do not have them.
     #[serde(default)]
     pub last_session: HashMap<String, String>,
+    /// Batches held for agents that are no longer present. The absence
+    /// purge clears presence state on its own schedule (six seconds at the
+    /// 2s tick), which is shorter than closing and reopening a pane — the
+    /// most natural way a human clears a wedge. Taking the stall with the
+    /// presence state lost the batch on exactly that path (#43), so the
+    /// stall moves here instead, carrying the cursor delivery must resume
+    /// from. Nothing here expires on a timer: an entry leaves when its
+    /// batch is delivered, when a human drops it, or when the room's cap
+    /// evicts the oldest to bound the file.
+    #[serde(default)]
+    pub held: HashMap<String, Held>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
@@ -111,6 +126,41 @@ impl Stall {
     }
 }
 
+/// A batch whose agent has gone from `herdr agent list` entirely. Split
+/// from `Stall`, which is about an agent that is still there and not
+/// taking deliveries: the two are reported separately because a human can
+/// fix one at the pane and the other has no pane to fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Held {
+    /// Where redelivery resumes. The cursor as of the purge, so it still
+    /// sits below every message the stall was holding.
+    pub cursor: u64,
+    /// Highest message id when the stall opened, carried over so the
+    /// reports that say when the hold began stay true across the purge.
+    pub held_since: u64,
+    /// Highest message id known to be waiting, for `daemon-status`. Nothing
+    /// gates on it.
+    pub batch: u64,
+    /// The session id herdr last reported for the agent that owned this
+    /// batch. Equality with a returning agent's id is the only evidence
+    /// that the name still means the same process, which is what gates
+    /// automatic redelivery (#43). `None` means herdr never reported one.
+    pub session: Option<String>,
+    /// Whether the daemon has already said this batch is held for a name
+    /// it cannot match to the agent now using it. Once per record, so a
+    /// standing mismatch does not print a line every tick; `daemon-status`
+    /// is where it stays visible.
+    #[serde(default)]
+    pub warned: bool,
+    /// Whether a human has confirmed that the name still means the agent
+    /// this batch was held for (`scuttlebutt held <agent> --deliver`). The
+    /// session id is the only thing that can decide it automatically, and
+    /// it decides only when both sides carry one; this is the way out of
+    /// every case where it cannot.
+    #[serde(default)]
+    pub released: bool,
+}
+
 pub fn load(dir: &Path) -> DaemonState {
     let path = dir.join("state.json");
     let contents = match std::fs::read_to_string(&path) {
@@ -151,6 +201,31 @@ pub fn save(dir: &Path, s: &DaemonState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_batch_roundtrips() {
+        // The cursor is the whole point of the record: a hold that came
+        // back without it would resume at tail, which is the loss.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::default();
+        s.held.insert(
+            "reviewer".into(),
+            Held {
+                cursor: 12,
+                held_since: 13,
+                batch: 19,
+                session: Some("sess-1".into()),
+                warned: true,
+                released: false,
+            },
+        );
+        save(dir.path(), &s).unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.held["reviewer"].cursor, 12);
+        assert_eq!(loaded.held["reviewer"].session.as_deref(), Some("sess-1"));
+        assert!(loaded.held["reviewer"].warned);
+        assert!(!loaded.held["reviewer"].released);
+    }
 
     #[test]
     fn roundtrips() {
@@ -210,6 +285,7 @@ mod tests {
         // fields added after this file was written default rather than
         // failing the parse and resetting every cursor
         assert!(loaded.unconfirmed_streak.is_empty());
+        assert!(loaded.held.is_empty());
         assert!(loaded.stalled.is_empty());
         assert!(
             !daemon_log(dir.path()).contains("delivery cursors reset"),

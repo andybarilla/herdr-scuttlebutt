@@ -63,6 +63,17 @@ enum Cmd {
     DaemonStatus,
     /// Stop the daemon
     DaemonStop,
+    /// Deliver or discard a batch held for an agent that is no longer present
+    Held {
+        /// The agent name the batch is held for
+        agent: String,
+        /// Deliver it to whatever now holds that name
+        #[arg(long, conflicts_with = "drop_it")]
+        deliver: bool,
+        /// Discard it
+        #[arg(long = "drop", conflicts_with = "deliver")]
+        drop_it: bool,
+    },
     /// Print the focused workspace's checkout path (used by the pane scripts)
     #[command(hide = true)]
     SessionCwd,
@@ -105,6 +116,17 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
+        Cmd::Held {
+            agent,
+            deliver,
+            drop_it,
+        } => {
+            if deliver == drop_it {
+                // Both flags is already refused by clap; neither is this.
+                anyhow::bail!("pass exactly one of --deliver or --drop");
+            }
+            daemon::held_action(&paths::session_dir()?, &agent, deliver)
+        }
         Cmd::SessionCwd => {
             println!("{}", herd::focused_cwd()?);
             Ok(())
