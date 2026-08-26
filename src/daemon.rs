@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Non-deliveries to one agent before the daemon stops prompting it. Two
-/// counters reach it over different events: `fail_counts` counts every
-/// non-delivery of one batch and restarts when the batch grows, while
+/// Non-deliveries to one agent before the daemon stalls it. Two counters
+/// reach it over different events: `fail_counts` counts every non-delivery
+/// of one batch and restarts when the batch grows, while
 /// `unconfirmed_streak` counts only unconfirmed deliveries and ignores the
 /// batch. Either reaching this stalls the agent — its batch is held, its
 /// cursor left alone, and delivery drops to `retry_after`'s widening backoff
@@ -19,10 +19,20 @@ use std::sync::{Arc, OnceLock};
 /// `herdr agent list` for `MAX_ABSENCES` passes loses its cursor and its
 /// stall with the rest of its state, and re-enrolls at the tail.
 ///
-/// The intro prompt shares the constant and not the behaviour: it gives up
-/// and moves on, because a missing intro costs an explanation rather than a
-/// message.
-pub const MAX_BATCH_FAILURES: u32 = 5;
+/// The cost of reaching it is delivery itself: nothing else lands at that
+/// pane until the stall lifts. `MAX_INTRO_FAILURES` gates the other,
+/// cheaper give-up and is deliberately a separate number (#44).
+pub const MAX_FAILURES_BEFORE_STALL: u32 = 5;
+
+/// Failed intro prompts to one agent before the daemon stops trying to
+/// explain the room and marks it introduced anyway. It shares
+/// `MAX_FAILURES_BEFORE_STALL`'s value and not its behaviour: giving up here
+/// costs an agent the explanation of what scuttlebutt is, after which it
+/// still receives every batch, so the number is free to move on its own
+/// (#44). Nothing retries an intro within an enrollment; the absence purge
+/// is the only way back, because it drops `introduced` with the rest of the
+/// agent's state and the next listing introduces it afresh.
+pub const MAX_INTRO_FAILURES: u32 = 5;
 
 /// Delivery opportunities a freshly stalled agent waits before it is offered
 /// its batch again. At the 2s tick that is about a minute, which is long
@@ -1107,18 +1117,20 @@ pub fn tick(
                     report(
                         dir,
                         &format!(
-                            "[scuttlebutt] intro to {} {why} ({fails}/{MAX_BATCH_FAILURES})",
+                            "[scuttlebutt] intro to {} {why} ({fails}/{MAX_INTRO_FAILURES})",
                             a.name
                         ),
                     );
-                    if fails >= MAX_BATCH_FAILURES {
-                        // Same terminal action as a wedged batch: give up and
-                        // move on, so the agent still receives room traffic.
+                    if fails >= MAX_INTRO_FAILURES {
+                        // Terminal for the intro alone: give up and move on,
+                        // so the agent still receives room traffic. A wedged
+                        // batch stalls and holds instead (#39) — different
+                        // costs, hence the separate constants (#44).
                         report(
                             dir,
                             &format!(
                                 "[scuttlebutt] GIVING UP on intro for {} after \
-                                 {MAX_BATCH_FAILURES} failures; it will receive \
+                                 {MAX_INTRO_FAILURES} failures; it will receive \
                                  batches without an explanation",
                                 a.name
                             ),
@@ -1222,8 +1234,9 @@ pub fn tick(
                 // The counters are left exactly as the stall found them,
                 // and `unconfirmed` goes unread for the same reason: they
                 // record how the threshold was reached, and counting
-                // retries into them would print `batch 6/5` and make the
-                // numbers mean two different things.
+                // retries into them would print a batch count past the cap
+                // it is shown against and make the numbers mean two
+                // different things.
                 let stall = state
                     .stalled
                     .get_mut(&a.name)
@@ -1283,8 +1296,9 @@ pub fn tick(
                 // every tick cannot keep an unconfirmable agent below the
                 // threshold forever. Only unconfirmed deliveries advance it,
                 // but the stored value is what gets reported either way: a
-                // hard error in the middle of a streak must not log 0/5 and
-                // make the eventual stall look like it came from nowhere.
+                // hard error in the middle of a streak must not log a
+                // streak of 0 and make the eventual stall look like it came
+                // from nowhere.
                 if unconfirmed {
                     *state.unconfirmed_streak.entry(a.name.clone()).or_insert(0) += 1;
                 }
@@ -1297,12 +1311,12 @@ pub fn tick(
                     dir,
                     &format!(
                         "[scuttlebutt] delivery to {} {why} \
-                         (batch {fails}/{MAX_BATCH_FAILURES}, \
-                         unconfirmed {streak}/{MAX_BATCH_FAILURES})",
+                         (batch {fails}/{MAX_FAILURES_BEFORE_STALL}, \
+                         unconfirmed {streak}/{MAX_FAILURES_BEFORE_STALL})",
                         a.name
                     ),
                 );
-                if fails >= MAX_BATCH_FAILURES || streak >= MAX_BATCH_FAILURES {
+                if fails >= MAX_FAILURES_BEFORE_STALL || streak >= MAX_FAILURES_BEFORE_STALL {
                     // The cursor stays where it is: advancing it here is what
                     // dropped the batch (#39). `fail_counts` and
                     // `unconfirmed_streak` are left standing too — clearing
@@ -1318,7 +1332,7 @@ pub fn tick(
                             dir,
                             &format!(
                                 "[scuttlebutt] STALLED: {} has not confirmed a delivery in \
-                                 {MAX_BATCH_FAILURES} attempts. Holding the batch up to \
+                                 {MAX_FAILURES_BEFORE_STALL} attempts. Holding the batch up to \
                                  #{max_id}; the room continues for everyone else. Delivery \
                                  to it drops to a widening retry and resumes on its own \
                                  when one is confirmed or a new session appears at that \
@@ -1669,16 +1683,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_intro_gives_up_at_the_batch_cap() {
+    fn failed_intro_gives_up_at_the_intro_cap() {
         let dir = tempfile::tempdir().unwrap();
         let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
         herd.fail_prompts = true;
         let mut state = DaemonState::default();
         state.deliverable_streak.insert("reviewer".into(), 9);
-        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+        for _ in 0..(MAX_INTRO_FAILURES - 1) {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
-        assert_eq!(state.intro_fails["reviewer"], MAX_BATCH_FAILURES - 1);
+        assert_eq!(state.intro_fails["reviewer"], MAX_INTRO_FAILURES - 1);
         assert!(!state.introduced.contains("reviewer"));
 
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
@@ -1970,12 +1984,15 @@ mod tests {
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
-        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+        for _ in 0..(MAX_FAILURES_BEFORE_STALL - 1) {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         // not yet at the cap: the batch is still pending, cursor unmoved
         assert_eq!(state.cursors["reviewer"], 0);
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+        assert_eq!(
+            state.fail_counts["reviewer"].0,
+            MAX_FAILURES_BEFORE_STALL - 1
+        );
 
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         // after the 5th consecutive failure the agent stalls: the batch is
@@ -1983,7 +2000,7 @@ mod tests {
         // says which agent is wedged
         assert_eq!(state.cursors["reviewer"], 0);
         assert_eq!(state.stalled["reviewer"].batch, 1);
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_FAILURES_BEFORE_STALL);
     }
 
     /// A prompt herdr accepted while leaving the text on the composer. This
@@ -2047,11 +2064,14 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+        for _ in 0..(MAX_FAILURES_BEFORE_STALL - 1) {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(state.cursors["reviewer"], 0);
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+        assert_eq!(
+            state.fail_counts["reviewer"].0,
+            MAX_FAILURES_BEFORE_STALL - 1
+        );
 
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         // one bad pane stalls itself, loudly, and keeps its batch
@@ -2075,7 +2095,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(
@@ -2108,7 +2128,7 @@ mod tests {
         state.cursors.insert("builder".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES + 1 {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL + 1 {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert!(state.stalled.contains_key("reviewer"));
@@ -2141,7 +2161,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for i in 0..MAX_BATCH_FAILURES + 5 {
+        for i in 0..MAX_FAILURES_BEFORE_STALL + 5 {
             // the room keeps moving underneath the stalled agent
             append(dir.path(), "human", &format!("later {i}")).unwrap();
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
@@ -2166,7 +2186,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert!(state.stalled.contains_key("reviewer"));
@@ -2207,7 +2227,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(state.stalled["reviewer"].session, None);
@@ -2235,7 +2255,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         let sent = herd.prompts.borrow().len();
@@ -2275,7 +2295,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(state.stalled["reviewer"].held_since, 1);
@@ -2312,7 +2332,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         // the room moves on, and a retry fails against the bigger batch
@@ -2352,7 +2372,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         append(dir.path(), "human", "and another").unwrap();
@@ -2386,7 +2406,7 @@ mod tests {
         append(dir.path(), "human", "hello").unwrap();
 
         // seen with an id, then the field goes missing across the threshold
-        for _ in 0..MAX_BATCH_FAILURES - 1 {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL - 1 {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         herd.drop_session("reviewer");
@@ -2406,7 +2426,7 @@ mod tests {
             "a dropped field read as a restart"
         );
         assert_eq!(herd.prompts.borrow().len(), sent, "back to full rate");
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_FAILURES_BEFORE_STALL);
     }
 
     #[test]
@@ -2426,7 +2446,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(
@@ -2476,7 +2496,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(state.stalled["reviewer"].session, None);
@@ -2497,7 +2517,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert_eq!(
@@ -2546,7 +2566,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         assert!(state.stalled.contains_key("reviewer"));
@@ -2581,7 +2601,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         herd.unconfirmed.clear();
@@ -2603,7 +2623,7 @@ mod tests {
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "hello").unwrap();
 
-        for _ in 0..MAX_BATCH_FAILURES {
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
         let sent = herd.prompts.borrow().len();
@@ -2638,8 +2658,11 @@ mod tests {
         assert_eq!(state.stalled["reviewer"].retries, 2);
         // the counters that led to the stall are the record of it, and a
         // retry is not part of that record
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
-        assert_eq!(state.unconfirmed_streak["reviewer"], MAX_BATCH_FAILURES);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_FAILURES_BEFORE_STALL);
+        assert_eq!(
+            state.unconfirmed_streak["reviewer"],
+            MAX_FAILURES_BEFORE_STALL
+        );
         let log = daemon_log(dir.path());
         assert_eq!(
             log.matches("STALLED: reviewer").count(),
@@ -2703,24 +2726,24 @@ mod tests {
 
     #[test]
     fn an_unconfirmable_agent_converges_while_the_room_is_busy() {
-        // The room this runs in gets traffic faster than five ticks, so the
-        // batch max id changes every pass and `fail_counts`' streak restarts
-        // every pass. Without a batch-independent counter the agent is
-        // re-prompted forever and never reaches the skip.
+        // The room this runs in gets traffic faster than the cap's worth of
+        // ticks, so the batch max id changes every pass and `fail_counts`'
+        // streak restarts every pass. Without a batch-independent counter the
+        // agent is re-prompted forever and never reaches the stall.
         let dir = tempfile::tempdir().unwrap();
         let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
 
-        for i in 0..MAX_BATCH_FAILURES {
+        for i in 0..MAX_FAILURES_BEFORE_STALL {
             append(dir.path(), "human", &format!("message {i}")).unwrap();
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
             // the per-batch counter never gets past its first failure
             assert_eq!(state.fail_counts.get("reviewer").map(|e| e.0), Some(1));
             assert_eq!(state.unconfirmed_streak["reviewer"], i + 1);
         }
-        let tail = u64::from(MAX_BATCH_FAILURES);
+        let tail = u64::from(MAX_FAILURES_BEFORE_STALL);
         // Converged means stopped prompting, not moved on: the batch is held
         // and the cursor is still where the last confirmed delivery left it.
         assert_eq!(state.stalled["reviewer"].batch, tail, "never converged");
@@ -2773,8 +2796,11 @@ mod tests {
         herd.fail_prompts = true;
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         let log = daemon_log(dir.path());
+        let cap = MAX_FAILURES_BEFORE_STALL;
         assert!(
-            log.contains("failed: stalled (batch 3/5, unconfirmed 2/5)"),
+            log.contains(&format!(
+                "failed: stalled (batch 3/{cap}, unconfirmed 2/{cap})"
+            )),
             "log was: {log}"
         );
     }
@@ -2829,10 +2855,13 @@ mod tests {
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
         append(dir.path(), "human", "one").unwrap();
-        for _ in 0..(MAX_BATCH_FAILURES - 1) {
+        for _ in 0..(MAX_FAILURES_BEFORE_STALL - 1) {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
-        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
+        assert_eq!(
+            state.fail_counts["reviewer"].0,
+            MAX_FAILURES_BEFORE_STALL - 1
+        );
 
         // a new message grows the batch: this is not the same batch anymore
         append(dir.path(), "human", "two").unwrap();
