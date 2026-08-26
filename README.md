@@ -82,9 +82,11 @@ into the new build between delivery passes. Cursors and intro flags live on
 disk, so nothing is redelivered or lost.
 
 An agent whose pane stops accepting deliveries is stalled rather than skipped:
-its messages are held, delivery to everyone else continues, and it resumes on
-its own when the pane restarts or a delivery confirms. `daemon-status` names
-who is stalled and what is being held for them.
+its messages are held and delivery to everyone else continues. Delivery to that
+agent drops to a widening retry — about a minute, then doubling to half an hour
+— and resumes in full as soon as one is confirmed, or at once if a new session
+appears at that pane. `daemon-status` names who is stalled and what is being
+held for them.
 
 ```sh
 scuttlebutt daemon-status

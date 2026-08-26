@@ -35,9 +35,15 @@ pub struct DaemonState {
     pub intro_fails: HashMap<String, u32>,
     /// Agents whose batch reached `MAX_BATCH_FAILURES` with nothing ever
     /// confirming a delivery. While an agent is in here the daemon leaves
-    /// its cursor alone and stops prompting it, so the batch survives until
-    /// its pane is fixed — the alternative, advancing the cursor, loses
-    /// those messages outright (#39).
+    /// its cursor alone and drops to a widening backoff instead of prompting
+    /// it every tick, so the batch survives until its pane can take it — the
+    /// alternative, advancing the cursor, loses those messages outright
+    /// (#39).
+    ///
+    /// The backoff rather than silence is what makes the exits reachable: a
+    /// pane that recovers in place reports the same session id and would
+    /// never be seen to recover if nothing were ever sent to it again, and
+    /// an agent herdr reports no session id for has no other way out at all.
     ///
     /// Keyed by agent and never by batch: an entry that re-armed when the
     /// batch grew would restart the five-failure cycle on every new room
@@ -55,15 +61,35 @@ pub struct DaemonState {
 /// when the pane proves it can receive again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stall {
-    /// Highest message id in the batch being held. Reported and shown by
-    /// `daemon-status` so a human can see what is waiting; nothing gates on
-    /// it, and a batch that grows past it does not clear the stall.
+    /// Highest message id in the batch being held, refreshed on every retry.
+    /// Reported and shown by `daemon-status` so a human can see what is
+    /// waiting; nothing gates on it, and a batch that grows past it neither
+    /// clears the stall nor shortens the wait.
     pub batch: u64,
-    /// The agent's session id when it stalled, or `None` if herdr reported
-    /// none. Compared against the live id to notice a restarted pane; two
-    /// `None`s are not a match, so an agent herdr reports no id for resumes
-    /// only on a confirming delivery.
+    /// The agent's session id when it stalled, or when it last failed a
+    /// retry; `None` if herdr reported none. A different id means a
+    /// different process is at that pane, which lifts the stall at once
+    /// rather than waiting out the backoff.
     pub session: Option<String>,
+    /// Delivery opportunities counted since the last retry — ticks where
+    /// this agent was deliverable and unfocused, not wall-clock seconds. A
+    /// pane nobody can be prompted at does not burn its backoff.
+    pub waited: u32,
+    /// Retries made since the stall opened. Sets how long the next wait is,
+    /// and is what widens it.
+    pub retries: u32,
+}
+
+impl Stall {
+    /// A stall as it opens: nothing waited, nothing retried yet.
+    pub fn new(batch: u64, session: Option<String>) -> Self {
+        Stall {
+            batch,
+            session,
+            waited: 0,
+            retries: 0,
+        }
+    }
 }
 
 pub fn load(dir: &Path) -> DaemonState {
@@ -127,13 +153,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = DaemonState::default();
         s.cursors.insert("reviewer".into(), 7);
-        s.stalled.insert(
-            "reviewer".into(),
-            Stall {
-                batch: 12,
-                session: Some("session-a".into()),
-            },
-        );
+        s.stalled
+            .insert("reviewer".into(), Stall::new(12, Some("session-a".into())));
         save(dir.path(), &s).unwrap();
         let loaded = load(dir.path());
         assert_eq!(loaded.stalled["reviewer"].batch, 12);

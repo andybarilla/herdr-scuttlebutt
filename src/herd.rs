@@ -14,8 +14,9 @@ pub struct AgentInfo {
     /// means `herdr agent list` did not emit it — for the agent kinds that
     /// never report one, and for a listing where it is momentarily missing.
     /// A restarted agent reports a new id, which is what lets the daemon
-    /// tell "this pane is a fresh process" from "this pane went quiet"; an
-    /// absent id claims neither, so it must never be read as a restart.
+    /// tell "this pane is a fresh process" from "this pane went quiet". An
+    /// absent id is not evidence either way; `tick` decides what each
+    /// combination of absent and present means, and says why there.
     pub session: Option<String>,
 }
 
