@@ -763,7 +763,13 @@ const UNGROUPED_ROOM: &str = "(ungrouped room)";
 /// room then agent so the listing is stable between runs.
 ///
 /// Rooms are the session dir itself — the ungrouped layout — plus one level
-/// of group dirs beneath it; nothing deeper is a room. Parsed here rather
+/// of group dirs beneath it; nothing deeper is a room. Swept here rather
+/// than through `groups::rooms`, which answers a different question: it
+/// takes the groups config into account and yields nothing at all when that
+/// config is broken. A held batch has to be reportable whatever the config
+/// says, since a state.json on disk is the record that the messages exist.
+///
+/// Parsed here rather
 /// than through `state::load` because that reports a reset warning into
 /// `daemon.log` on an unreadable file, and asking for status must not write
 /// to the log the daemon owns. An unreadable room contributes nothing.
