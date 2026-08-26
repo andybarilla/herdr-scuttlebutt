@@ -361,7 +361,11 @@ fn box_span(border: &str) -> (usize, usize) {
 /// keeps the furniture it exists to remove.
 ///
 /// A selector with nothing to promote, or one after a character already two
-/// cells wide, adds nothing.
+/// cells wide, adds nothing. A second consecutive selector promotes again,
+/// so `\u{26a0}\u{fe0f}\u{fe0f}` measures three where a terminal draws two. Left alone
+/// deliberately: over-counting a row clips it early, which can only shorten
+/// what a composer is read as holding, and shortening is the direction that
+/// costs a repeat rather than a batch.
 fn cell_width(c: char, previous: usize) -> usize {
     match c {
         '\u{fe0f}' => usize::from(previous == 1),
@@ -994,15 +998,27 @@ mod tests {
         // unconfirmed streak skips a batch just as surely as a failed
         // delivery does.
         //
-        // What excludes them is the rule beneath the composer's rows, which
-        // no echo has. "No rule is drawn beneath an echo" was the claim
-        // here and it is false: a message body carrying a table or a `---`
-        // puts one inside the echo's own gutter, which is
-        // `a_rule_inside_a_gutter_row_does_not_box_the_transcript`. What
-        // holds is narrower — a rule inside a gutter row is not this box's
-        // edge, and an overlay bordered below an echo would close a real
-        // box, which is survivable only because every box is kept rather
-        // than the lowest. One region here, and it is the composer.
+        // What excludes them here is that no rule is drawn beneath any of
+        // them. That is a property of this pane, not a guarantee, and two
+        // rounds of this comment claiming otherwise is why it is spelled
+        // out. A rule inside an echo's own gutter row — a table or a `---`
+        // in a message body — is covered, by
+        // `a_rule_inside_a_gutter_row_does_not_box_the_transcript`. A rule
+        // drawn on its own line directly beneath an echo's block is not:
+        // inserting one `\u{2579}\u{2580}\u{2580}\u{2580}` line below an echo here yields that echo as
+        // a region holding our batch, and `Some(true)` on a clear composer
+        // for as long as the pane stands.
+        //
+        // Accepted rather than closed. No capture shows a rule beside an
+        // echo, every OpenCode pane we have carries exactly one rule, the
+        // shape needs no blank row between the two blocks, and what it
+        // costs is the bounded `Some(true)` — a stall that holds the batch
+        // — rather than a drop.
+        //
+        // Note what does *not* help: `composer_holds` returns on the first
+        // region matching our text, so keeping every box rather than the
+        // lowest never enters into this. That serves the opposite case, an
+        // overlay drawn below a real composer.
         assert_eq!(composer_regions(OC_LIVE).composers.len(), 1);
         assert_eq!(composer_holds(OC_LIVE, OC_SENT), Some(false));
     }
@@ -1181,6 +1197,51 @@ mod tests {
         assert_eq!(display_width("\u{26a0}\u{fe0f}"), 2);
         // Already two cells; the selector adds nothing to it.
         assert_eq!(display_width("\u{1f389}\u{fe0f}"), 2);
+    }
+
+    /// A pane's own composer rows replaced with the batch, keeping both of
+    /// its borders so the box still measures as one.
+    fn holding(pane: &str) -> String {
+        let mut lines: Vec<&str> = pane.lines().collect();
+        let top = lines
+            .iter()
+            .rposition(|l| is_rule(l))
+            .and_then(|bottom| lines[..bottom].iter().rposition(|l| is_rule(l)))
+            .expect("pane lost its composer");
+        let bottom = top
+            + lines[top..]
+                .iter()
+                .skip(1)
+                .position(|l| is_rule(l))
+                .expect("pane lost its composer")
+            + 1;
+        let batch: Vec<&str> = HOLDS_BATCH
+            .lines()
+            .skip_while(|l| !l.starts_with('\u{276f}'))
+            .take_while(|l| !is_rule(l))
+            .collect();
+        lines.splice(top + 1..bottom, batch);
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_table_pane_holding_a_batch_is_not_confirmed() {
+        // The cross-product the suite was missing. Tables were tested only
+        // against a clear composer and held batches only against
+        // table-free panes, so the one shape nobody covered was the one
+        // where a moved boundary costs a batch rather than an agent: a
+        // pane whose transcript draws rules *and* whose composer still
+        // holds us.
+        for (name, pane) in [
+            ("a rendered table", TABLE),
+            ("a table with a wrapped cell", WRAPPED_TABLE),
+        ] {
+            let held = holding(pane);
+            let regions = composer_regions(&held);
+            assert_eq!(regions.composers.len(), 1, "{name}");
+            assert!(regions.others.is_empty(), "{name}");
+            assert_eq!(composer_holds(&held, RULE), Some(true), "{name}");
+        }
     }
 
     #[test]
