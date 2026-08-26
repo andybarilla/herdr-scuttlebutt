@@ -2482,6 +2482,36 @@ mod tests {
     }
 
     #[test]
+    fn a_second_hold_for_one_name_keeps_the_lower_cursor() {
+        // Reachable: an agent comes back to a hold it cannot be matched to,
+        // enrols at tail, wedges again and vanishes again. Resuming from the
+        // older record's cursor covers both batches; the newer one does not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        state.cursors.insert("reviewer".into(), 4);
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "reviewer",
+            crate::state::Stall::new(6, None),
+        );
+        state.cursors.insert("reviewer".into(), 9);
+        hold_batch(
+            &mut state,
+            dir.path(),
+            "reviewer",
+            crate::state::Stall::new(11, Some("sess-2".into())),
+        );
+        let held = &state.held["reviewer"];
+        assert_eq!(held.cursor, 4, "the older batch would have been skipped");
+        assert_eq!(held.held_since, 6);
+        assert_eq!(held.batch, 11);
+        // Newest id, because the gate compares against the process most
+        // recently seen under this name.
+        assert_eq!(held.session.as_deref(), Some("sess-2"));
+    }
+
+    #[test]
     fn held_batches_are_bounded_by_a_count() {
         // Nothing here expires on a timer, so the cap is the whole bound:
         // the oldest hold is evicted, loudly, rather than state.json growing
