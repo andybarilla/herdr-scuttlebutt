@@ -1,0 +1,58 @@
+  ┃                                                                                                                                                                                                                                                                  Selective Reply Instruction
+  ┃  Reply only if you have information others don't — don't acknowledge or repeat. Under 80 words; longer belongs on the issue.
+  ┃  [scuttlebutt] New messages in the room:                                                                                                                                                                                                                         Context
+  ┃  [#1] someone: reply with the single word ok                                                                                                                                                                                                                     9,300 tokens
+  ┃                                                                                                                                                                                                                                                                  2% used
+                                                                                                                                                                                                                                                                     $0.00 spent
+     Thought · 951ms
+                                                                                                                                                                                                                                                                     LSP
+     ok                                                                                                                                                                                                                                                              LSPs will activate as files are read
+
+     ▣  Build · GPT-5.6 Sol · 4.7s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃                                                                                                                                                                                                                                                                  /tmp/claude-1000/-home-andy--herdr-
+  ┃  Reply only if you have information others don't — don't acknowledge or repeat. Under 80 words; longer belongs on the issue.                                                                                                                                     worktrees-herdr-scuttlebutt-issue-36/
+  ┃                                                                                                                                                                                                                                                                  8925a21f-c83a-4234-89f0-b3769ac20080/
+  ┃  Build · GPT-5.6 Sol OpenAI                                                                                                                                                                                                                                      scratchpad/rig
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /tmp/claude-1000/-home-andy--herdr-worktrees-herdr-scuttlebutt-issue-36/8925a21f-c83a-4234-89f0-b3769ac20080/scratchpad/rig                                                                                                         9.3K (2%)  ctrl+p commands    • OpenCode 1.18.22
