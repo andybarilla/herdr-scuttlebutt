@@ -151,7 +151,11 @@ pub struct Held {
     /// The session id herdr last reported for the agent that owned this
     /// batch. Equality with a returning agent's id is the only evidence
     /// that the name still means the same process, which is what gates
-    /// automatic redelivery (#43). `None` means herdr never reported one.
+    /// automatic redelivery (#43). `None` means no such evidence exists —
+    /// either herdr never reported an id for that agent, or two stalls
+    /// merged under this name and disagreed about whose batch it is, which
+    /// leaves the hold unable to say. Both refuse every returning agent
+    /// until a human releases it.
     pub session: Option<String>,
     /// Whether the daemon has already said this batch is held for a name
     /// it cannot match to the agent now using it. Once per record, so a
@@ -186,14 +190,17 @@ pub struct Release {
     /// forever in exactly the room where it is most likely to be stale.
     ///
     /// This is a bound on the *authorization*, never on the batch: a hold
-    /// whose release lapses is still held, and still listed.
+    /// whose release lapses is still held, and still listed. A stamp in
+    /// the future is read as lapsed rather than as fresh, so a state file
+    /// written by a machine whose clock runs ahead cannot hold one open.
     pub at: String,
 }
 
 /// A held batch the room's cap evicted. Kept so `daemon-status` can still
 /// name what was dropped: a batch that leaves the state file with only a
 /// `daemon.log` line behind is invisible to the interface that is supposed
-/// to be the record of what is waiting.
+/// to be the record of what is waiting. Capped like the holds are, and
+/// trimmed on every tick rather than only when one is written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dropped {
     pub agent: String,

@@ -1132,7 +1132,9 @@ const MAX_DROPPED_NOTES: usize = 8;
 /// A release is an authorization to deliver now, not a permanent arrangement
 /// for whoever next answers to that name: long enough to cover reopening a
 /// pane and getting it to idle, short enough that a release forgotten in a
-/// room the agent has left cannot arm a delivery days later.
+/// room the agent has left cannot arm a delivery days later. `release_live`
+/// bounds it in both directions, so a stamp in the future cannot outlast it
+/// either.
 const RELEASE_WINDOW_MINUTES: i64 = 30;
 
 /// Whether a release is still standing. An unparseable timestamp counts as
@@ -1141,8 +1143,15 @@ const RELEASE_WINDOW_MINUTES: i64 = 30;
 fn release_live(r: &crate::state::Release) -> bool {
     match chrono::DateTime::parse_from_rfc3339(&r.at) {
         Ok(at) => {
-            chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc))
-                < chrono::Duration::minutes(RELEASE_WINDOW_MINUTES)
+            let age = chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc));
+            // Bounded in both directions. A stamp in the future — a state
+            // file from another machine, a clock that jumped — would
+            // otherwise be live for the whole of its lead plus the window,
+            // arming exactly the unidentified delivery this window exists
+            // to bound. Costing a human a retype after a clock skew is the
+            // cheaper mistake.
+            age >= chrono::Duration::zero()
+                && age < chrono::Duration::minutes(RELEASE_WINDOW_MINUTES)
         }
         Err(_) => false,
     }
@@ -1152,6 +1161,11 @@ fn release_live(r: &crate::state::Release) -> bool {
 /// the rest of it. Merging rather than replacing when the name already
 /// holds one: the older record's cursor is the lower of the two, so
 /// resuming from it covers both batches.
+///
+/// The batches merge and the identities do not. Two stalls under one name
+/// that cannot be shown to be one process leave the hold's session `None`,
+/// which refuses everyone until a human decides — see the comment on the
+/// merge itself for what taking the newer id would have cost.
 fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::state::Stall) {
     // A stall standing without a cursor is not reachable today, and the
     // fallback is 0 anyway rather than the batch's own id: `held_since` is
@@ -1174,9 +1188,30 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
     entry.cursor = entry.cursor.min(cursor);
     entry.held_since = entry.held_since.min(stall.held_since);
     entry.batch = entry.batch.max(stall.batch);
-    // Newest known id wins, because the gate compares against the process
-    // most recently seen under this name.
-    entry.session = stall.session.or_else(|| entry.session.clone());
+    // Merging two batches is right; merging their identities is not. This
+    // record answers "which process was this batch held for", and the
+    // moment two stalls under one name disagree about that, the honest
+    // answer is that nobody here knows — so the id goes to `None` and
+    // `may_resume` refuses everyone until a human decides.
+    //
+    // Taking the newest id instead would launder one agent's batch into
+    // another's hands with no human anywhere in it: A stalls and vanishes,
+    // B takes the name and is refused, B stalls and vanishes, and a merge
+    // that adopted B's id would hand A's messages to B on its next return.
+    // Newest-known is right for #42's in-place rule, where a listed pane's
+    // new id can only be that pane restarting; it is exactly wrong here,
+    // where a new id is equally consistent with a reused name.
+    let unified = match (&entry.session, &stall.session) {
+        (Some(was), Some(now)) if was == now => Some(was.clone()),
+        (None, None) => None,
+        // Different ids, or one side that never had one: not one process.
+        _ => None,
+    };
+    // Reported whenever the two sides cannot be shown to be one process,
+    // including a first hold that never had an id: the record now covers
+    // two agents' messages and can no longer say whose they are.
+    let mixed_identity = entry.session != stall.session;
+    entry.session = unified;
     // Both re-armed by a fresh hold: this is a new stall, larger than the
     // one the last line described, so the mismatch warning is worth saying
     // again, and a release given against the earlier hold is not an answer
@@ -1184,6 +1219,18 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
     entry.warned = false;
     entry.release = None;
     let (batch, held_since) = (entry.batch, entry.held_since);
+    if mixed_identity {
+        report(
+            dir,
+            &format!(
+                "[scuttlebutt] a second batch is now held for {name} and the two \
+                 cannot be shown to belong to the same process; the hold can no \
+                 longer say whose messages it carries, so nothing will resume it \
+                 automatically. `scuttlebutt daemon-status` lists it; \
+                 `scuttlebutt held {name} --deliver` decides it."
+            ),
+        );
+    }
     // Evicted first, so the cap's own victim is not announced as kept one
     // line above the line dropping it.
     evict_oldest_held(state, dir);
@@ -1200,6 +1247,24 @@ fn hold_batch(state: &mut DaemonState, dir: &Path, name: &str, stall: crate::sta
              `scuttlebutt daemon-status` lists it until then."
         ),
     );
+}
+
+/// Enforces both of this room's caps. Called at the top of every tick and
+/// not only from the writer, because a `state.json` that arrived over
+/// either cap — an older build, a hand edit, a restore — is never trimmed
+/// by anything else.
+fn enforce_bounds(state: &mut DaemonState, dir: &Path) {
+    evict_oldest_held(state, dir);
+    trim_dropped_notes(state);
+}
+
+/// Enforces `MAX_DROPPED_NOTES`, oldest first. Separate from the eviction
+/// loop that pushes them: that loop returns early when the room is under
+/// the hold cap, so a state file carrying nothing but notes would keep
+/// every one of them.
+fn trim_dropped_notes(state: &mut DaemonState) {
+    let over = state.dropped.len().saturating_sub(MAX_DROPPED_NOTES);
+    state.dropped.drain(..over);
 }
 
 /// Enforces `MAX_HELD_BATCHES`. Oldest by `held_since`, tie-broken by name
@@ -1224,9 +1289,7 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
             held_since: dropped.held_since,
             at: chrono::Utc::now().to_rfc3339(),
         });
-        while state.dropped.len() > MAX_DROPPED_NOTES {
-            state.dropped.remove(0);
-        }
+        trim_dropped_notes(state);
         report(
             dir,
             &format!(
@@ -1255,7 +1318,9 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
 /// batch to an unrelated pane is worse than making a human confirm it.
 /// `release` is that confirmation: `scuttlebutt held <agent> --deliver`.
 ///
-/// A release does not skip the question, it answers it. Where herdr could
+/// A release does not skip the question, it answers it, and it can only
+/// ever widen what is allowed: the automatic comparison runs first, so a
+/// release naming one process cannot veto the return of another. Where herdr could
 /// report an id for the agent at that name when the human ran the command,
 /// the release carries it and is checked exactly like the automatic case —
 /// a human authorised a delivery to *that* process. Where it could not, the
@@ -1274,6 +1339,16 @@ fn evict_oldest_held(state: &mut DaemonState, dir: &Path) {
 /// a human closed and reopened. `--deliver` is what covers the rest, which
 /// is why it is not optional.
 fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
+    // The automatic answer first, so a release can only ever widen what is
+    // allowed. A human answering about one process must not veto the return
+    // of the process the batch was actually held for: `held --deliver`
+    // captures whichever id the listing carried at that moment, which in a
+    // multi-room session need not be the agent this hold is about.
+    if let (Some(was), Some(now)) = (&held.session, &a.session) {
+        if was == now {
+            return true;
+        }
+    }
     if let Some(r) = &held.release {
         if release_live(r) {
             return match (&r.session, &a.session) {
@@ -1393,12 +1468,7 @@ pub fn tick(
         .collect();
     let tail = log_store::last_id(dir)?;
 
-    // The cap belongs to the state file, not to one writer: `hold_batch` is
-    // the only production path that adds a hold, but a state.json that
-    // arrived over it — an older build, a hand edit, a restore — would
-    // otherwise carry any number of holds forever, since nothing else
-    // trims them.
-    evict_oldest_held(state, dir);
+    enforce_bounds(state, dir);
 
     let live: std::collections::HashSet<String> = agents.iter().map(|a| a.name.clone()).collect();
 
@@ -2529,6 +2599,13 @@ mod tests {
     /// pane a human closes. Returns the room dir and the state left behind.
     fn stalled_then_vanished(session: Option<&str>) -> (tempfile::TempDir, DaemonState) {
         let dir = tempfile::tempdir().unwrap();
+        let state = stalled_then_vanished_in(dir.path(), session).1;
+        (dir, state)
+    }
+
+    /// The same, in a room a caller already owns, so a test can keep using
+    /// it after the agent has gone.
+    fn stalled_then_vanished_in(dir: &Path, session: Option<&str>) -> ((), DaemonState) {
         let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
         if let Some(id) = session {
             herd.set_session("reviewer", id);
@@ -2537,16 +2614,16 @@ mod tests {
         let mut state = DaemonState::default();
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
-        append(dir.path(), "human", "the batch that must survive").unwrap();
+        append(dir, "human", "the batch that must survive").unwrap();
         for _ in 0..MAX_FAILURES_BEFORE_STALL {
-            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+            tick(&mut state, &herd, dir, &AgentFilter::default(), None).unwrap();
         }
         assert!(state.stalled.contains_key("reviewer"), "never stalled");
         let gone = FakeHerd::new(vec![]);
         for _ in 0..MAX_ABSENCES {
-            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+            tick(&mut state, &gone, dir, &AgentFilter::default(), None).unwrap();
         }
-        (dir, state)
+        ((), state)
     }
 
     /// The agent comes back able to receive, reporting `session`.
@@ -2709,12 +2786,70 @@ mod tests {
         assert_eq!(held.cursor, 4, "the older batch would have been skipped");
         assert_eq!(held.held_since, 6);
         assert_eq!(held.batch, 11);
-        // Newest id, because the gate compares against the process most
-        // recently seen under this name.
-        assert_eq!(held.session.as_deref(), Some("sess-2"));
+        // The batches merge and the identities do not: two stalls that
+        // disagree about whose batch this is leave a hold that says it does
+        // not know, rather than one that names the newcomer.
+        assert_eq!(held.session, None);
+        assert!(
+            daemon_log(dir.path()).contains("can no longer say"),
+            "an un-identified hold went unreported"
+        );
     }
 
-    /// A release given `mins` ago, for `session`.
+    #[test]
+    fn a_merge_cannot_launder_one_agents_batch_into_another() {
+        // The whole probe, through `tick`: the daemon must not refuse an
+        // agent on one tick and hand it the same batch on a later one with
+        // no human anywhere in it.
+        let dir = tempfile::tempdir().unwrap();
+        // A stalls holding the batch and vanishes.
+        let (_, mut state) = stalled_then_vanished_in(dir.path(), Some("sess-1"));
+        assert_eq!(state.held["reviewer"].session.as_deref(), Some("sess-1"));
+
+        // B takes the name, is refused, wedges on its own traffic and goes.
+        let mut b = FakeHerd::new(vec![("reviewer", "idle")]);
+        b.set_session("reviewer", "sess-2");
+        b.fail_prompts = true;
+        tick(&mut state, &b, dir.path(), &AgentFilter::default(), None).unwrap();
+        // Posted after B has enrolled, because it enrols at tail: a message
+        // already in the room when it appeared would be behind its cursor
+        // and it would have nothing to fail on.
+        append(dir.path(), "human", "traffic B fails on").unwrap();
+        // Ticked to the stall rather than for a counted number of passes:
+        // B has to be sighted, fail its intro its way to the give-up, and
+        // only then fail deliveries to the cap, and hard-coding that sum
+        // makes the test a puzzle about three constants.
+        for _ in 0..50 {
+            if state.stalled.contains_key("reviewer") {
+                break;
+            }
+            tick(&mut state, &b, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(!was_delivered(&b), "A's batch went to B on first contact");
+        assert!(state.stalled.contains_key("reviewer"), "B never stalled");
+        let gone = FakeHerd::new(vec![]);
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+
+        // B comes back as itself. The merged hold must not have adopted its
+        // id in the meantime.
+        assert_eq!(state.held["reviewer"].session, None);
+        let back = comes_back(
+            &mut state,
+            dir.path(),
+            Some("sess-2"),
+            REQUIRED_SIGHTINGS + 3,
+        );
+        assert!(
+            !was_delivered(&back),
+            "a merge handed one agent's held batch to another with no human in it"
+        );
+    }
+
+    /// A release given `mins` ago, for `session`. A negative `mins` stamps
+    /// it in the future, which is what a state file from another machine or
+    /// a jumped clock looks like.
     fn release_aged(session: Option<&str>, mins: i64) -> crate::state::Release {
         crate::state::Release {
             session: session.map(str::to_string),
@@ -2776,6 +2911,61 @@ mod tests {
         state.held.get_mut("reviewer").unwrap().release = Some(release_aged(None, 1));
         let back = comes_back(&mut state, dir.path(), None, 4);
         assert!(was_delivered(&back), "a live release did not deliver");
+    }
+
+    #[test]
+    fn a_release_stamped_in_the_future_is_not_live() {
+        // A state file from another machine, or a clock that jumped. Read
+        // as an age this is negative, and a naive `age < window` makes it
+        // live for the whole of its lead — arming the one arm of the gate
+        // that compares nothing.
+        let (dir, mut state) = stalled_then_vanished(None);
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(None, -1440));
+        let back = comes_back(&mut state, dir.path(), None, 4);
+        assert!(!was_delivered(&back), "a release from the future delivered");
+        assert!(state.held.contains_key("reviewer"));
+    }
+
+    #[test]
+    fn a_release_cannot_veto_the_automatic_path() {
+        // `held --deliver` captures whichever id the listing carried at
+        // that moment, which in a multi-room session need not belong to
+        // the agent this hold is about. A human answering about one process
+        // must not silently refuse the return of another.
+        let (dir, mut state) = stalled_then_vanished(Some("sess-1"));
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(Some("sess-9"), 0));
+        let back = comes_back(
+            &mut state,
+            dir.path(),
+            Some("sess-1"),
+            REQUIRED_SIGHTINGS + 3,
+        );
+        assert!(
+            was_delivered(&back),
+            "a release for another session vetoed the agent the batch was held for"
+        );
+    }
+
+    #[test]
+    fn dropped_notes_are_trimmed_even_with_no_holds() {
+        // The twin of the hold-cap fix: the note trim used to sit inside
+        // the eviction loop, which returns early under the hold cap, so a
+        // state file carrying nothing but notes kept every one of them.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        for i in 0..MAX_DROPPED_NOTES * 6 {
+            state.dropped.push(crate::state::Dropped {
+                agent: format!("agent-{i:02}"),
+                batch: i as u64,
+                held_since: i as u64,
+                at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+        let herd = FakeHerd::new(vec![]);
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.dropped.len(), MAX_DROPPED_NOTES);
+        // oldest dropped first, so the newest notes are the ones kept
+        assert!(state.dropped.iter().all(|d| d.batch >= 40));
     }
 
     #[test]
