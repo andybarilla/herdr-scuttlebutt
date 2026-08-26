@@ -2003,6 +2003,55 @@ mod tests {
         assert_eq!(state.fail_counts["reviewer"].0, MAX_FAILURES_BEFORE_STALL);
     }
 
+    #[test]
+    fn a_stalled_agent_that_vanishes_keeps_its_held_batch() {
+        // #43: a human clears a wedged pane by closing and reopening it,
+        // which takes longer than the six seconds `MAX_ABSENCES` tolerates.
+        // The purge used to take the stall and the cursor with the presence
+        // state, so the agent re-enrolled at tail and the held batch was
+        // never delivered — silently, since the stall that named it in
+        // `daemon-status` went with it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "sess-1");
+        herd.fail_prompts = true;
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "the batch that must survive").unwrap();
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"), "never stalled");
+
+        // the pane is gone for longer than the absence purge tolerates
+        let gone = FakeHerd::new(vec![]);
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+
+        // it comes back able to receive, and reporting the same session id:
+        // the one case where a name provably belongs to the same process.
+        let mut back = FakeHerd::new(vec![("reviewer", "idle")]);
+        back.set_session("reviewer", "sess-1");
+        // Enough passes for the re-enrolment's sightings and intro, both of
+        // which cost a tick before any batch moves.
+        for _ in 0..(REQUIRED_SIGHTINGS + 3) {
+            tick(&mut state, &back, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let prompts = back.prompts.borrow();
+        assert!(
+            prompts
+                .iter()
+                .any(|(n, t)| n == "reviewer" && t.contains("the batch that must survive")),
+            "the held batch was never delivered after the pane came back; \
+             cursor is {:?} against a tail of {}, prompts were {:?}",
+            state.cursors.get("reviewer"),
+            log_store::last_id(dir.path()).unwrap(),
+            prompts,
+        );
+    }
+
     /// A prompt herdr accepted while leaving the text on the composer. This
     /// is the #26 defect: the batch never reached the agent, so treating the
     /// `Ok` as delivery advances the cursor past messages nobody saw.
