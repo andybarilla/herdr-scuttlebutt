@@ -13,7 +13,10 @@ use std::sync::{Arc, OnceLock};
 /// non-delivery of one batch and restarts when the batch grows, while
 /// `unconfirmed_streak` counts only unconfirmed deliveries and ignores the
 /// batch. Either reaching this stalls the agent — its batch is held and its
-/// cursor left alone, so nothing is lost while it is wedged (#39).
+/// cursor left alone for as long as the agent is still listed (#39). The
+/// absence purge is the one door still open: an agent missing from
+/// `herdr agent list` for `MAX_ABSENCES` passes loses its cursor and its
+/// stall with the rest of its state, and re-enrolls at the tail.
 ///
 /// The intro prompt shares the constant and not the behaviour: it gives up
 /// and moves on, because a missing intro costs an explanation rather than a
@@ -610,7 +613,10 @@ fn run_once(
         // `state::save` keeps failing (disk full, permissions) each pass
         // re-derives from the last state that reached disk, so the same batch
         // is delivered again every pass and neither `fail_counts` nor
-        // `unconfirmed_streak` survives to reach the 5-failure cap.
+        // `unconfirmed_streak` survives to reach the 5-failure cap. `stalled`
+        // has the same exposure: a stall recorded on a pass that fails to
+        // save is gone by the next one, so the agent is prompted again and
+        // the once-per-stall report fires again.
         let mut st = crate::state::load(&dir);
         let scoped = ScopedHerd {
             inner: herd,
@@ -884,7 +890,10 @@ fn focus_blocked(a: &AgentInfo) -> bool {
 }
 
 /// Consecutive absences from `herdr agent list` tolerated before an agent's
-/// state (cursor, intro flag, fail count) is purged.
+/// state (cursor, intro flag, fail count, held batch) is purged. At the 2s
+/// tick interval that is roughly six seconds, which is shorter than closing
+/// and reopening a pane: a batch held for a stalled agent does not survive
+/// that.
 const MAX_ABSENCES: u32 = 3;
 
 /// Consecutive deliverable sightings required before an agent's first
