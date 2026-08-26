@@ -955,22 +955,25 @@ fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
     }
 }
 
-/// Drops every trace of a wedged delivery for one agent. The counters go
-/// with the stall: they are what would otherwise carry a resumed agent
-/// straight back to the threshold on its next failure.
-/// The session id to record for `a`: the one this listing carries, or the
-/// last one herdr reported for it. Both writers of `Stall::session` go
-/// through this, so neither can record the `None` of a listing that merely
-/// omitted the field — which `(None, Some(_))` would then read as a new
-/// session on the next tick, lifting the stall and returning the agent to
-/// full-rate prompting. `None` out of here means herdr has never reported
-/// an id for this agent, and that genuinely is unknowable.
+/// The id to record when a stall *opens*: the one this listing carries, or
+/// the newest herdr has reported for that agent. `agent_session` is
+/// optional per listing, so a threshold tick that omits it would otherwise
+/// record `None`, which `(None, Some(_))` reads as a new session on the
+/// next tick — lifting the stall and returning the agent to full rate.
+/// Newest-known is the right fallback here and only here: a stall that is
+/// opening has no id of its own to preserve yet.
+///
+/// A `None` out of this means herdr has never reported an id for this
+/// agent, which genuinely is unknowable.
 fn session_of(state: &DaemonState, a: &AgentInfo) -> Option<String> {
     a.session
         .clone()
         .or_else(|| state.last_session.get(&a.name).cloned())
 }
 
+/// Drops every trace of a wedged delivery for one agent. The counters go
+/// with the stall: they are what would otherwise carry a resumed agent
+/// straight back to the threshold on its next failure.
 fn clear_stall(state: &mut DaemonState, name: &str) -> Option<crate::state::Stall> {
     state.fail_counts.remove(name);
     state.unconfirmed_streak.remove(name);
@@ -1221,7 +1224,6 @@ pub fn tick(
                 // record how the threshold was reached, and counting
                 // retries into them would print `batch 6/5` and make the
                 // numbers mean two different things.
-                let session = session_of(state, a);
                 let stall = state
                     .stalled
                     .get_mut(&a.name)
@@ -1233,7 +1235,17 @@ pub fn tick(
                 // a batch that grows neither lifts the stall nor shortens
                 // the wait.
                 stall.batch = max_id;
-                stall.session = session;
+                // Falls back to what the stall already holds, not to the
+                // newest id herdr has reported. `last_session` is written
+                // for every listed agent, including on the ticks this loop
+                // skips — a busy or focused pane — so a pane that restarted
+                // while the agent was busy has a newer id recorded there
+                // than the reader has ever compared against. Preferring it
+                // here would overwrite the stall's own id with the new one
+                // and the reader would then find them equal, holding a
+                // stall that should have lifted. This writer's job is to
+                // preserve what the reader compares against.
+                stall.session = a.session.clone().or_else(|| stall.session.clone());
                 let retries = stall.retries;
                 let next = retry_after(retries);
                 report(
@@ -1383,6 +1395,14 @@ mod tests {
             let mut h = FakeHerd::new(vec![]);
             h.agents = agents;
             h
+        }
+
+        /// Changes what `herdr agent list` reports as an agent's status, so
+        /// a test can take a pane out of the delivery loop and bring it back.
+        fn set_status(&mut self, name: &str, status: &str) {
+            for a in self.agents.iter_mut().filter(|a| a.name == name) {
+                a.status = status.into();
+            }
         }
 
         /// Models a listing where herdr emitted no `agent_session` for an
@@ -2378,6 +2398,61 @@ mod tests {
         );
         assert_eq!(herd.prompts.borrow().len(), sent, "back to full rate");
         assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+    }
+
+    #[test]
+    fn a_restart_while_the_agent_was_busy_still_lifts_the_stall() {
+        // `last_session` is recorded for every listed agent, including on
+        // the ticks the delivery loop skips. So a pane can restart while its
+        // agent is busy and the reader never sees the new id. If the retry
+        // writer then took the newest known id, it would copy that new id
+        // into the stall the reader is about to compare against, and the
+        // restart would be suppressed — a stall held that should have
+        // lifted, which is invisible until someone reads `daemon-status`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+
+        // the pane restarts while the agent is busy: listed, so the new id
+        // is remembered, but not deliverable, so nothing compares it
+        herd.set_status("reviewer", "working");
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.last_session["reviewer"], "session-b");
+
+        // deliverable again, on a listing that happens to omit the field,
+        // and the retry against the fresh pane fails
+        herd.set_status("reviewer", "idle");
+        herd.drop_session("reviewer");
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "the retry overwrote the id the reader had yet to compare"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, and it is the new session
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(state.stalled.is_empty(), "a real restart was suppressed");
+        assert_eq!(herd.prompts.borrow().len(), sent + 1);
+        let log = daemon_log(dir.path());
+        assert!(log.contains("reviewer is a new session"), "log was: {log}");
     }
 
     #[test]
