@@ -109,8 +109,10 @@ printersrow = ["~/dev/printersrow"]
 
 A room does not have to be configured to exist: one derived from a repository
 `origin`, or one whose group has since left the config and survives as a log on
-disk, is a room like any other. `scuttlebutt rooms` lists all of them, and the
-chat pane's picker offers them.
+disk, is a room like any other. `scuttlebutt rooms` lists every room something
+vouches for — an agent standing in it, the config, or a log on disk — and the
+chat pane's picker offers those. A group with none of the three is still legal
+and simply has nothing to list yet.
 
 Names must match `[a-z0-9][a-z0-9_-]*`; they become directory names. Longest
 prefix wins, and prefixes match on path-segment boundaries, so `~/dev/alare`

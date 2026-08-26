@@ -455,15 +455,23 @@ fn switch_room(
     if target == app.room {
         return Ok(());
     }
+    let carried = std::mem::take(&mut app.input);
     if app.room.selected().is_some() {
-        app.drafts
-            .insert(app.room.clone(), std::mem::take(&mut app.input));
+        app.drafts.insert(app.room.clone(), carried);
         // Re-seed the room being left so visiting it clears its dot; its log
         // has been read up to here.
         let len = room_len(session_dir, &app.room);
         app.unread_seeds.insert(app.room.clone(), len);
+        app.input = app.drafts.remove(&target).unwrap_or_default();
+    } else {
+        // Text typed with no room selected was not typed *for* a room —
+        // there was none — so it follows the human into the first one they
+        // pick rather than being stashed under a room nobody can return to.
+        // Stashing it would be the silent discard per-room drafts exist to
+        // prevent, since `NoneSelected` is unreachable again once a room is
+        // chosen.
+        app.input = app.drafts.remove(&target).unwrap_or(carried);
     }
-    app.input = app.drafts.remove(&target).unwrap_or_default();
     app.scroll_from_bottom = 0;
     // A write failure belonged to the room it was attempted in.
     app.post_error = None;
@@ -1398,6 +1406,34 @@ mod tests {
         assert_eq!(a.input, "half-written note for alare");
         switch(&mut a, named("acme"), &session, &herd).unwrap();
         assert_eq!(a.input, "something for acme");
+    }
+
+    #[test]
+    fn text_typed_before_a_room_existed_follows_you_into_the_first_one() {
+        // A roomless pane can be typed into — `handle_key` only gates the
+        // *post* — and `NoneSelected` is unreachable once a room is picked,
+        // so stashing that text under it would discard it for good.
+        let (_d, _env, session) = scratch();
+        let mut a = App {
+            input: "typed before picking a room".into(),
+            ..App::default()
+        };
+        switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
+        assert_eq!(a.input, "typed before picking a room");
+    }
+
+    #[test]
+    fn a_carried_draft_never_overwrites_one_already_waiting() {
+        let (_d, _env, session) = scratch();
+        let herd = FakeHerd(vec![], false);
+        let mut a = app();
+        a.room = named("acme");
+        a.input = "acme's own draft".into();
+        switch(&mut a, named("alare"), &session, &herd).unwrap();
+        switch(&mut a, CurrentRoom::NoneSelected, &session, &herd).unwrap();
+        a.input = "typed with no room".into();
+        switch(&mut a, named("acme"), &session, &herd).unwrap();
+        assert_eq!(a.input, "acme's own draft");
     }
 
     #[test]
