@@ -18,9 +18,12 @@ pub fn resolve_group(
     if let Grouping::Broken(msg) = grouping {
         bail!("groups config is unusable: {msg}");
     }
-    // Org-derived groups are not enumerable — they exist as soon as an agent
-    // with that origin starts — so an explicit name is checked for legality,
-    // not membership. A typo therefore opens an empty room rather than
+    // There is no roster of legal group names to check against. `rooms`
+    // enumerates the rooms something vouches for — an agent standing in one,
+    // the config, a log on disk — but an org-derived group exists the moment
+    // an agent with that origin starts, so a group with neither is legal and
+    // absent from that list. An explicit name is therefore checked for
+    // legality, not membership. A typo opens an empty room rather than
     // erroring; the TUI titles every room, which is where that shows up.
     if let Some(g) = explicit {
         if !groups::valid_group_name(g) {
@@ -149,6 +152,58 @@ pub fn cmd_groups(herd: &dyn HerdControl) -> Result<()> {
         for a in ungrouped {
             println!("  {}\t{}\t{}", a.name, a.status, a.cwd);
         }
+    }
+    Ok(())
+}
+
+/// The rooms this session could open. Not scoped to the caller's group:
+/// this is an enumeration surface like `groups`, which already prints every
+/// group from any cwd, and it deliberately does not resolve the caller's own
+/// cwd — the one place you most want to run it is a cwd that resolves to
+/// nothing, where `resolve_group` would bail.
+pub fn cmd_rooms(herd: &dyn HerdControl) -> Result<()> {
+    let grouping = current_grouping()?;
+    if let Grouping::Broken(msg) = &grouping {
+        // `rooms` returns nothing here, and silence would read as "no rooms
+        // exist" rather than "I could not tell".
+        println!("groups config BROKEN — no room is listed: {msg}");
+        return Ok(());
+    }
+    let agents = match herd.list_agents() {
+        Ok(a) => a,
+        Err(e) => {
+            // Without a roster every room reads as quiet, which sorts live
+            // rooms down among the dead ones. Say so rather than let the
+            // order lie.
+            println!(
+                "cannot list agents ({e}) — every room below reads as having none, \
+                 whether or not it does"
+            );
+            Vec::new()
+        }
+    };
+    let session = crate::paths::session_dir()?;
+    let mut orgs = OrgCache::default();
+    println!("name\tagents\tknown from");
+    for r in groups::rooms(&grouping, &agents, &session, &mut orgs) {
+        let mut from = Vec::new();
+        if r.configured {
+            from.push("config");
+        }
+        if r.history {
+            from.push("history");
+        }
+        // Neither: a room that exists only because an agent is standing in
+        // it right now, derived from its repository origin.
+        if from.is_empty() {
+            from.push("live agents");
+        }
+        println!(
+            "{}\t{}\t{}",
+            r.name.as_deref().unwrap_or("(ungrouped)"),
+            r.agents,
+            from.join(", ")
+        );
     }
     Ok(())
 }
@@ -298,7 +353,8 @@ mod tests {
 
     #[test]
     fn explicit_group_is_allowed_without_a_config() {
-        // org groups are not enumerable, so there is no list to check against
+        // org groups appear as their agents start, so there is no roster of
+        // legal names to check an explicit one against
         let g = resolve_group(
             Some("acme"),
             Path::new("/anywhere"),
