@@ -1366,10 +1366,12 @@ fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
             };
         }
     }
-    match (&held.session, &a.session) {
-        (Some(was), Some(now)) => was == now,
-        _ => false,
-    }
+    // Nothing else can say yes. The only automatic yes is the equality
+    // above, and every other shape — a different id, an id missing on
+    // either side, a hold that two merged stalls left unable to name its
+    // process — refuses and waits for a human. This line is the refusal,
+    // not a further test.
+    false
 }
 
 /// The stall a resumed hold comes back as. Primed to retry at the first
@@ -1386,10 +1388,14 @@ fn resuming_stall(held: &crate::state::Held, a: &AgentInfo) -> crate::state::Sta
     crate::state::Stall {
         held_since: held.held_since,
         batch: held.batch,
-        // Never a newer id than the one compared against above: writing one
-        // in would make the delivery loop's reader find them equal and hold
-        // a stall that should have lifted.
-        session: a.session.clone().or_else(|| held.session.clone()),
+        // Whatever this pane reports, and nothing inherited. Falling back
+        // to the hold's id would re-stamp an id-less pane with its
+        // predecessor's identity — reachable through an unidentified
+        // release, where the pane that takes the batch need not be the one
+        // the hold recorded — and that stall would then hold an id no
+        // agent here ever reported. `None` is the honest record, and it is
+        // what the delivery loop's `(None, Some(_))` lift is written for.
+        session: a.session.clone(),
         waited: retry_after(0),
         retries: 0,
     }
@@ -1433,8 +1439,17 @@ fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
 /// Newest-known is the right fallback here and only here: a stall that is
 /// opening has no id of its own to preserve yet.
 ///
-/// A `None` out of this means herdr has never reported an id for this
-/// agent, which genuinely is unknowable.
+/// The fallback is scoped to an unbroken presence, and that scoping lives
+/// in `last_session` itself, which is dropped on the agent's first absence.
+/// Without it this function reads as "the newest id known for this name",
+/// which is a different question from "which process is at that pane" the
+/// moment presence breaks: an id-less agent taking the name two ticks after
+/// its owner closed would stall carrying its predecessor's id, and the
+/// batch held for it would resume into the predecessor (#43).
+///
+/// A `None` out of this means nothing here knows who is at that pane —
+/// herdr has never reported an id for this agent, or the name's presence
+/// has broken since it last did.
 fn session_of(state: &DaemonState, a: &AgentInfo) -> Option<String> {
     a.session
         .clone()
@@ -1608,6 +1623,18 @@ pub fn tick(
         }
         let count = state.absences.entry(name.clone()).or_insert(0);
         *count += 1;
+        // Dropped on the first absence, not with the rest of the state at
+        // `MAX_ABSENCES`. `last_session` exists so a listing that drops the
+        // *field* does not read as a new process (#42), and that holds only
+        // while the agent is continuously listed: a dropped field on one
+        // tick is the same pane. Once presence itself breaks, an id
+        // remembered against the name is no longer evidence about whoever
+        // is there next — a different agent can take the name in the two
+        // ticks before the purge, and `session_of` would hand it the id its
+        // predecessor left behind. That is the same newest-known-for-a-name
+        // mistake the merge makes, one tick earlier and with no merge in
+        // it. After an absence the honest answer is that nothing here knows.
+        state.last_session.remove(&name);
         if *count >= MAX_ABSENCES {
             // The stall does not go with the presence state: its batch is
             // data, and data must not expire on the timer that keeps the
@@ -1621,7 +1648,6 @@ pub fn tick(
             state.introduced.remove(&name);
             state.fail_counts.remove(&name);
             state.unconfirmed_streak.remove(&name);
-            state.last_session.remove(&name);
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
             state.intro_fails.remove(&name);
@@ -1809,6 +1835,12 @@ pub fn tick(
                 // than the reader has ever compared against — writing that
                 // in would make the reader find them equal and hold a stall
                 // that should have lifted.
+                //
+                // This writer is the one identity site that is safe to
+                // preserve, and it is safe because it only runs for an
+                // agent in this tick's listing. The reader it feeds is not
+                // equally safe across an absence, which is #58 and not
+                // this line.
                 stall.session = a.session.clone().or_else(|| stall.session.clone());
                 let retries = stall.retries;
                 let next = retry_after(retries);
@@ -2599,13 +2631,13 @@ mod tests {
     /// pane a human closes. Returns the room dir and the state left behind.
     fn stalled_then_vanished(session: Option<&str>) -> (tempfile::TempDir, DaemonState) {
         let dir = tempfile::tempdir().unwrap();
-        let state = stalled_then_vanished_in(dir.path(), session).1;
+        let state = stalled_then_vanished_in(dir.path(), session);
         (dir, state)
     }
 
     /// The same, in a room a caller already owns, so a test can keep using
     /// it after the agent has gone.
-    fn stalled_then_vanished_in(dir: &Path, session: Option<&str>) -> ((), DaemonState) {
+    fn stalled_then_vanished_in(dir: &Path, session: Option<&str>) -> DaemonState {
         let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
         if let Some(id) = session {
             herd.set_session("reviewer", id);
@@ -2623,7 +2655,7 @@ mod tests {
         for _ in 0..MAX_ABSENCES {
             tick(&mut state, &gone, dir, &AgentFilter::default(), None).unwrap();
         }
-        ((), state)
+        state
     }
 
     /// The agent comes back able to receive, reporting `session`.
@@ -2803,7 +2835,7 @@ mod tests {
         // no human anywhere in it.
         let dir = tempfile::tempdir().unwrap();
         // A stalls holding the batch and vanishes.
-        let (_, mut state) = stalled_then_vanished_in(dir.path(), Some("sess-1"));
+        let mut state = stalled_then_vanished_in(dir.path(), Some("sess-1"));
         assert_eq!(state.held["reviewer"].session.as_deref(), Some("sess-1"));
 
         // B takes the name, is refused, wedges on its own traffic and goes.
@@ -2911,6 +2943,86 @@ mod tests {
         state.held.get_mut("reviewer").unwrap().release = Some(release_aged(None, 1));
         let back = comes_back(&mut state, dir.path(), None, 4);
         assert!(was_delivered(&back), "a live release did not deliver");
+    }
+
+    #[test]
+    fn an_id_less_agent_that_takes_a_name_after_an_absence_inherits_no_identity() {
+        // The third site of one pattern: `session_of` fell back to the
+        // newest id known for the NAME, and `last_session` outlived a
+        // broken presence. So an id-less pane taking a name two ticks after
+        // its owner closed would stall carrying its predecessor's id, and
+        // the batch held for it would auto-resume into the predecessor. One
+        // hold, no merge, no human.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = FakeHerd::new(vec![("reviewer", "idle")]);
+        a.set_session("reviewer", "sess-1");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+        tick(&mut state, &a, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.last_session["reviewer"], "sess-1");
+
+        // the pane closes, briefly — short of the purge
+        let gone = FakeHerd::new(vec![]);
+        for _ in 0..(MAX_ABSENCES - 1) {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(
+            !state.last_session.contains_key("reviewer"),
+            "an id was remembered for a name whose presence had broken"
+        );
+
+        // an opencode pane, which herdr reports no id for, takes the name
+        // and wedges on its own traffic
+        append(dir.path(), "human", "the batch that must survive").unwrap();
+        let mut b = FakeHerd::new(vec![("reviewer", "idle")]);
+        b.fail_prompts = true;
+        for _ in 0..50 {
+            if state.stalled.contains_key("reviewer") {
+                break;
+            }
+            tick(&mut state, &b, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session, None,
+            "the stall recorded an id that no agent at that pane ever reported"
+        );
+
+        // it goes, and the original returns to a hold that is not its own
+        for _ in 0..MAX_ABSENCES {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.held["reviewer"].session, None);
+        let back = comes_back(
+            &mut state,
+            dir.path(),
+            Some("sess-1"),
+            REQUIRED_SIGHTINGS + 3,
+        );
+        assert!(
+            !was_delivered(&back),
+            "one agent's held batch was delivered to another with no human in it"
+        );
+    }
+
+    #[test]
+    fn a_resumed_stall_records_the_pane_that_took_it() {
+        // Reachable through an unidentified release: the pane that claims
+        // the batch need not be the one the hold recorded. Inheriting the
+        // hold's id would leave a stall claiming an identity nothing at
+        // that pane ever reported, and that id would then be handed on to
+        // the next hold.
+        let (dir, mut state) = stalled_then_vanished(Some("sess-1"));
+        state.held.get_mut("reviewer").unwrap().release = Some(release_aged(None, 0));
+        let mut back = FakeHerd::new(vec![("reviewer", "idle")]);
+        back.fail_prompts = true;
+        tick(&mut state, &back, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(state.held.is_empty(), "the release was not claimed");
+        assert_eq!(
+            state.stalled["reviewer"].session, None,
+            "an id-less pane was re-stamped with its predecessor's identity"
+        );
     }
 
     #[test]

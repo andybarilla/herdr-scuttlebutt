@@ -62,8 +62,20 @@ pub struct DaemonState {
     /// lets a stall record a real id even when it opens on a listing that
     /// dropped the field; without that, the stall records `None`, the next
     /// listing looks like a new session, and delivery goes back to full
-    /// rate. Absent here means herdr has never reported one for that agent,
-    /// which is the case for the agent kinds that do not have them.
+    /// rate.
+    ///
+    /// Scoped to an unbroken presence: the entry is dropped on the agent's
+    /// first absence, not with the rest of its state at `MAX_ABSENCES`. A
+    /// dropped *field* while the agent stays listed is the same process,
+    /// which is the case this map exists for; a broken *presence* is not,
+    /// because a different agent can take the name before the purge and
+    /// would otherwise be handed the id its predecessor left behind (#43).
+    ///
+    /// So absent here means one of two things — herdr has never reported an
+    /// id for that agent, which is the case for the agent kinds that do not
+    /// have them, or the name's presence has broken since it last did.
+    /// Both mean the same thing to a reader: nothing here knows who is at
+    /// that pane.
     #[serde(default)]
     pub last_session: HashMap<String, String>,
     /// Batches held for agents that are no longer present. The absence
