@@ -8,12 +8,43 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Non-deliveries to one agent before its batch is given up on. Two counters
-/// reach it over different events: `fail_counts` counts every non-delivery of
-/// one batch and restarts when the batch grows, while `unconfirmed_streak`
-/// counts only unconfirmed deliveries and ignores the batch. Either reaching
-/// this skips the batch.
+/// Non-deliveries to one agent before the daemon stops prompting it. Two
+/// counters reach it over different events: `fail_counts` counts every
+/// non-delivery of one batch and restarts when the batch grows, while
+/// `unconfirmed_streak` counts only unconfirmed deliveries and ignores the
+/// batch. Either reaching this stalls the agent — its batch is held, its
+/// cursor left alone, and delivery drops to `retry_after`'s widening backoff
+/// for as long as the agent is still listed (#39). The
+/// absence purge is the one door still open: an agent missing from
+/// `herdr agent list` for `MAX_ABSENCES` passes loses its cursor and its
+/// stall with the rest of its state, and re-enrolls at the tail.
+///
+/// The intro prompt shares the constant and not the behaviour: it gives up
+/// and moves on, because a missing intro costs an explanation rather than a
+/// message.
 pub const MAX_BATCH_FAILURES: u32 = 5;
+
+/// Delivery opportunities a freshly stalled agent waits before it is offered
+/// its batch again. At the 2s tick that is about a minute, which is long
+/// enough not to burn a turn on a wedged pane and short enough that a pane
+/// someone has just fixed does not sit idle for long.
+const STALL_RETRY_TICKS: u32 = 30;
+
+/// Ceiling on the widening wait: about half an hour at the 2s tick. A stall
+/// nobody has attended to in that long is being reported by `daemon-status`,
+/// not discovered by the next retry, so retrying more often buys nothing.
+const MAX_STALL_RETRY_TICKS: u32 = 900;
+
+/// How long a stalled agent waits before its next retry, doubling per retry
+/// to the ceiling. Retrying at all is what makes the exits reachable: a pane
+/// that recovers in place keeps its session id, so a confirmed delivery is
+/// the only evidence it is well again, and an agent herdr reports no session
+/// id for has no other exit whatsoever.
+fn retry_after(retries: u32) -> u32 {
+    STALL_RETRY_TICKS
+        .saturating_mul(1 << retries.min(5))
+        .min(MAX_STALL_RETRY_TICKS)
+}
 
 /// Which agents this daemon enrolls. The spec's design is auto-enroll, so an
 /// empty filter (the default, and what you get with no `--agents` flag and no
@@ -575,7 +606,7 @@ fn run_once(
                     session,
                     &format!(
                         "enrolling in {}: {}",
-                        g.as_deref().unwrap_or("(ungrouped room)"),
+                        g.as_deref().unwrap_or(UNGROUPED_ROOM),
                         names.join(", ")
                     ),
                 );
@@ -605,7 +636,10 @@ fn run_once(
         // `state::save` keeps failing (disk full, permissions) each pass
         // re-derives from the last state that reached disk, so the same batch
         // is delivered again every pass and neither `fail_counts` nor
-        // `unconfirmed_streak` survives to reach the 5-failure cap.
+        // `unconfirmed_streak` survives to reach the 5-failure cap. `stalled`
+        // has the same exposure: a stall recorded on a pass that fails to
+        // save is gone by the next one, so the agent is prompted again and
+        // the once-per-stall report fires again.
         let mut st = crate::state::load(&dir);
         let scoped = ScopedHerd {
             inner: herd,
@@ -744,6 +778,49 @@ pub fn run(session: &Path, filter: &AgentFilter) -> Result<()> {
     Ok(())
 }
 
+/// How a room with no group of its own is named in `daemon-status`, matching
+/// what `run_once` logs when it enrolls into one.
+const UNGROUPED_ROOM: &str = "(ungrouped room)";
+
+/// Every held batch under a session, as (room, agent, batch id), ordered by
+/// room then agent so the listing is stable between runs.
+///
+/// Rooms are the session dir itself — the ungrouped layout — plus one level
+/// of group dirs beneath it; nothing deeper is a room. Swept here rather
+/// than through `groups::rooms`, which answers a different question: it
+/// takes the groups config into account and yields nothing at all when that
+/// config is broken. A held batch has to be reportable whatever the config
+/// says, since a state.json on disk is the record that the messages exist.
+///
+/// Parsed here rather
+/// than through `state::load` because that reports a reset warning into
+/// `daemon.log` on an unreadable file, and asking for status must not write
+/// to the log the daemon owns. An unreadable room contributes nothing.
+fn held_batches(session: &Path) -> Vec<(String, String, u64)> {
+    let mut rooms = vec![(UNGROUPED_ROOM.to_string(), session.to_path_buf())];
+    if let Ok(entries) = std::fs::read_dir(session) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                rooms.push((e.file_name().to_string_lossy().into_owned(), e.path()));
+            }
+        }
+    }
+    let mut held = vec![];
+    for (room, path) in rooms {
+        let Ok(text) = std::fs::read_to_string(path.join("state.json")) else {
+            continue;
+        };
+        let Ok(st) = serde_json::from_str::<DaemonState>(&text) else {
+            continue;
+        };
+        for (name, stall) in st.stalled {
+            held.push((room.clone(), name, stall.batch));
+        }
+    }
+    held.sort();
+    held
+}
+
 pub fn status(dir: &Path) {
     // The session dir derives silently from HERDR_SOCKET_PATH; printing it
     // turns "daemon and TUI are on different sessions" from a silent no-op
@@ -752,6 +829,23 @@ pub fn status(dir: &Path) {
     match read_live_record(dir) {
         Some(record) => println!("{}", status_line(record.pid, record.freshness())),
         None => println!("not running"),
+    }
+    // Printed unconditionally, including the empty case: "no stalled agents"
+    // is the answer to the question this command gets asked, and a section
+    // that appears only when something is wrong reads as a missing feature
+    // the rest of the time.
+    let held = held_batches(dir);
+    if held.is_empty() {
+        println!("stalled agents: none");
+        return;
+    }
+    println!(
+        "stalled agents: {} (batch held, delivery slowed to a widening retry; \
+         resumes when a retry is confirmed or a new session appears)",
+        held.len()
+    );
+    for (room, name, batch) in held {
+        println!("  {name} in {room}: holding messages up to #{batch}");
     }
 }
 
@@ -825,7 +919,10 @@ fn focus_blocked(a: &AgentInfo) -> bool {
 }
 
 /// Consecutive absences from `herdr agent list` tolerated before an agent's
-/// state (cursor, intro flag, fail count) is purged.
+/// state (cursor, intro flag, fail count, held batch) is purged. At the 2s
+/// tick interval that is roughly six seconds, which is shorter than closing
+/// and reopening a pane: a batch held for a stalled agent does not survive
+/// that.
 const MAX_ABSENCES: u32 = 3;
 
 /// Consecutive deliverable sightings required before an agent's first
@@ -858,6 +955,31 @@ fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
     }
 }
 
+/// The id to record when a stall *opens*: the one this listing carries, or
+/// the newest herdr has reported for that agent. `agent_session` is
+/// optional per listing, so a threshold tick that omits it would otherwise
+/// record `None`, which `(None, Some(_))` reads as a new session on the
+/// next tick — lifting the stall and returning the agent to full rate.
+/// Newest-known is the right fallback here and only here: a stall that is
+/// opening has no id of its own to preserve yet.
+///
+/// A `None` out of this means herdr has never reported an id for this
+/// agent, which genuinely is unknowable.
+fn session_of(state: &DaemonState, a: &AgentInfo) -> Option<String> {
+    a.session
+        .clone()
+        .or_else(|| state.last_session.get(&a.name).cloned())
+}
+
+/// Drops every trace of a wedged delivery for one agent. The counters go
+/// with the stall: they are what would otherwise carry a resumed agent
+/// straight back to the threshold on its next failure.
+fn clear_stall(state: &mut DaemonState, name: &str) -> Option<crate::state::Stall> {
+    state.fail_counts.remove(name);
+    state.unconfirmed_streak.remove(name);
+    state.stalled.remove(name)
+}
+
 /// `filter` is vestigial in production: `run_once` applies the agent filter
 /// once, before partitioning, so the only production call site passes
 /// `AgentFilter::default()`. It survives because the tests drive `tick`
@@ -883,6 +1005,9 @@ pub fn tick(
     for a in &agents {
         state.cursors.entry(a.name.clone()).or_insert(tail);
         state.absences.remove(&a.name);
+        if let Some(id) = &a.session {
+            state.last_session.insert(a.name.clone(), id.clone());
+        }
         // Reported here, above the `introduced` early-continue, because the
         // steady state for every agent is introduced: a warning any lower
         // would never fire for the agents it is about.
@@ -925,6 +1050,8 @@ pub fn tick(
         .chain(state.introduced.iter().cloned())
         .chain(state.fail_counts.keys().cloned())
         .chain(state.unconfirmed_streak.keys().cloned())
+        .chain(state.stalled.keys().cloned())
+        .chain(state.last_session.keys().cloned())
         .chain(state.absences.keys().cloned())
         .chain(state.deliverable_streak.keys().cloned())
         .chain(state.intro_fails.keys().cloned())
@@ -941,6 +1068,8 @@ pub fn tick(
             state.introduced.remove(&name);
             state.fail_counts.remove(&name);
             state.unconfirmed_streak.remove(&name);
+            state.stalled.remove(&name);
+            state.last_session.remove(&name);
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
             state.intro_fails.remove(&name);
@@ -1005,6 +1134,50 @@ pub fn tick(
             // double-prompting the agent while it's still busy with intro.
             continue;
         }
+        // A stalled agent takes one of three routes: lift the stall because
+        // the pane is demonstrably a different process, spend a delivery
+        // opportunity waiting, or fall through and be retried once.
+        let mut retrying = false;
+        if let Some(stall) = state.stalled.get_mut(&a.name) {
+            let restarted = match (&stall.session, &a.session) {
+                // A different id is a different process at that pane, so
+                // whatever wedged the old one is gone with it.
+                (Some(was), Some(now)) => was != now,
+                // No id when it stalled and an id now. This is not evidence
+                // the process is the same one, and reading it as sameness is
+                // what left a stall recorded during a listing that dropped
+                // the field wedged for good.
+                (None, Some(_)) => true,
+                // An id that has gone missing says nothing either way, and
+                // lifting on it would clear every stall the moment herdr
+                // dropped the field. The backoff is that case's way out.
+                (Some(_), None) | (None, None) => false,
+            };
+            if restarted {
+                let batch = stall.held_since;
+                clear_stall(state, &a.name);
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] {} is a new session; resuming delivery of \
+                         the batch held since #{batch}",
+                        a.name
+                    ),
+                );
+            } else {
+                stall.waited += 1;
+                if stall.waited < retry_after(stall.retries) {
+                    // Silent: a stall is standing state, and a line per tick
+                    // is as unreadable as none. It is reported once when it
+                    // opens, again on each retry, and stands in
+                    // `daemon-status` the whole time.
+                    continue;
+                }
+                stall.waited = 0;
+                stall.retries += 1;
+                retrying = true;
+            }
+        }
         let cursor = state.cursors[&a.name];
         let pending = log_store::read_since(dir, cursor)?;
         let Some(max_id) = pending.last().map(|m| m.id) else {
@@ -1012,6 +1185,17 @@ pub fn tick(
         };
         let others: Vec<_> = pending.iter().filter(|m| m.from != a.name).collect();
         if others.is_empty() {
+            // Not reachable while a stall stands, and that is a conclusion
+            // rather than a coincidence: a stall only opens with someone
+            // else's message in the batch, the cursor does not move while
+            // it stands, and `log_store` only ever appends — so `others`
+            // cannot become empty again. The advance here is the ordinary
+            // case of an agent whose only unread messages are its own.
+            //
+            // A prune pass over the room is what would break that: `others`
+            // could then empty out under a held batch and this line would
+            // skip past it. The emptiness would mean the room had forgotten
+            // those messages, not that the agent had written them all.
             state.cursors.insert(a.name.clone(), max_id);
             continue;
         }
@@ -1023,8 +1207,65 @@ pub fn tick(
         match undelivered(herd.prompt(&a.name, &text)) {
             None => {
                 state.cursors.insert(a.name.clone(), max_id);
-                state.fail_counts.remove(&a.name);
-                state.unconfirmed_streak.remove(&a.name);
+                if let Some(stall) = clear_stall(state, &a.name) {
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] {} took the batch held since #{}; \
+                             delivery to it has resumed",
+                            a.name, stall.held_since
+                        ),
+                    );
+                }
+            }
+            Some(NotDelivered { why, .. }) if retrying => {
+                // The counters are left exactly as the stall found them,
+                // and `unconfirmed` goes unread for the same reason: they
+                // record how the threshold was reached, and counting
+                // retries into them would print `batch 6/5` and make the
+                // numbers mean two different things.
+                let stall = state
+                    .stalled
+                    .get_mut(&a.name)
+                    .expect("a retry only happens for an agent that is stalled");
+                // The batch is refreshed because the retry just offered the
+                // agent everything up to `max_id`, so that is what is now
+                // being held for it and what `daemon-status` should name. It
+                // is a report of what was attempted, not a retry condition:
+                // a batch that grows neither lifts the stall nor shortens
+                // the wait.
+                stall.batch = max_id;
+                // A defensive no-op today, and worth saying so rather than
+                // implying it decides something. The reader ran earlier in
+                // this same iteration over this same listing and lifted the
+                // stall on every case where `a.session` differed from what
+                // the stall holds — so by here `a.session` is either equal
+                // to it or `None`, and both branches write back the value
+                // already there. Deleting the line passes every test.
+                //
+                // It stays because the invariant is that this writer must
+                // not change the recorded id, and a line that preserves it
+                // reads better to whoever loosens one of the reader's lift
+                // conditions than an absence would. What it must never
+                // become is the newest id herdr has reported:
+                // `last_session` is written for every listed agent,
+                // including on the ticks this loop skips, so a pane that
+                // restarted while its agent was busy has a newer id there
+                // than the reader has ever compared against — writing that
+                // in would make the reader find them equal and hold a stall
+                // that should have lifted.
+                stall.session = a.session.clone().or_else(|| stall.session.clone());
+                let retries = stall.retries;
+                let next = retry_after(retries);
+                report(
+                    dir,
+                    &format!(
+                        "[scuttlebutt] {} is still stalled: retry {retries} {why}. \
+                         Still holding the batch up to #{max_id}; next retry after \
+                         {next} delivery opportunities.",
+                        a.name
+                    ),
+                );
             }
             Some(NotDelivered { why, unconfirmed }) => {
                 let entry = state
@@ -1043,7 +1284,7 @@ pub fn tick(
                 // threshold forever. Only unconfirmed deliveries advance it,
                 // but the stored value is what gets reported either way: a
                 // hard error in the middle of a streak must not log 0/5 and
-                // make the eventual skip look like it came from nowhere.
+                // make the eventual stall look like it came from nowhere.
                 if unconfirmed {
                     *state.unconfirmed_streak.entry(a.name.clone()).or_insert(0) += 1;
                 }
@@ -1062,17 +1303,30 @@ pub fn tick(
                     ),
                 );
                 if fails >= MAX_BATCH_FAILURES || streak >= MAX_BATCH_FAILURES {
-                    report(
-                        dir,
-                        &format!(
-                            "[scuttlebutt] SKIPPING batch up to #{max_id} for {} after \
-                             {MAX_BATCH_FAILURES} failures",
-                            a.name
-                        ),
-                    );
-                    state.cursors.insert(a.name.clone(), max_id);
-                    state.fail_counts.remove(&a.name);
-                    state.unconfirmed_streak.remove(&a.name);
+                    // The cursor stays where it is: advancing it here is what
+                    // dropped the batch (#39). `fail_counts` and
+                    // `unconfirmed_streak` are left standing too — clearing
+                    // them would make a stalled agent indistinguishable from
+                    // a healthy one in the saved state.
+                    let stall = crate::state::Stall::new(max_id, session_of(state, a));
+                    // Once per stall, not once per tick: a stalled agent
+                    // is skipped above and never reaches this branch again,
+                    // and the guard on the insert holds the guarantee even
+                    // if a future caller does.
+                    if state.stalled.insert(a.name.clone(), stall).is_none() {
+                        report(
+                            dir,
+                            &format!(
+                                "[scuttlebutt] STALLED: {} has not confirmed a delivery in \
+                                 {MAX_BATCH_FAILURES} attempts. Holding the batch up to \
+                                 #{max_id}; the room continues for everyone else. Delivery \
+                                 to it drops to a widening retry and resumes on its own \
+                                 when one is confirmed or a new session appears at that \
+                                 pane. `scuttlebutt daemon-status` lists what is held.",
+                                a.name
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -1108,6 +1362,7 @@ mod tests {
                         status: s.into(),
                         cwd: String::new(),
                         focused: Some(false),
+                        session: None,
                     })
                     .collect(),
                 prompts: RefCell::new(vec![]),
@@ -1149,6 +1404,31 @@ mod tests {
             let mut h = FakeHerd::new(vec![]);
             h.agents = agents;
             h
+        }
+
+        /// Changes what `herdr agent list` reports as an agent's status, so
+        /// a test can take a pane out of the delivery loop and bring it back.
+        fn set_status(&mut self, name: &str, status: &str) {
+            for a in self.agents.iter_mut().filter(|a| a.name == name) {
+                a.status = status.into();
+            }
+        }
+
+        /// Models a listing where herdr emitted no `agent_session` for an
+        /// agent that has one — the field is optional per listing, not per
+        /// agent.
+        fn drop_session(&mut self, name: &str) {
+            for a in self.agents.iter_mut().filter(|a| a.name == name) {
+                a.session = None;
+            }
+        }
+
+        /// Sets the `agent_session` id herdr reports for one agent. A pane
+        /// that restarts is modelled by calling this again with a new id.
+        fn set_session(&mut self, name: &str, id: &str) {
+            for a in self.agents.iter_mut().filter(|a| a.name == name) {
+                a.session = Some(id.into());
+            }
         }
 
         /// `new` with explicit per-agent focus. `None` models a herdr that
@@ -1682,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_batch_retries_then_skips() {
+    fn failed_batch_retries_then_stalls() {
         let dir = tempfile::tempdir().unwrap();
         let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
         herd.fail_prompts = true;
@@ -1698,9 +1978,12 @@ mod tests {
         assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
 
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
-        // after the 5th consecutive failure the batch is skipped
-        assert_eq!(state.cursors["reviewer"], 1);
-        assert_eq!(state.fail_counts.get("reviewer"), None);
+        // after the 5th consecutive failure the agent stalls: the batch is
+        // held, not skipped, and the counters stay so the saved state still
+        // says which agent is wedged
+        assert_eq!(state.cursors["reviewer"], 0);
+        assert_eq!(state.stalled["reviewer"].batch, 1);
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
     }
 
     /// A prompt herdr accepted while leaving the text on the composer. This
@@ -1756,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_unconfirmed_deliveries_hit_the_skip_threshold() {
+    fn repeated_unconfirmed_deliveries_stall_the_agent() {
         let dir = tempfile::tempdir().unwrap();
         let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
@@ -1771,15 +2054,651 @@ mod tests {
         assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES - 1);
 
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
-        // the room does not stall on one bad pane: give up, loudly, and move on
-        assert_eq!(state.cursors["reviewer"], 1);
-        assert_eq!(state.fail_counts.get("reviewer"), None);
+        // one bad pane stalls itself, loudly, and keeps its batch
+        assert_eq!(state.cursors["reviewer"], 0);
+        assert_eq!(state.stalled["reviewer"].batch, 1);
         let log = daemon_log(dir.path());
         assert!(log.contains("still on the composer"), "log was: {log}");
-        assert!(
-            log.contains("SKIPPING batch up to #1 for reviewer"),
+        assert!(log.contains("STALLED: reviewer"), "log was: {log}");
+        assert!(log.contains("Holding the batch up to #1"), "log was: {log}");
+    }
+
+    #[test]
+    fn the_threshold_keeps_the_batch_and_stops_re_prompting() {
+        // #39: the skip advanced the cursor past a batch no delivery ever
+        // confirmed, so those messages were gone. The threshold must stall
+        // the agent instead — batch kept, no further prompts.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "cursor advanced past a batch nothing confirmed: those messages are lost"
+        );
+
+        let sent = herd.prompts.borrow().len();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "a stalled agent was re-prompted"
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
+    }
+
+    #[test]
+    fn a_stall_does_not_block_delivery_to_anyone_else() {
+        // The stall is per-agent: one wedged pane must not hold up the room
+        // or abort the pass before the agents after it in the listing.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(
+            &["reviewer"],
+            vec![("reviewer", "idle"), ("builder", "idle")],
+        );
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer", "builder"]);
+        state.cursors.insert("reviewer".into(), 0);
+        state.cursors.insert("builder".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES + 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"));
+        assert!(!state.stalled.contains_key("builder"));
+        // builder got its batch on the first pass and nothing since
+        assert_eq!(state.cursors["builder"], 1);
+        let to_builder = herd
+            .prompts
+            .borrow()
+            .iter()
+            .filter(|(n, _)| n == "builder")
+            .count();
+        assert_eq!(to_builder, 1, "builder was starved or re-prompted");
+
+        // and a message posted after the stall still reaches builder
+        append(dir.path(), "human", "later").unwrap();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.cursors["builder"], 2);
+        assert_eq!(state.cursors["reviewer"], 0, "the held batch moved");
+    }
+
+    #[test]
+    fn the_stall_is_reported_once_not_every_tick() {
+        // Thirty lines a minute is as unreadable as silence; the standing
+        // state belongs in `daemon-status`, not in a per-tick log line.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for i in 0..MAX_BATCH_FAILURES + 5 {
+            // the room keeps moving underneath the stalled agent
+            append(dir.path(), "human", &format!("later {i}")).unwrap();
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let log = daemon_log(dir.path());
+        assert_eq!(
+            log.matches("STALLED: reviewer").count(),
+            1,
             "log was: {log}"
         );
+    }
+
+    #[test]
+    fn a_new_session_id_lifts_the_stall_at_once() {
+        // A different process at that pane cannot be the one that wedged, so
+        // this exit does not wait out the backoff.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"));
+        let sent = herd.prompts.borrow().len();
+
+        // same id, well inside the first backoff window: nothing sent
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(herd.prompts.borrow().len(), sent);
+
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        let prompts = herd.prompts.borrow();
+        assert_eq!(
+            prompts.len(),
+            sent + 1,
+            "the new session waited for a retry"
+        );
+        assert!(
+            prompts[sent].1.contains("hello"),
+            "the held batch was not the one delivered: {:?}",
+            prompts[sent].1
+        );
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer is a new session; resuming delivery of the batch held since #1"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn a_stall_recorded_with_no_session_id_lifts_when_one_appears() {
+        // The stall tick may be the one listing where herdr dropped the
+        // field. Reading that later id as sameness wedged the agent for good.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].session, None);
+        let sent = herd.prompts.borrow().len();
+
+        herd.set_session("reviewer", "session-a");
+        herd.unconfirmed.clear();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(state.stalled.is_empty(), "stall outlived its cause");
+        assert_eq!(herd.prompts.borrow().len(), sent + 1);
+        assert_eq!(state.cursors["reviewer"], 1);
+    }
+
+    #[test]
+    fn an_agent_with_no_session_id_does_not_read_as_restarted() {
+        // herdr does not report `agent_session` for every agent kind. Absent
+        // on both sides means unknown: treating it as a new id would clear
+        // the stall on every tick, which is the redelivery loop all over
+        // again. Such an agent leaves by the backoff instead — see
+        // `an_agent_that_never_reports_a_session_id_still_gets_its_batch`.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let sent = herd.prompts.borrow().len();
+        for _ in 0..3 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(herd.prompts.borrow().len(), sent);
+        assert!(state.stalled.contains_key("reviewer"));
+    }
+
+    #[test]
+    fn the_backoff_widens_to_a_cap_and_never_reaches_zero() {
+        assert_eq!(retry_after(0), STALL_RETRY_TICKS);
+        assert_eq!(retry_after(1), STALL_RETRY_TICKS * 2);
+        // last shift before the cap bites
+        assert_eq!(retry_after(4), STALL_RETRY_TICKS * 16);
+        // the shift would give 960; the cap is what it lands on
+        assert_eq!(retry_after(5), MAX_STALL_RETRY_TICKS);
+        assert_eq!(retry_after(6), MAX_STALL_RETRY_TICKS);
+        // `retries` is unbounded in state, so the clamp has to hold at the
+        // top of the range: shifting by it would be undefined, and a wait of
+        // zero would retry every tick — the redelivery loop again.
+        assert_eq!(retry_after(u32::MAX), MAX_STALL_RETRY_TICKS);
+    }
+
+    #[test]
+    fn a_stalled_agents_own_posts_do_not_advance_its_cursor() {
+        // This is the half of the `others.is_empty()` reasoning that can be
+        // tested: a stalled agent's own posts grow its batch without ever
+        // moving its cursor. That is also why that branch cannot be reached
+        // while a stall stands — someone else's message is still in there —
+        // so the branch itself is pinned by a comment, not by this test.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].held_since, 1);
+
+        // the stalled agent keeps posting: its batch grows with messages
+        // that are all its own
+        for i in 0..3 {
+            append(dir.path(), "reviewer", &format!("still working {i}")).unwrap();
+        }
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "the held batch was skipped past on the agent's own messages"
+        );
+        assert_eq!(state.stalled["reviewer"].held_since, 1, "the hold moved");
+        assert_eq!(
+            state.stalled["reviewer"].batch, 4,
+            "the retry saw a stale batch"
+        );
+    }
+
+    #[test]
+    fn the_hold_is_reported_from_when_it_began_not_from_the_last_retry() {
+        // `batch` moves with each retry so `daemon-status` names what is
+        // actually waiting. The sentence "held since #N" is about when the
+        // hold started, so it reads the half that does not move.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        // the room moves on, and a retry fails against the bigger batch
+        append(dir.path(), "human", "and another").unwrap();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].batch, 2,
+            "the retry saw a stale batch"
+        );
+        assert_eq!(state.stalled["reviewer"].held_since, 1, "the hold moved");
+
+        herd.unconfirmed.clear();
+        for _ in 0..retry_after(1) {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.is_empty(), "the second retry never came");
+        assert_eq!(state.cursors["reviewer"], 2);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer took the batch held since #1"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn the_restart_report_also_names_when_the_hold_began() {
+        // The other half of the pair: a stall lifted by a new session has
+        // usually seen the batch grow under it, and the sentence is still
+        // about when the hold started.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        append(dir.path(), "human", "and another").unwrap();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].batch, 2);
+
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer is a new session; resuming delivery of the batch held since #1"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn a_stall_opened_without_the_field_records_the_last_known_id() {
+        // The sibling of the retry-path case: if herdr omits
+        // `agent_session` on exactly the tick that crosses the threshold,
+        // the stall is constructed with `None`, and the next listing with
+        // the field back reads as a new session — lifting the stall, which
+        // resets the counters and returns the agent to full-rate prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        // seen with an id, then the field goes missing across the threshold
+        for _ in 0..MAX_BATCH_FAILURES - 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        herd.drop_session("reviewer");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "the stall recorded the absence instead of the id it had already seen"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, same process
+        herd.set_session("reviewer", "session-a");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "a dropped field read as a restart"
+        );
+        assert_eq!(herd.prompts.borrow().len(), sent, "back to full rate");
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+    }
+
+    #[test]
+    fn a_restart_while_the_agent_was_busy_still_lifts_the_stall() {
+        // `last_session` is recorded for every listed agent, including on
+        // the ticks the delivery loop skips. So a pane can restart while its
+        // agent is busy and the reader never sees the new id. If the retry
+        // writer then took the newest known id, it would copy that new id
+        // into the stall the reader is about to compare against, and the
+        // restart would be suppressed — a stall held that should have
+        // lifted, which is invisible until someone reads `daemon-status`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+
+        // the pane restarts while the agent is busy: listed, so the new id
+        // is remembered, but not deliverable, so nothing compares it
+        herd.set_status("reviewer", "working");
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(state.last_session["reviewer"], "session-b");
+
+        // deliverable again, on a listing that happens to omit the field,
+        // and the retry against the fresh pane fails
+        herd.set_status("reviewer", "idle");
+        herd.drop_session("reviewer");
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "the retry overwrote the id the reader had yet to compare"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, and it is the new session
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(state.stalled.is_empty(), "a real restart was suppressed");
+        assert_eq!(herd.prompts.borrow().len(), sent + 1);
+        let log = daemon_log(dir.path());
+        assert!(log.contains("reviewer is a new session"), "log was: {log}");
+    }
+
+    #[test]
+    fn an_agent_herdr_never_reports_an_id_for_records_none() {
+        // The fallback must not invent an id: with nothing ever seen there
+        // is nothing to remember, and `(None, None)` is what keeps such an
+        // agent on the backoff rather than lifting its stall every tick.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].session, None);
+        assert!(state.last_session.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_session_field_does_not_lift_a_stall_through_the_retry_path() {
+        // The comparison treats "no id then, an id now" as a new session,
+        // which is right. The hazard is the retry writing that `None` in the
+        // first place: one listing without the field, and the next listing
+        // with it back looks like a restart that never happened.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+
+        // herdr stops emitting the field, and the first retry fails
+        herd.drop_session("reviewer");
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].retries, 1, "the retry never came");
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "a listing without the field erased the id the stall was recorded with"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, same process, same id
+        herd.set_session("reviewer", "session-a");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "a dropped field read as a restart"
+        );
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "the batch was redelivered off a field that only went missing"
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
+    }
+
+    #[test]
+    fn a_pane_that_recovers_in_place_receives_its_held_batch() {
+        // The pane is fixed without the agent restarting, so the session id
+        // never changes. A confirmed delivery is the only evidence there is
+        // that it is well again — which means something has to be sent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"));
+        let sent = herd.prompts.borrow().len();
+
+        herd.unconfirmed.clear();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let prompts = herd.prompts.borrow();
+        assert_eq!(prompts.len(), sent + 1, "the retry never came");
+        assert!(prompts[sent].1.contains("hello"), "{:?}", prompts[sent].1);
+        assert!(state.stalled.is_empty());
+        assert_eq!(state.cursors["reviewer"], 1);
+        assert_eq!(state.fail_counts.get("reviewer"), None);
+        assert_eq!(state.unconfirmed_streak.get("reviewer"), None);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer took the batch held since #1; delivery to it has resumed"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_never_reports_a_session_id_still_gets_its_batch() {
+        // herdr reports no `agent_session` for some agent kinds. Those have
+        // no restart signal at all, so the backoff is their only exit.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        herd.unconfirmed.clear();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.is_empty(), "no way out without a session id");
+        assert_eq!(state.cursors["reviewer"], 1);
+    }
+
+    #[test]
+    fn a_stalled_agent_is_retried_on_a_widening_backoff() {
+        // Not every tick — that is the redelivery loop the threshold exists
+        // to stop — and not never, which is a dead agent.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let sent = herd.prompts.borrow().len();
+
+        // one wait short of the first retry
+        for _ in 0..STALL_RETRY_TICKS - 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(herd.prompts.borrow().len(), sent, "retried too early");
+
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(herd.prompts.borrow().len(), sent + 1);
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "a failed retry moved the cursor"
+        );
+        assert_eq!(state.stalled["reviewer"].retries, 1);
+
+        // the second wait is longer than the first
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent + 1,
+            "the backoff did not widen"
+        );
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(herd.prompts.borrow().len(), sent + 2);
+        assert_eq!(state.stalled["reviewer"].retries, 2);
+        // the counters that led to the stall are the record of it, and a
+        // retry is not part of that record
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+        assert_eq!(state.unconfirmed_streak["reviewer"], MAX_BATCH_FAILURES);
+        let log = daemon_log(dir.path());
+        assert_eq!(
+            log.matches("STALLED: reviewer").count(),
+            1,
+            "log was: {log}"
+        );
+        assert!(log.contains("retry 1"), "log was: {log}");
+        assert!(log.contains("retry 2"), "log was: {log}");
+    }
+
+    #[test]
+    fn daemon_status_names_every_stalled_agent_and_its_batch() {
+        // daemon.log alone is not enough: nobody reads it until something is
+        // already wrong. Group rooms are one level under the session dir, so
+        // reading only the session dir's own state.json would report nothing
+        // while every real stall sat in a subdirectory.
+        let session = tempfile::tempdir().unwrap();
+        let mut ungrouped = DaemonState::default();
+        ungrouped
+            .stalled
+            .insert("lead-alare".into(), crate::state::Stall::new(376, None));
+        crate::state::save(session.path(), &ungrouped).unwrap();
+
+        let room = session.path().join("herdr-scuttlebutt");
+        std::fs::create_dir_all(&room).unwrap();
+        let mut grouped = DaemonState::default();
+        grouped.stalled.insert(
+            "lead-herdr-scuttlebutt".into(),
+            crate::state::Stall::new(30, Some("session-a".into())),
+        );
+        grouped.cursors.insert("healthy".into(), 30);
+        crate::state::save(&room, &grouped).unwrap();
+
+        assert_eq!(
+            held_batches(session.path()),
+            vec![
+                (
+                    "(ungrouped room)".to_string(),
+                    "lead-alare".to_string(),
+                    376
+                ),
+                (
+                    "herdr-scuttlebutt".to_string(),
+                    "lead-herdr-scuttlebutt".to_string(),
+                    30
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_status_is_quiet_and_safe_on_a_session_with_no_state() {
+        // Status must not write into the daemon's own log: a corrupt
+        // state.json here is something to skip, not to report a cursor reset
+        // over.
+        let session = tempfile::tempdir().unwrap();
+        std::fs::write(session.path().join("state.json"), "garbage").unwrap();
+        assert!(held_batches(session.path()).is_empty());
+        assert!(daemon_log(session.path()).is_empty());
     }
 
     #[test]
@@ -1798,19 +2717,25 @@ mod tests {
             append(dir.path(), "human", &format!("message {i}")).unwrap();
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
             // the per-batch counter never gets past its first failure
-            let batch_fails = state.fail_counts.get("reviewer").map(|e| e.0);
-            match i + 1 < MAX_BATCH_FAILURES {
-                true => assert_eq!(batch_fails, Some(1)),
-                // cleared by the skip on the last pass
-                false => assert_eq!(batch_fails, None),
-            }
+            assert_eq!(state.fail_counts.get("reviewer").map(|e| e.0), Some(1));
+            assert_eq!(state.unconfirmed_streak["reviewer"], i + 1);
         }
         let tail = u64::from(MAX_BATCH_FAILURES);
-        assert_eq!(state.cursors["reviewer"], tail, "never converged");
-        assert_eq!(state.unconfirmed_streak.get("reviewer"), None);
+        // Converged means stopped prompting, not moved on: the batch is held
+        // and the cursor is still where the last confirmed delivery left it.
+        assert_eq!(state.stalled["reviewer"].batch, tail, "never converged");
+        assert_eq!(state.cursors["reviewer"], 0);
+        let sent = herd.prompts.borrow().len();
+        append(dir.path(), "human", "one more").unwrap();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "a growing batch re-armed the stalled agent"
+        );
         let log = daemon_log(dir.path());
         assert!(
-            log.contains(&format!("SKIPPING batch up to #{tail} for reviewer")),
+            log.contains(&format!("Holding the batch up to #{tail}")),
             "log was: {log}"
         );
     }
@@ -2173,6 +3098,7 @@ mod tests {
             status: status.into(),
             cwd: cwd.into(),
             focused: Some(false),
+            session: None,
         }
     }
 

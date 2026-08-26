@@ -24,8 +24,8 @@ pub struct DaemonState {
     /// whenever the batch grows: in a room with traffic that streak never
     /// reaches the threshold, so an agent whose pane never submits would be
     /// re-prompted every tick forever. This one is batch-independent and
-    /// cleared only by a confirmed delivery, which is what makes it
-    /// converge. Outright prompt errors do not touch it — those keep
+    /// cleared only by a confirmed delivery or by the stall it leads to
+    /// being lifted, which is what makes it converge. Outright prompt errors do not touch it — those keep
     /// `fail_counts`' per-batch semantics, where a bigger batch is worth
     /// another try.
     #[serde(default)]
@@ -33,11 +33,81 @@ pub struct DaemonState {
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
+    /// Agents whose batch reached `MAX_BATCH_FAILURES` with nothing ever
+    /// confirming a delivery. While an agent is in here the daemon leaves
+    /// its cursor alone and drops to a widening backoff instead of prompting
+    /// it every tick, so the batch survives until its pane can take it — the
+    /// alternative, advancing the cursor, loses those messages outright
+    /// (#39).
+    ///
+    /// The backoff rather than silence is what makes the exits reachable: a
+    /// pane that recovers in place reports the same session id and would
+    /// never be seen to recover if nothing were ever sent to it again, and
+    /// an agent herdr reports no session id for has no other way out at all.
+    ///
+    /// Keyed by agent and never by batch: an entry that re-armed when the
+    /// batch grew would restart the five-failure cycle on every new room
+    /// message, which is the redelivery loop the threshold exists to stop.
+    #[serde(default)]
+    pub stalled: HashMap<String, Stall>,
+    /// The most recent `agent_session` id herdr reported for each agent.
+    /// The field is optional per *listing*, not per agent, so a tick that
+    /// omits it says nothing about the process at that pane — and an agent
+    /// seen before is one we already know the id of. Keeping it is what
+    /// lets a stall record a real id even when it opens on a listing that
+    /// dropped the field; without that, the stall records `None`, the next
+    /// listing looks like a new session, and delivery goes back to full
+    /// rate. Absent here means herdr has never reported one for that agent,
+    /// which is the case for the agent kinds that do not have them.
+    #[serde(default)]
+    pub last_session: HashMap<String, String>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
     #[serde(default)]
     pub focus_unknown_warned: HashSet<String>,
+}
+
+/// One agent's held batch. Recorded when delivery is given up on, dropped
+/// when the pane proves it can receive again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stall {
+    /// Highest message id at the moment the stall opened. Never moves, so
+    /// the reports that say when the hold began stay true however long it
+    /// lasts; `batch` is the other half of that pair and moves.
+    pub held_since: u64,
+    /// Highest message id in the batch being held, refreshed on every retry.
+    /// Reported and shown by `daemon-status` so a human can see what is
+    /// waiting; nothing gates on it, and a batch that grows past it neither
+    /// clears the stall nor shortens the wait.
+    pub batch: u64,
+    /// The last id herdr reported for this agent as of the stall opening or
+    /// its last failed retry — not necessarily the one carried by that
+    /// particular listing, which may have omitted the field. `None` only
+    /// when herdr has never reported one. A different id means a different
+    /// process is at that pane, which lifts the stall at once rather than
+    /// waiting out the backoff.
+    pub session: Option<String>,
+    /// Delivery opportunities counted since the last retry — ticks where
+    /// this agent was deliverable and unfocused, not wall-clock seconds. A
+    /// pane nobody can be prompted at does not burn its backoff.
+    pub waited: u32,
+    /// Retries made since the stall opened. Sets how long the next wait is,
+    /// and is what widens it.
+    pub retries: u32,
+}
+
+impl Stall {
+    /// A stall as it opens: nothing waited, nothing retried yet.
+    pub fn new(batch: u64, session: Option<String>) -> Self {
+        Stall {
+            held_since: batch,
+            batch,
+            session,
+            waited: 0,
+            retries: 0,
+        }
+    }
 }
 
 pub fn load(dir: &Path) -> DaemonState {
@@ -94,6 +164,25 @@ mod tests {
     }
 
     #[test]
+    fn a_stall_survives_a_daemon_restart() {
+        // A held batch that did not outlive the daemon would be delivered
+        // again on the next tick, and the agent would work back through the
+        // same five failures to reach the same stall.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::default();
+        s.cursors.insert("reviewer".into(), 7);
+        s.stalled
+            .insert("reviewer".into(), Stall::new(12, Some("session-a".into())));
+        save(dir.path(), &s).unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.stalled["reviewer"].batch, 12);
+        assert_eq!(
+            loaded.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+    }
+
+    #[test]
     fn a_production_state_file_still_loads() {
         // Verbatim from a live room dir. Cursors are the only record of what
         // each agent has seen, so a shape change that reset them would lose
@@ -120,6 +209,7 @@ mod tests {
         // fields added after this file was written default rather than
         // failing the parse and resetting every cursor
         assert!(loaded.unconfirmed_streak.is_empty());
+        assert!(loaded.stalled.is_empty());
         assert!(
             !daemon_log(dir.path()).contains("delivery cursors reset"),
             "an existing state file was rejected"

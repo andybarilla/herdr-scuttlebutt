@@ -512,6 +512,7 @@ mod tests {
             status: "idle".into(),
             cwd: String::new(),
             focused: Some(false),
+            session: None,
         }]
     }
 
@@ -523,6 +524,7 @@ mod tests {
                 status: "idle".into(),
                 cwd: "/w/alare/api".into(),
                 focused: Some(false),
+                session: None,
             },
             AgentInfo {
                 name: "acme-secret-issue".into(),
@@ -530,6 +532,7 @@ mod tests {
                 status: "idle".into(),
                 cwd: "/w/acme/web".into(),
                 focused: Some(false),
+                session: None,
             },
             AgentInfo {
                 name: "stray".into(),
@@ -537,6 +540,7 @@ mod tests {
                 status: "idle".into(),
                 cwd: "/tmp/scratch".into(),
                 focused: Some(false),
+                session: None,
             },
         ]
     }

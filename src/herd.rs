@@ -10,6 +10,14 @@ pub struct AgentInfo {
     /// `herdr agent list` did not emit the field at all, which is treated as
     /// "not focused" at the delivery gate — see `focus_blocked` in `daemon.rs`.
     pub focused: Option<bool>,
+    /// The agent process's own session id (`agent_session.value`). `None`
+    /// means `herdr agent list` did not emit it — for the agent kinds that
+    /// never report one, and for a listing where it is momentarily missing.
+    /// A restarted agent reports a new id, which is what lets the daemon
+    /// tell "this pane is a fresh process" from "this pane went quiet". An
+    /// absent id is not evidence either way; `tick` decides what each
+    /// combination of absent and present means, and says why there.
+    pub session: Option<String>,
 }
 
 /// The outcome of a prompt herdr accepted. `herdr agent prompt` can return
@@ -262,6 +270,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<AgentInfo>> {
                 status: a["agent_status"].as_str().unwrap_or("unknown").to_string(),
                 cwd: a["cwd"].as_str().unwrap_or_default().to_string(),
                 focused: a["focused"].as_bool(),
+                session: a["agent_session"]["value"].as_str().map(str::to_string),
             })
         })
         .collect())
