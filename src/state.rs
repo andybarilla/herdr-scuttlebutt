@@ -33,8 +33,8 @@ pub struct DaemonState {
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
-    /// Agents whose batch reached `MAX_BATCH_FAILURES` with nothing ever
-    /// confirming a delivery. While an agent is in here the daemon leaves
+    /// Agents whose batch or unconfirmed streak reached
+    /// `MAX_FAILURES_BEFORE_STALL` with nothing ever confirming a delivery. While an agent is in here the daemon leaves
     /// its cursor alone and drops to a widening backoff instead of prompting
     /// it every tick, so the batch survives until its pane can take it — the
     /// alternative, advancing the cursor, loses those messages outright
