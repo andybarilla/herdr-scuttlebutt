@@ -49,6 +49,8 @@ enum Cmd {
     },
     /// List groups and their members
     Groups,
+    /// List the rooms this session could open
+    Rooms,
     /// Run the delivery daemon in the foreground
     Daemon {
         /// Only enroll agents matching this comma-separated glob list
@@ -88,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         } => cli::cmd_read(group.as_deref(), since, limit),
         Cmd::Agents { group } => cli::cmd_agents(group.as_deref(), &herd),
         Cmd::Groups => cli::cmd_groups(&herd),
+        Cmd::Rooms => cli::cmd_rooms(&herd),
         Cmd::Daemon { agents } => {
             let pattern = agents
                 .or_else(|| std::env::var("SCUTTLEBUTT_AGENTS").ok())
