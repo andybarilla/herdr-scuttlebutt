@@ -2792,8 +2792,11 @@ mod tests {
         herd.fail_prompts = true;
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         let log = daemon_log(dir.path());
+        let cap = MAX_FAILURES_BEFORE_STALL;
         assert!(
-            log.contains("failed: stalled (batch 3/5, unconfirmed 2/5)"),
+            log.contains(&format!(
+                "failed: stalled (batch 3/{cap}, unconfirmed 2/{cap})"
+            )),
             "log was: {log}"
         );
     }
