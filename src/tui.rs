@@ -76,12 +76,12 @@ pub struct App {
     pub scroll_from_bottom: u16,
     pub quit: bool,
     /// The last failed action, surfaced in the input-line title. A transient
-    /// failure must not tear the chat pane down — neither a write nor a
-    /// switch.
+    /// failure must not tear the chat pane down — neither a write, nor a
+    /// switch, nor a read of the room's log.
     ///
-    /// Each writer stores a message describing its own action, because two
-    /// actions land here and a fixed "post failed" prefix would report a
-    /// failed switch as a post nobody attempted.
+    /// Each writer stores a message describing its own action, because
+    /// several actions land here and a fixed "post failed" prefix would
+    /// report a failed switch as a post nobody attempted.
     pub last_error: Option<String>,
     /// Message-pane title, always naming the room being viewed — a group,
     /// the ungrouped room, or none selected. It is half the safeguard
@@ -103,6 +103,17 @@ pub struct App {
     /// switch-in. Without it a draft either follows you into the next room
     /// or is silently dropped.
     pub drafts: HashMap<CurrentRoom, String>,
+    /// Whether the message in `last_error` is the tail read's own, so that a
+    /// later successful read clears that and nothing else. The tail runs at
+    /// the top of every loop, before the draw, so an unconditional clear
+    /// would wipe a `post failed: …` written after the last draw before the
+    /// human ever saw it.
+    ///
+    /// It is a claim about who wrote `last_error`, which means every other
+    /// writer has to clear it — `post` and `switch_room` both do, and a
+    /// third writer added without doing so silently re-opens exactly that
+    /// hole.
+    pub tail_failed: bool,
     /// `room.jsonl` length per room when this pane started, refreshed for a
     /// room as you leave it. An unread dot is this compared against the
     /// file's length now, so it means "arrived while this pane has been
@@ -465,6 +476,11 @@ fn switch_room(
     if target == app.room {
         return Ok(());
     }
+    // Cleared before anything that can fail, because the caller writes its
+    // own `could not open that room: …` into `last_error` when this returns
+    // Err — and a flag left standing there hands that message to the next
+    // successful read to erase.
+    app.tail_failed = false;
     // Everything that can fail happens here, before a single byte of the
     // pane's room-scoped state moves. `paths::room_dir` reaches `base_dir`,
     // which spawns `herdr plugin config-dir` unless SCUTTLEBUTT_DIR is set,
@@ -516,7 +532,8 @@ fn switch_room(
         app.input = app.drafts.remove(&target).unwrap_or(carried);
     }
     app.scroll_from_bottom = 0;
-    // A write failure belonged to the room it was attempted in.
+    // A failure belonged to the room it happened in — a write attempted
+    // there, or a read of that room's log.
     app.last_error = None;
 
     match loaded {
@@ -537,6 +554,80 @@ fn switch_room(
     app.title = title_for(&target);
     app.room = target;
     Ok(())
+}
+
+/// Commits a line to the room on screen, reporting a failed write the way a
+/// failed read and a failed switch are reported.
+fn post(app: &mut App, dir: &Path, text: &str) {
+    app.last_error = match log_store::append(dir, "human", text) {
+        Ok(_) => None,
+        Err(e) => Some(format!("post failed: {e}")),
+    };
+    // Whatever is in `last_error` now, it is not the tail's. Leaving the
+    // flag standing would have the next good read — which comes before the
+    // next draw — erase what the human just failed to send, unseen.
+    app.tail_failed = false;
+}
+
+/// The messages `dir` has for a pane sitting at `cursor`, and whether they
+/// replace that pane's list rather than extend it: `room.jsonl` was
+/// truncated or replaced (ids restarted lower than the cursor), so the stale
+/// in-memory tail is discarded and the file re-read from the start rather
+/// than every future message being filtered out forever.
+///
+/// Separate from `tail` so that everything which can fail happens before a
+/// single message moves — the same order `switch_room` uses, and what lets a
+/// failed read leave the list exactly as it stands.
+///
+/// One way of losing the message list is not guarded anywhere, here or in
+/// `tail`, and #56 owns it: a `room.jsonl` deleted and left absent comes
+/// back through this door rather than the Err one — `last_id` reads 0,
+/// `should_reseed` fires against any non-zero cursor, and the pane is
+/// blanked with `last_error` never set. It is not a one-line check because
+/// #34's configured-but-quiet room is legitimately empty and has to keep
+/// rendering in silence, so the two are indistinguishable from the read
+/// alone. Forcing the state wants the directory present and the file
+/// deleted; a regular file where the directory belongs gives the Err door
+/// instead, and `chmod` gives neither under a CI running as root.
+fn read_tail(dir: &Path, cursor: u64) -> Result<(bool, Vec<Message>)> {
+    let reseed = should_reseed(cursor, log_store::last_id(dir)?);
+    let from = if reseed { 0 } else { cursor };
+    Ok((reseed, log_store::read_since(dir, from)?))
+}
+
+/// Reads whatever has arrived in the room on screen since the last loop,
+/// surfacing a failed read through `last_error` rather than out of the event
+/// loop. Propagating it tears the pane down, and `App` goes with it — every
+/// room's stashed draft included, silently.
+///
+/// A failure does not stop this room being polled. The read is one file read
+/// per loop; leaving it running is what makes a genuinely unreadable room
+/// keep saying so on every frame instead of complaining once and then
+/// looking healthy, and it is also the only way a room that becomes readable
+/// again recovers, which a poller that had switched itself off could not do.
+fn tail(app: &mut App, dir: &Path) {
+    let cursor = app.messages.last().map(|m| m.id).unwrap_or(0);
+    match read_tail(dir, cursor) {
+        Ok((reseed, mut fresh)) => {
+            if reseed {
+                app.messages = fresh;
+            } else {
+                app.messages.append(&mut fresh);
+            }
+            // Only the read's own error is cleared, never whatever else is
+            // sitting in `last_error`: this runs at the top of every loop,
+            // before the draw, so clearing unconditionally would wipe a
+            // "post failed: …" from the keystroke just handled before the
+            // human ever saw it.
+            if std::mem::take(&mut app.tail_failed) {
+                app.last_error = None;
+            }
+        }
+        Err(e) => {
+            app.last_error = Some(format!("could not read this room: {e}"));
+            app.tail_failed = true;
+        }
+    }
 }
 
 pub fn run(group: Option<&str>) -> Result<()> {
@@ -567,18 +658,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
         while !app.quit {
             // tail new messages every loop; members on a slow tick
             if let Some(dir) = app.dir.clone() {
-                let last = app.messages.last().map(|m| m.id).unwrap_or(0);
-                let file_last = log_store::last_id(&dir)?;
-                if should_reseed(last, file_last) {
-                    // room.jsonl was truncated or replaced (ids restarted
-                    // lower than our cursor); discard the stale in-memory
-                    // tail and re-seed from the start of the file instead of
-                    // filtering every future message out forever.
-                    app.messages = log_store::read_since(&dir, 0)?;
-                } else {
-                    let mut fresh = log_store::read_since(&dir, last)?;
-                    app.messages.append(&mut fresh);
-                }
+                tail(&mut app, &dir);
                 // `selected()` is destructured, never flattened: flattening
                 // would hand `scoped_members` the ungrouped room's roster
                 // for a pane that has selected no room, which is the
@@ -607,11 +687,8 @@ pub fn run(group: Option<&str>) -> Result<()> {
                                 // `handle_key` only returns this with a room
                                 // selected, so a pane with none never reaches
                                 // an append with no directory.
-                                if let Some(dir) = &app.dir {
-                                    app.last_error = match log_store::append(dir, "human", &text) {
-                                        Ok(_) => None,
-                                        Err(e) => Some(format!("post failed: {e}")),
-                                    };
+                                if let Some(dir) = app.dir.clone() {
+                                    post(&mut app, &dir, &text);
                                 }
                             }
                             Some(Action::OpenPicker) => {
@@ -1710,6 +1787,248 @@ mod tests {
         a.scroll_from_bottom = 7;
         switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
         assert_eq!(a.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn a_failed_tail_read_leaves_the_pane_alive_holding_every_draft() {
+        // What is lost here is not the read: it is the `?` the run loop
+        // applies to it. That Err leaves `run`, ratatui restores the
+        // terminal, and `App` is dropped with it — every room's stashed
+        // draft included, silently, with nothing written anywhere. The
+        // per-room `drafts` map is what turned that from one half-typed line
+        // into all of them.
+        //
+        // A regular file where the room directory belongs is the honest way
+        // into the Err branch: it is ENOTDIR for any uid, root included,
+        // where `chmod 000` stops failing under a CI running as root and
+        // leaves a green no-op. A *missing* directory reads as `Ok(vec![])`,
+        // so there is no other route.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.messages = vec![msg("bob", "already on screen")];
+        a.input = "half-typed, not sent".into();
+        a.drafts.insert(named("alare"), "unsent to alare".into());
+        a.drafts.insert(named("acme"), "unsent to acme".into());
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+
+        tail(&mut a, &wall);
+
+        // The pane is still here, and it says what failed in its own words:
+        // a fixed prefix is what once had a failed switch claiming "post
+        // failed".
+        let reported = a.last_error.clone();
+        assert!(
+            reported
+                .as_deref()
+                .is_some_and(|e| e.contains("could not read this room")),
+            "a failed tail read left the pane with nothing to say: {reported:?}"
+        );
+        // Blanking the list would make a transient read error look like a
+        // room somebody emptied.
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["already on screen"]
+        );
+        assert_eq!(a.input, "half-typed, not sent");
+        let mut stashed: Vec<&str> = a.drafts.values().map(String::as_str).collect();
+        stashed.sort();
+        assert_eq!(stashed, vec!["unsent to acme", "unsent to alare"]);
+    }
+
+    #[test]
+    fn a_replaced_room_log_is_re_seeded_rather_than_filtered_out_forever() {
+        // The other half of what `tail` decides, and the one a reader is
+        // most likely to simplify away: with ids restarted below the
+        // pane's cursor, reading *since the cursor* returns nothing
+        // forever, so the room looks dead while messages arrive.
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..3 {
+            log_store::append(&dir, "bob", &format!("old{i}")).unwrap();
+        }
+        let mut a = app();
+        tail(&mut a, &dir);
+        assert_eq!(a.messages.len(), 3);
+
+        std::fs::remove_file(dir.join("room.jsonl")).unwrap();
+        log_store::append(&dir, "bob", "id 1 all over again").unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id 1 all over again"]
+        );
+    }
+
+    #[test]
+    fn a_failed_post_is_not_erased_by_the_next_good_read() {
+        // The sequence that reaches this: the room's log fails to read
+        // (flag set, error drawn), the human presses Enter and the write
+        // fails too — after the draw — and the read succeeds again next
+        // frame. A flag left standing from the read erases the post failure
+        // before it is ever drawn, which is the one thing the flag exists to
+        // prevent.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+        tail(&mut a, &wall);
+
+        post(&mut a, &wall, "the line the human typed");
+        assert!(
+            a.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("post failed:")),
+            "{:?}",
+            a.last_error
+        );
+
+        let good = session.join("acme");
+        std::fs::create_dir(&good).unwrap();
+        log_store::append(&good, "bob", "hi").unwrap();
+        tail(&mut a, &good);
+
+        assert!(
+            a.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("post failed:")),
+            "the good read erased what the human failed to send: {:?}",
+            a.last_error
+        );
+    }
+
+    #[test]
+    fn a_failed_switch_is_not_erased_by_the_next_good_read() {
+        // Same shape, other writer: `switch_room` returns Err and its caller
+        // writes the message, so the flag has to be down by the time it
+        // returns — on the failing path as much as the succeeding one.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+        tail(&mut a, &wall);
+
+        let e = switch(&mut a, named("wall"), &session, &FakeHerd(vec![], false)).unwrap_err();
+        assert!(
+            !a.tail_failed,
+            "a failed switch left the read's claim on `last_error` standing"
+        );
+        // The message the run loop writes for that Err, verbatim.
+        a.last_error = Some(format!("could not open that room: {e}"));
+
+        let good = session.join("acme");
+        std::fs::create_dir(&good).unwrap();
+        tail(&mut a, &good);
+
+        assert_eq!(
+            a.last_error.as_deref(),
+            Some(format!("could not open that room: {e}").as_str())
+        );
+    }
+
+    #[test]
+    fn trimming_a_room_log_leaves_the_pane_the_history_it_has_read() {
+        // A rotation that drops old lines but keeps the newest id: the
+        // cursor still matches the file, so there is nothing to re-seed
+        // from, and re-reading anyway would shrink the pane's scrollback to
+        // whatever the file kept. This is the case that separates the two
+        // branches of `reseed`; ids restarting lower is the other.
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..5 {
+            log_store::append(&dir, "bob", &format!("m{i}")).unwrap();
+        }
+        let mut a = app();
+        tail(&mut a, &dir);
+        assert_eq!(a.messages.len(), 5);
+
+        let kept: String = std::fs::read_to_string(dir.join("room.jsonl"))
+            .unwrap()
+            .lines()
+            .skip(3)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(dir.join("room.jsonl"), kept).unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m0", "m1", "m2", "m3", "m4"]
+        );
+    }
+
+    #[test]
+    fn a_room_that_stays_unreadable_keeps_saying_so() {
+        // The failure mode this rules out is a pane that complains once and
+        // then looks healthy while its log is still unreadable.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let wall = session.join("wall");
+        std::fs::write(&wall, b"not a directory").unwrap();
+
+        tail(&mut a, &wall);
+        let first = a.last_error.clone();
+        tail(&mut a, &wall);
+
+        assert_eq!(a.last_error, first);
+        assert!(a.last_error.is_some(), "the room fell quiet about it");
+    }
+
+    #[test]
+    fn a_room_that_becomes_readable_again_stops_saying_it_failed() {
+        // The same path throughout: a room directory that a file was
+        // standing in the way of, as it is on disk when the mount or the
+        // stray file is cleared up.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let dir = session.join("acme");
+        std::fs::write(&dir, b"not a directory").unwrap();
+        tail(&mut a, &dir);
+        assert!(a.last_error.is_some());
+
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        log_store::append(&dir, "bob", "back again").unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(a.last_error, None);
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["back again"]
+        );
+    }
+
+    #[test]
+    fn a_successful_read_does_not_wipe_a_failed_post_before_it_is_seen() {
+        // `tail` runs at the top of every loop, before the draw, so a read
+        // that cleared `last_error` unconditionally would erase the report
+        // of the post the human just failed to send — in the same frame it
+        // was written, having never been drawn.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        log_store::append(&dir, "bob", "hi").unwrap();
+        a.last_error = Some("post failed: disk on fire".into());
+
+        tail(&mut a, &dir);
+
+        assert_eq!(a.last_error.as_deref(), Some("post failed: disk on fire"));
     }
 
     #[test]
