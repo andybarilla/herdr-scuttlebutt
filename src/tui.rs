@@ -75,9 +75,14 @@ pub struct App {
     pub members: Vec<AgentInfo>,
     pub scroll_from_bottom: u16,
     pub quit: bool,
-    /// Last post failure, surfaced in the input-line title. A transient write
-    /// failure must not tear the chat pane down.
-    pub post_error: Option<String>,
+    /// The last failed action, surfaced in the input-line title. A transient
+    /// failure must not tear the chat pane down — neither a write nor a
+    /// switch.
+    ///
+    /// Each writer stores a message describing its own action, because two
+    /// actions land here and a fixed "post failed" prefix would report a
+    /// failed switch as a post nobody attempted.
+    pub last_error: Option<String>,
     /// Message-pane title, always naming the room being viewed — a group,
     /// the ungrouped room, or none selected. It is half the safeguard
     /// against posting into the wrong company's room; the input line's
@@ -469,16 +474,24 @@ fn switch_room(
     // into another company's room.
     let loaded = match target.selected() {
         Some(group) => {
-            let dir = crate::paths::room_dir(group)?;
+            let dir = crate::paths::room_dir_in(session_dir, group);
             // A clean read of the whole file, never `should_reseed`: that
             // asks whether *this* room's log was truncated, and it would be
             // comparing this room's cursor against another room's last id.
+            // A room with no directory yet reads as empty rather than
+            // failing, which is why the read can precede the create below.
             let messages = log_store::read_since(&dir, 0)?;
             // A failed listing is not a failed switch: `scoped_members`
             // returns `None` for it, and an empty roster beside the new
             // room's title is honest, where the old room's names would not
             // be.
             let members = scoped_members(herd, group, grouping, orgs).unwrap_or_default();
+            // Created only once the room is certain to open, so a switch
+            // that fails leaves no empty directory behind — the litter
+            // `groups::has_history` exists to sweep out of listings.
+            // `room_dir` would have created it before the read could fail,
+            // and reaches `base_dir`, which spawns a subprocess per switch.
+            std::fs::create_dir_all(&dir)?;
             Some((dir, messages, members))
         }
         None => None,
@@ -504,7 +517,7 @@ fn switch_room(
     }
     app.scroll_from_bottom = 0;
     // A write failure belonged to the room it was attempted in.
-    app.post_error = None;
+    app.last_error = None;
 
     match loaded {
         Some((dir, messages, members)) => {
@@ -595,9 +608,9 @@ pub fn run(group: Option<&str>) -> Result<()> {
                                 // selected, so a pane with none never reaches
                                 // an append with no directory.
                                 if let Some(dir) = &app.dir {
-                                    app.post_error = match log_store::append(dir, "human", &text) {
+                                    app.last_error = match log_store::append(dir, "human", &text) {
                                         Ok(_) => None,
-                                        Err(e) => Some(e.to_string()),
+                                        Err(e) => Some(format!("post failed: {e}")),
                                     };
                                 }
                             }
@@ -633,7 +646,7 @@ pub fn run(group: Option<&str>) -> Result<()> {
                                     // the room it was in, with every draft
                                     // where it was left.
                                     Err(e) => {
-                                        app.post_error =
+                                        app.last_error =
                                             Some(format!("could not open that room: {e}"))
                                     }
                                 }
@@ -717,12 +730,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // and the border stays away-yellow rather than error-red: a reader who
     // has learned that yellow means "not your room" must not lose it to a
     // transient write error.
-    let (input_title, border) = match (&app.post_error, app.room.selected().is_some(), away) {
-        (Some(e), _, true) => (
-            format!(" → {} · post failed: {e} ", app.room.label()),
-            Color::Yellow,
-        ),
-        (Some(e), _, false) => (format!(" post failed: {e} "), Color::Red),
+    let (input_title, border) = match (&app.last_error, app.room.selected().is_some(), away) {
+        // A pane with no room selected keeps its one affordance whatever
+        // else has failed. Ctrl-K is the only way out of a state the pane
+        // cannot leave on its own — the state #35 exists to rescue — so an
+        // error that displaced the hint would make the pane dead again.
+        (Some(e), false, _) => (format!(" {e} — Ctrl-K to pick a room "), Color::Red),
+        (Some(e), _, true) => (format!(" → {} · {e} ", app.room.label()), Color::Yellow),
+        (Some(e), _, false) => (format!(" {e} "), Color::Red),
         (None, false, _) => (
             " no room selected — Ctrl-K to pick a room ".to_string(),
             Color::DarkGray,
@@ -785,8 +800,15 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
                         if r.unread { "● " } else { "  " },
                         Style::default().fg(Color::Yellow),
                     ),
+                    // Padded by display cells, not chars, like every other
+                    // width in this file: a CJK room name is twice as wide
+                    // as it is long and would push the column out of line.
                     Span::styled(
-                        format!("{:<20}", r.room.label()),
+                        format!(
+                            "{}{}",
+                            r.room.label(),
+                            " ".repeat(20usize.saturating_sub(display_width(r.room.label())))
+                        ),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!("{} agents · {}", r.agents, r.sources)),
@@ -1092,6 +1114,36 @@ mod tests {
             .collect()
     }
 
+    /// Terminal column of each row containing `needle`, measured in cells
+    /// rather than string bytes. `render` above concatenates cell symbols,
+    /// and a wide glyph fills one cell and leaves the next holding a space,
+    /// so an index into that string is not a column: two aligned rows can
+    /// look misaligned there, and misaligned ones aligned.
+    fn columns_of(app: &App, width: u16, height: u16, needle: &str) -> Vec<u16> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut hits = Vec::new();
+        for y in 0..height {
+            let cells: Vec<(u16, String)> = (0..width)
+                .map(|x| (x, buffer[(x, y)].symbol().to_string()))
+                .collect();
+            let line: String = cells.iter().map(|(_, s)| s.as_str()).collect();
+            if let Some(byte) = line.find(needle) {
+                let mut acc = 0usize;
+                for (x, s) in &cells {
+                    if acc == byte {
+                        hits.push(*x);
+                        break;
+                    }
+                    acc += s.len();
+                }
+            }
+        }
+        hits
+    }
+
     #[test]
     fn newest_message_is_visible_without_scrolling() {
         // The bug: counting one row per message undershoots the bottom
@@ -1147,9 +1199,9 @@ mod tests {
     }
 
     #[test]
-    fn post_error_is_surfaced_in_the_input_title() {
+    fn last_error_is_surfaced_in_the_input_title() {
         let app = App {
-            post_error: Some("disk on fire".into()),
+            last_error: Some("post failed: disk on fire".into()),
             ..App::default()
         };
         assert!(render(&app, 60, 12).join("\n").contains("disk on fire"));
@@ -1526,7 +1578,7 @@ mod tests {
     #[test]
     fn a_switch_that_cannot_open_the_room_changes_nothing_at_all() {
         // The half-applied switch: input taken, draft stashed, the old room
-        // marked read, `post_error` cleared — but `app.room` still the old
+        // marked read, `last_error` cleared — but `app.room` still the old
         // room. The pane then displays and posts to room A while holding
         // room B's draft, which is one company's text one Enter away from
         // another company's room.
@@ -1536,11 +1588,14 @@ mod tests {
         a.room = named("alare");
         a.input = "alare draft".into();
         a.messages = vec![msg("bob", "alare chatter")];
-        a.post_error = Some("an earlier failure".into());
+        a.last_error = Some("an earlier failure".into());
         a.unread_seeds.insert(named("alare"), 11);
         a.dir = Some(crate::paths::room_dir(Some("alare")).unwrap());
+        a.scroll_from_bottom = 4;
+        a.title = title_for(&named("alare"));
+        a.members = vec![at("alare-1", "/w/alare/api")];
 
-        // A room name that cannot become a directory, so `room_dir` fails
+        // A room whose path is an ordinary file, so reading its log fails
         // where every other step would have succeeded.
         std::fs::write(session.join("wall"), b"not a directory").unwrap();
         let err = switch(&mut a, named("wall"), &session, &herd);
@@ -1553,9 +1608,82 @@ mod tests {
             "a draft was stashed by a failed switch"
         );
         assert_eq!(a.unread_seeds.get(&named("alare")), Some(&11));
-        assert_eq!(a.post_error.as_deref(), Some("an earlier failure"));
+        assert_eq!(a.last_error.as_deref(), Some("an earlier failure"));
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.dir, Some(crate::paths::room_dir(Some("alare")).unwrap()));
+        // Everything else the switch would have moved, so the guarantee is
+        // "nothing changed" rather than "the fields I remembered".
+        assert_eq!(a.scroll_from_bottom, 4);
+        assert_eq!(a.title, " scuttlebutt · alare ");
+        let names: Vec<&str> = a.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["alare-1"]);
+    }
+
+    #[test]
+    fn a_failed_switch_leaves_no_directory_behind_for_the_room_it_could_not_open() {
+        // `room_dir` would have created it before the read could fail, and
+        // an empty directory is exactly what `groups::has_history` filters
+        // out of every listing.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.room = named("alare");
+        std::fs::write(session.join("wall"), b"not a directory").unwrap();
+
+        // a switch that succeeds does create the room's directory
+        assert!(switch(&mut a, named("ghost"), &session, &FakeHerd(vec![], false)).is_ok());
+        assert!(session.join("ghost").is_dir());
+
+        assert!(switch(&mut a, named("wall"), &session, &FakeHerd(vec![], false)).is_err());
+        assert!(
+            !session.join("wall").is_dir(),
+            "a failed switch created the room directory anyway"
+        );
+    }
+
+    #[test]
+    fn a_roomless_pane_keeps_its_way_out_even_when_something_has_failed() {
+        // Ctrl-K is the only exit from a pane that resolved to no room, and
+        // that pane is the case #35 exists to rescue. An error displacing
+        // the hint makes it a dead pane again.
+        let a = App {
+            last_error: Some("could not open that room: Not a directory".into()),
+            ..App::default()
+        };
+        let screen = render(&a, 90, 12).join("\n");
+        assert!(screen.contains("Ctrl-K"), "the way out is gone:\n{screen}");
+        assert!(screen.contains("could not open that room"), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_switch_is_never_reported_as_a_failed_post() {
+        // The switch is a no-op when it fails, so nothing was posted and
+        // nothing was attempted; "post failed" describes an action nobody
+        // took.
+        let (_d, _env, session) = scratch();
+        let mut a = app();
+        a.room = named("alare");
+        std::fs::write(session.join("wall"), b"not a directory").unwrap();
+        let e = switch(&mut a, named("wall"), &session, &FakeHerd(vec![], false)).unwrap_err();
+        let reported = format!("could not open that room: {e}");
+
+        // Every arm of the input-line match, not just the one this pane
+        // happens to be in: a fixed "post failed" prefix reintroduced in any
+        // of them is the same lie.
+        for (room, home) in [
+            (CurrentRoom::NoneSelected, CurrentRoom::NoneSelected),
+            (named("alare"), named("alare")),
+            (named("alare"), named("acme")),
+        ] {
+            let pane = App {
+                room,
+                home,
+                last_error: Some(reported.clone()),
+                ..App::default()
+            };
+            let screen = render(&pane, 90, 12).join("\n");
+            assert!(!screen.contains("post failed"), "{screen}");
+            assert!(screen.contains("could not open that room"), "{screen}");
+        }
     }
 
     #[test]
@@ -1566,7 +1694,7 @@ mod tests {
         let a = App {
             room: named("acme"),
             home: named("alare"),
-            post_error: Some("disk on fire".into()),
+            last_error: Some("post failed: disk on fire".into()),
             ..App::default()
         };
         let screen = render(&a, 70, 12).join("\n");
@@ -1587,9 +1715,9 @@ mod tests {
     fn a_post_failure_does_not_follow_you_into_the_next_room() {
         let (_d, _env, session) = scratch();
         let mut a = app();
-        a.post_error = Some("disk on fire".into());
+        a.last_error = Some("post failed: disk on fire".into());
         switch(&mut a, named("acme"), &session, &FakeHerd(vec![], false)).unwrap();
-        assert_eq!(a.post_error, None);
+        assert_eq!(a.last_error, None);
     }
 
     #[test]
@@ -1815,6 +1943,33 @@ mod tests {
         assert_eq!(
             labelled,
             vec![("alare", "live agents"), ("acme", "history")]
+        );
+    }
+
+    #[test]
+    fn a_wide_room_name_does_not_push_the_picker_columns_out_of_line() {
+        // `{:<20}` pads by chars; a CJK name is twice as wide as it is long,
+        // so its detail column would start four cells late.
+        let mut a = app();
+        a.picker = Some(PickerState {
+            rows: ["一二三四", "acme"]
+                .iter()
+                .map(|n| PickerRow {
+                    room: CurrentRoom::Named((*n).into()),
+                    agents: 0,
+                    sources: "config".into(),
+                    unread: false,
+                })
+                .collect(),
+            filter: String::new(),
+            cursor: 0,
+        });
+        let screen = render(&a, 90, 12).join("\n");
+        let columns = columns_of(&a, 90, 12, "0 agents");
+        assert_eq!(columns.len(), 2, "expected both rows:\n{screen}");
+        assert_eq!(
+            columns[0], columns[1],
+            "detail columns are misaligned:\n{screen}"
         );
     }
 
