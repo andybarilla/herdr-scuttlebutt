@@ -345,8 +345,8 @@ fn rule_bounded(lines: &[&str]) -> Regions {
 /// double-width character late, by one column per such character, and the
 /// fragment it keeps is exactly the furniture this exists to remove.
 fn box_span(border: &str) -> (usize, usize) {
-    let start = border.chars().take_while(|c| c.is_whitespace()).count();
-    (start, display_width(border.trim_end()))
+    let indent: String = border.chars().take_while(|c| c.is_whitespace()).collect();
+    (display_width(&indent), display_width(border.trim_end()))
 }
 
 /// The cells one character is drawn in, given what the character before it
@@ -1158,6 +1158,21 @@ mod tests {
             assert_eq!(composer_regions(&pane).composers.len(), 1);
             assert_eq!(composer_holds(&pane, OC_SENT), Some(false));
         }
+    }
+
+    #[test]
+    fn both_ends_of_a_box_span_are_measured_in_cells() {
+        // The sibling of the two-metric defect, in the same function: the
+        // indent was counted in characters while the far edge was measured
+        // in cells. Whitespace wider than one cell then makes two boxes at
+        // different columns compare as one, and a rule that is not the
+        // composer's edge pairs with it.
+        let run = "\u{2500}".repeat(RULE_RUN);
+        let wide = format!("\u{3000}{run}");
+        let narrow = format!(" {run}");
+        assert_eq!(display_width("\u{3000}"), 2, "the indents measure alike");
+        assert_eq!(box_span(&wide).0, 2);
+        assert!(!same_box(&wide, &narrow));
     }
 
     #[test]
