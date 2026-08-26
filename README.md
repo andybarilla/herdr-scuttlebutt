@@ -91,6 +91,27 @@ agent drops to a widening retry — about a minute, then doubling to half an hou
 appears at that pane. `daemon-status` names who is stalled and what is being
 held for them.
 
+If that pane goes away entirely — the usual way a human clears a wedge is to
+close it and open a new one — the batch is kept rather than expiring with the
+agent's presence state. `daemon-status` lists it separately, since nobody can
+fix a pane that is gone. It is delivered automatically when an agent returns
+under that name reporting the same session id; a name is not an identity, so
+any other case waits for you:
+
+```
+scuttlebutt held <agent> --deliver   # authorise delivery to the agent at that name
+scuttlebutt held <agent> --drop      # discard it, or clear a dropped-batch note
+```
+
+`--deliver` authorises one delivery rather than arming the name forever: if
+herdr reports a session id for that pane it is recorded and checked, and either
+way the authorization lapses after 30 minutes unclaimed. The batch itself does
+not lapse — only the permission to hand it over.
+
+Each room holds at most 16 batches at once. That is the bound: past it, the
+batch that has waited longest is dropped, said loudly in `daemon.log`, and named
+by `daemon-status` until you clear the note.
+
 ```sh
 scuttlebutt daemon-status
 scuttlebutt daemon-stop

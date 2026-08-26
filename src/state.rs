@@ -49,6 +49,10 @@ pub struct DaemonState {
     /// Keyed by agent and never by batch: an entry that re-armed when the
     /// batch grew would restart the run-up to the cap on every new room
     /// message, which is the redelivery loop the threshold exists to stop.
+    ///
+    /// Every agent in here is one herdr is still listing. An entry whose
+    /// agent goes away is moved to `held` rather than purged with the
+    /// presence state (#43), and comes back here if that name is resumed.
     #[serde(default)]
     pub stalled: HashMap<String, Stall>,
     /// The most recent `agent_session` id herdr reported for each agent.
@@ -58,10 +62,40 @@ pub struct DaemonState {
     /// lets a stall record a real id even when it opens on a listing that
     /// dropped the field; without that, the stall records `None`, the next
     /// listing looks like a new session, and delivery goes back to full
-    /// rate. Absent here means herdr has never reported one for that agent,
-    /// which is the case for the agent kinds that do not have them.
+    /// rate.
+    ///
+    /// Scoped to an unbroken presence: the entry is dropped on the agent's
+    /// first absence, not with the rest of its state at `MAX_ABSENCES`. A
+    /// dropped *field* while the agent stays listed is the same process,
+    /// which is the case this map exists for; a broken *presence* is not,
+    /// because a different agent can take the name before the purge and
+    /// would otherwise be handed the id its predecessor left behind (#43).
+    ///
+    /// So absent here means one of two things — herdr has never reported an
+    /// id for that agent, which is the case for the agent kinds that do not
+    /// have them, or the name's presence has broken since it last did.
+    /// Both mean the same thing to a reader: nothing here knows who is at
+    /// that pane.
     #[serde(default)]
     pub last_session: HashMap<String, String>,
+    /// Batches held for agents that are no longer present. The absence
+    /// purge clears presence state on its own schedule (six seconds at the
+    /// 2s tick), which is shorter than closing and reopening a pane — the
+    /// most natural way a human clears a wedge. Taking the stall with the
+    /// presence state lost the batch on exactly that path (#43), so the
+    /// stall moves here instead, carrying the cursor delivery must resume
+    /// from. Nothing here expires on a timer: an entry leaves when its
+    /// batch is delivered, when a human drops it, or when the room's cap
+    /// evicts the oldest to bound the file.
+    #[serde(default)]
+    pub held: HashMap<String, Held>,
+    /// Held batches this room's cap evicted, newest last and capped at
+    /// `MAX_DROPPED_NOTES`. A note is not the batch: those messages are
+    /// still in the room log and nothing will deliver them. It stays until
+    /// a human acknowledges it with `held <agent> --drop` or another
+    /// eviction pushes it out.
+    #[serde(default)]
+    pub dropped: Vec<Dropped>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
@@ -111,6 +145,82 @@ impl Stall {
     }
 }
 
+/// A batch whose agent has gone from `herdr agent list` entirely. Split
+/// from `Stall`, which is about an agent that is still there and not
+/// taking deliveries: the two are reported separately because a human can
+/// fix one at the pane and the other has no pane to fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Held {
+    /// Where redelivery resumes. The cursor as of the purge, so it still
+    /// sits below every message the stall was holding.
+    pub cursor: u64,
+    /// Highest message id when the stall opened, carried over so the
+    /// reports that say when the hold began stay true across the purge.
+    pub held_since: u64,
+    /// Highest message id known to be waiting, for `daemon-status`. Nothing
+    /// gates on it.
+    pub batch: u64,
+    /// The session id herdr last reported for the agent that owned this
+    /// batch. Equality with a returning agent's id is the only evidence
+    /// that the name still means the same process, which is what gates
+    /// automatic redelivery (#43). `None` means no such evidence exists —
+    /// either herdr never reported an id for that agent, or two stalls
+    /// merged under this name and disagreed about whose batch it is, which
+    /// leaves the hold unable to say. Both refuse every returning agent
+    /// until a human releases it.
+    pub session: Option<String>,
+    /// Whether the daemon has already said this batch is held for a name
+    /// it cannot match to the agent now using it. Once per record, so a
+    /// standing mismatch does not print a line every tick; `daemon-status`
+    /// is where it stays visible.
+    #[serde(default)]
+    pub warned: bool,
+    /// A human's standing answer to the question the session id could not
+    /// (`scuttlebutt held <agent> --deliver`), or `None` for a hold nobody
+    /// has released. Bounded and identified rather than a bare flag: a
+    /// release that never expired and compared nothing would arm a
+    /// delivery for whoever next answered to that name, which is the
+    /// cross-delivery the automatic path exists to refuse.
+    #[serde(default)]
+    pub release: Option<Release>,
+}
+
+/// One human authorization to deliver a held batch. An authorization, not a
+/// standing arrangement: it names the process it was given for whenever
+/// herdr could report one, and it lapses either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Release {
+    /// The session id the agent at that name was reporting when the human
+    /// released the hold. `Some` means the release is for that process and
+    /// no other. `None` means herdr reported none — the agent was gone, or
+    /// is a kind that has no id — and the window below is then the only
+    /// thing standing between the release and an unrelated pane.
+    pub session: Option<String>,
+    /// When the release was given, RFC3339. Wall-clock rather than ticks
+    /// because a room whose agents have all gone does not tick at all, and
+    /// a release that only lapsed while something was running would stand
+    /// forever in exactly the room where it is most likely to be stale.
+    ///
+    /// This is a bound on the *authorization*, never on the batch: a hold
+    /// whose release lapses is still held, and still listed. A stamp in
+    /// the future is read as lapsed rather than as fresh, so a state file
+    /// written by a machine whose clock runs ahead cannot hold one open.
+    pub at: String,
+}
+
+/// A held batch the room's cap evicted. Kept so `daemon-status` can still
+/// name what was dropped: a batch that leaves the state file with only a
+/// `daemon.log` line behind is invisible to the interface that is supposed
+/// to be the record of what is waiting. Capped like the holds are, and
+/// trimmed on every tick rather than only when one is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dropped {
+    pub agent: String,
+    pub batch: u64,
+    pub held_since: u64,
+    pub at: String,
+}
+
 pub fn load(dir: &Path) -> DaemonState {
     let path = dir.join("state.json");
     let contents = match std::fs::read_to_string(&path) {
@@ -151,6 +261,31 @@ pub fn save(dir: &Path, s: &DaemonState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_batch_roundtrips() {
+        // The cursor is the whole point of the record: a hold that came
+        // back without it would resume at tail, which is the loss.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::default();
+        s.held.insert(
+            "reviewer".into(),
+            Held {
+                cursor: 12,
+                held_since: 13,
+                batch: 19,
+                session: Some("sess-1".into()),
+                warned: true,
+                release: None,
+            },
+        );
+        save(dir.path(), &s).unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.held["reviewer"].cursor, 12);
+        assert_eq!(loaded.held["reviewer"].session.as_deref(), Some("sess-1"));
+        assert!(loaded.held["reviewer"].warned);
+        assert!(loaded.held["reviewer"].release.is_none());
+    }
 
     #[test]
     fn roundtrips() {
@@ -210,6 +345,7 @@ mod tests {
         // fields added after this file was written default rather than
         // failing the parse and resetting every cursor
         assert!(loaded.unconfirmed_streak.is_empty());
+        assert!(loaded.held.is_empty());
         assert!(loaded.stalled.is_empty());
         assert!(
             !daemon_log(dir.path()).contains("delivery cursors reset"),

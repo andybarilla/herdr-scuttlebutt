@@ -9,6 +9,7 @@ mod state;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use herd::HerdControl as _;
 
 #[derive(Parser)]
 #[command(name = "scuttlebutt", about = "Chat room for herdr agents")]
@@ -63,6 +64,17 @@ enum Cmd {
     DaemonStatus,
     /// Stop the daemon
     DaemonStop,
+    /// Deliver or discard a batch held for an agent that is no longer present
+    Held {
+        /// The agent name the batch is held for
+        agent: String,
+        /// Deliver it to whatever now holds that name
+        #[arg(long, conflicts_with = "drop_it")]
+        deliver: bool,
+        /// Discard it
+        #[arg(long = "drop", conflicts_with = "deliver")]
+        drop_it: bool,
+    },
     /// Print the focused workspace's checkout path (used by the pane scripts)
     #[command(hide = true)]
     SessionCwd,
@@ -105,6 +117,27 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
+        Cmd::Held {
+            agent,
+            deliver,
+            drop_it,
+        } => {
+            if deliver == drop_it {
+                // Both flags is already refused by clap; neither is this.
+                anyhow::bail!("pass exactly one of --deliver or --drop");
+            }
+            // The id is captured here, at the moment the human answers,
+            // rather than trusted later: a release that named nothing would
+            // stand for whoever next answered to that name. Best effort —
+            // the usual case for this command is an agent that is gone, and
+            // a herdr that cannot be reached says nothing either way.
+            let at_pane = herd
+                .list_agents()
+                .ok()
+                .and_then(|all| all.into_iter().find(|a| a.name == agent))
+                .and_then(|a| a.session);
+            daemon::held_action(&paths::session_dir()?, &agent, deliver, at_pane)
+        }
         Cmd::SessionCwd => {
             println!("{}", herd::focused_cwd()?);
             Ok(())
