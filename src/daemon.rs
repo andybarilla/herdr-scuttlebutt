@@ -1783,6 +1783,36 @@ mod tests {
     }
 
     #[test]
+    fn the_threshold_keeps_the_batch_and_stops_re_prompting() {
+        // #39: the skip advanced the cursor past a batch no delivery ever
+        // confirmed, so those messages were gone. The threshold must stall
+        // the agent instead — batch kept, no further prompts.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "cursor advanced past a batch nothing confirmed: those messages are lost"
+        );
+
+        let sent = herd.prompts.borrow().len();
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "a stalled agent was re-prompted"
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
+    }
+
+    #[test]
     fn an_unconfirmable_agent_converges_while_the_room_is_busy() {
         // The room this runs in gets traffic faster than five ticks, so the
         // batch max id changes every pass and `fail_counts`' streak restarts
