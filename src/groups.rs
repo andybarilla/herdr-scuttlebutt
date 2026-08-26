@@ -172,6 +172,185 @@ pub fn resolve(
     }
 }
 
+/// One room a caller could open, carrying the three sources that vouch for
+/// it. Three flavours a bare name cannot tell apart: a group with agents in
+/// it, a group the config names that nobody is in, and a group that survives
+/// only as history on disk. All three are real rooms and a picker has to
+/// label them differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Room {
+    /// `None` is the ungrouped room — `session_dir()` itself rather than a
+    /// subdirectory of it, and offered only when grouping is `Inactive`.
+    pub name: Option<String>,
+    /// Live agents whose cwd resolves here.
+    pub agents: usize,
+    /// Named by `groups.toml`.
+    pub configured: bool,
+    /// Holds a `room.jsonl` with something in it.
+    pub history: bool,
+}
+
+/// One of the three things that can vouch for a room, in provenance order:
+/// an agent standing in it now outranks the config naming it, which outranks
+/// a log left on disk. An enum rather than a string so a caller grouping
+/// rooms under headings matches on the source instead of on its wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Source {
+    Agents,
+    Config,
+    History,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Agents => "live agents",
+            Source::Config => "config",
+            Source::History => "history",
+        }
+    }
+}
+
+impl Room {
+    /// Every source that vouches for this room, in provenance order, so the
+    /// first is the room's primary source. Rooms are genuinely vouched for
+    /// by more than one thing at once — `alare` has agents in it, sits in
+    /// the config and holds a log — and which ones is the whole reason
+    /// `Room` carries three flags rather than a name.
+    ///
+    /// Labelling and sorting both read from here so they cannot give two
+    /// answers about the same room: listing only the config for a room that
+    /// also has agents in it labels it as configured while `rooms` sorts it
+    /// as live.
+    ///
+    /// Empty only for a `Room` nothing vouches for, which `rooms` never
+    /// builds.
+    pub fn sources(&self) -> Vec<Source> {
+        [
+            (self.agents > 0, Source::Agents),
+            (self.configured, Source::Config),
+            (self.history, Source::History),
+        ]
+        .into_iter()
+        .filter_map(|(vouches, s)| vouches.then_some(s))
+        .collect()
+    }
+
+    /// Sort key: where this room's primary source falls in provenance order.
+    /// A room nothing vouches for sorts last rather than first.
+    pub fn provenance_rank(&self) -> u8 {
+        self.sources().first().map_or(u8::MAX, |s| *s as u8)
+    }
+}
+
+/// Whether a room directory holds a `room.jsonl` with anything in it.
+/// Emptiness is the filter that matters: `paths::room_dir` calls
+/// `create_dir_all` before the first post, so one mistyped `--group` leaves a
+/// directory that would otherwise be offered as a room forever.
+fn has_history(dir: &Path) -> bool {
+    std::fs::metadata(dir.join("room.jsonl"))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// The accumulating entry for one room name, created blank on first touch.
+/// Every source goes through this, which is what makes the union a dedup
+/// rather than three lists concatenated.
+fn entry_for(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -> &mut Room {
+    found.entry(name.clone()).or_insert(Room {
+        name,
+        agents: 0,
+        configured: false,
+        history: false,
+    })
+}
+
+/// Every room this session could open, deduped across the three sources that
+/// know about rooms and genuinely disagree: the config, the live agents, and
+/// the session directory. In a real config `jackdaw` is configured with no
+/// room file and `andybarilla` has 42 KB of history and appears in no config,
+/// so no one source is the list.
+///
+/// `Broken` yields nothing, mirroring `visible_agents`. The disk sweep below
+/// never consults the config, so enumerating under a config we could not
+/// parse would list every company's room — the outcome this module exists to
+/// prevent.
+pub fn rooms(
+    grouping: &Grouping,
+    agents: &[crate::herd::AgentInfo],
+    session_dir: &Path,
+    orgs: &mut crate::git_org::OrgCache,
+) -> Vec<Room> {
+    if matches!(grouping, Grouping::Broken(_)) {
+        return Vec::new();
+    }
+    let mut found: BTreeMap<Option<String>, Room> = BTreeMap::new();
+
+    if let Grouping::Active(rules) = grouping {
+        for name in rules.names() {
+            entry_for(&mut found, Some(name.to_string())).configured = true;
+        }
+    }
+
+    for a in agents {
+        match resolve(Path::new(&a.cwd), grouping, orgs) {
+            Some(g) => entry_for(&mut found, Some(g)).agents += 1,
+            // Without a config, an agent in no repository belongs to the
+            // single shared room, so it is a member like any other.
+            None if matches!(grouping, Grouping::Inactive) => {
+                entry_for(&mut found, None).agents += 1
+            }
+            // Under a config the same agent is enrolled nowhere, and the
+            // ungrouped room receives nothing. Counting it would conjure a
+            // room out of one stray cwd whose only member can never be
+            // reached in it.
+            None => {}
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(session_dir) {
+        for e in entries.flatten() {
+            let name = match e.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // A directory whose name is not a legal group can never be given
+            // back to `--group`, so listing it offers a room nothing can open.
+            // Only this source needs the check: source 1's names came through
+            // `load`, which rejects illegal ones, and source 2's come from
+            // `load` or from `git_org::sanitize`, which maps an arbitrary
+            // repository owner onto exactly this predicate.
+            if !valid_group_name(&name) {
+                continue;
+            }
+            if has_history(&e.path()) {
+                entry_for(&mut found, Some(name)).history = true;
+            }
+        }
+    }
+    // The ungrouped room is `session_dir()` itself, so it has no entry in the
+    // sweep above. Under an active config it receives nothing and
+    // `resolve_group` can never return `None`, so its history is the record
+    // of a room that can no longer be posted to; offering it would invite
+    // posting into a dead room.
+    if matches!(grouping, Grouping::Inactive) && has_history(session_dir) {
+        entry_for(&mut found, None).history = true;
+    }
+
+    let mut out: Vec<Room> = found.into_values().collect();
+    // Never by mtime: a list that reorders between readings defeats muscle
+    // memory in the picker this feeds.
+    out.sort_by(|a, b| {
+        a.provenance_rank().cmp(&b.provenance_rank()).then_with(|| {
+            a.name
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.name.as_deref().unwrap_or(""))
+        })
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +659,324 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(load(dir.path()), Grouping::Active(_)));
+    }
+
+    // --- rooms() -------------------------------------------------------
+
+    fn agent_at(cwd: &str) -> crate::herd::AgentInfo {
+        crate::herd::AgentInfo {
+            name: format!("agent{cwd}"),
+            pane_id: "w1:p1".into(),
+            status: "idle".into(),
+            cwd: cwd.into(),
+            focused: Some(false),
+        }
+    }
+
+    /// `/w/<org>/...` belongs to `<org>`; anything else is outside a repo.
+    fn fake_org(cwd: &Path) -> Option<String> {
+        let rest = cwd.to_string_lossy().strip_prefix("/w/")?.to_string();
+        Some(rest.split('/').next()?.to_string())
+    }
+
+    /// Writes `text` into a room's log. `None` is the ungrouped room, whose
+    /// log lives in the session directory itself.
+    fn write_room(session: &Path, name: Option<&str>, text: &str) {
+        let dir = match name {
+            Some(n) => session.join(n),
+            None => session.to_path_buf(),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("room.jsonl"), text).unwrap();
+    }
+
+    fn names(rooms: &[Room]) -> Vec<&str> {
+        rooms
+            .iter()
+            .map(|r| r.name.as_deref().unwrap_or("(ungrouped)"))
+            .collect()
+    }
+
+    fn room<'a>(rooms: &'a [Room], name: &str) -> &'a Room {
+        rooms
+            .iter()
+            .find(|r| r.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no room {name:?} in {:?}", names(rooms)))
+    }
+
+    #[test]
+    fn a_broken_config_lists_no_room_at_all() {
+        // the disk sweep never reads the config, so a config we could not
+        // parse must stop enumeration outright rather than fall through to it
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("acme"), "{}\n");
+        write_room(session.path(), None, "{}\n");
+        let found = rooms(
+            &Grouping::Broken("bad".into()),
+            &[agent_at("/w/alare/api")],
+            session.path(),
+            &mut cache(fake_org),
+        );
+        assert_eq!(found, Vec::new());
+    }
+
+    #[test]
+    fn the_ungrouped_room_appears_when_grouping_is_inactive() {
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), None, "{}\n");
+        let found = rooms(
+            &Grouping::Inactive,
+            &[agent_at("/elsewhere")],
+            session.path(),
+            &mut cache(fake_org),
+        );
+        assert_eq!(names(&found), vec!["(ungrouped)"]);
+        assert_eq!(found[0].agents, 1);
+        assert!(found[0].history);
+        assert!(!found[0].configured);
+    }
+
+    #[test]
+    fn the_ungrouped_room_is_hidden_under_an_active_config() {
+        // it receives nothing under a config, so offering it would invite
+        // posting into a dead room
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), None, "{}\n");
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        let found = rooms(&g, &[], session.path(), &mut cache(fake_org));
+        assert_eq!(names(&found), vec!["alare"]);
+    }
+
+    #[test]
+    fn an_agent_belonging_nowhere_does_not_conjure_an_ungrouped_room() {
+        // `resolve` returns None for a cwd in no group and no repo; under a
+        // config that means enrolled nowhere, not a member of a shared room
+        let session = tempfile::tempdir().unwrap();
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/tmp/scratch")],
+            session.path(),
+            &mut cache(no_org),
+        );
+        assert_eq!(names(&found), vec!["alare"]);
+        assert_eq!(room(&found, "alare").agents, 0);
+    }
+
+    #[test]
+    fn a_directory_holding_an_empty_room_file_is_not_a_room() {
+        // `room_dir` creates the directory before the first post, so one
+        // mistyped --group leaves an empty room behind
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("typoo"), "");
+        std::fs::create_dir_all(session.path().join("nolog")).unwrap();
+        write_room(session.path(), Some("real"), "{}\n");
+        let found = rooms(&Grouping::Inactive, &[], session.path(), &mut cache(no_org));
+        assert_eq!(names(&found), vec!["real"]);
+    }
+
+    #[test]
+    fn a_configured_group_with_no_room_file_still_appears() {
+        let session = tempfile::tempdir().unwrap();
+        let g = Grouping::Active(rules(&[("jackdaw", &["/w/jackdaw"])]));
+        let found = rooms(&g, &[], session.path(), &mut cache(no_org));
+        assert_eq!(names(&found), vec!["jackdaw"]);
+        assert!(found[0].configured);
+        assert!(!found[0].history);
+        assert_eq!(found[0].agents, 0);
+    }
+
+    #[test]
+    fn a_room_with_history_and_no_config_still_appears() {
+        // the real config's `andybarilla`: 42 KB of log, named nowhere
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("andybarilla"), "{}\n");
+        let g = Grouping::Active(rules(&[("jackdaw", &["/w/jackdaw"])]));
+        let found = rooms(&g, &[], session.path(), &mut cache(no_org));
+        let quiet = room(&found, "andybarilla");
+        assert!(quiet.history);
+        assert!(!quiet.configured);
+        // and it is distinguishable from jackdaw, which has the opposite pair
+        let configured = room(&found, "jackdaw");
+        assert!(configured.configured);
+        assert!(!configured.history);
+    }
+
+    #[test]
+    fn an_org_derived_room_in_no_config_still_appears() {
+        let session = tempfile::tempdir().unwrap();
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/acme/web")],
+            session.path(),
+            &mut cache(fake_org),
+        );
+        let acme = room(&found, "acme");
+        assert_eq!(acme.agents, 1);
+        assert!(!acme.configured);
+        assert!(!acme.history);
+    }
+
+    #[test]
+    fn one_room_named_by_all_three_sources_is_listed_once() {
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("alare"), "{}\n");
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/alare/api"), agent_at("/w/alare/web")],
+            session.path(),
+            &mut cache(fake_org),
+        );
+        assert_eq!(names(&found), vec!["alare"]);
+        assert_eq!(found[0].agents, 2);
+        assert!(found[0].configured);
+        assert!(found[0].history);
+    }
+
+    #[test]
+    fn rooms_sort_by_provenance_then_name() {
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("zeta"), "{}\n");
+        write_room(session.path(), Some("attic"), "{}\n");
+        let g = Grouping::Active(rules(&[
+            ("busy", &["/w/busy"]),
+            ("also-busy", &["/w/also-busy"]),
+            ("quiet", &["/w/quiet"]),
+            ("also-quiet", &["/w/also-quiet"]),
+        ]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/busy/x"), agent_at("/w/also-busy/x")],
+            session.path(),
+            &mut cache(no_org),
+        );
+        assert_eq!(
+            names(&found),
+            vec!["also-busy", "busy", "also-quiet", "quiet", "attic", "zeta"]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_session_directory_keeps_the_config_and_the_agents() {
+        // the disk sweep is one source of three; losing it must not lose the
+        // other two
+        let g = Grouping::Active(rules(&[("alare", &["/w/alare"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/acme/web")],
+            Path::new("/nonexistent/session/dir"),
+            &mut cache(fake_org),
+        );
+        assert_eq!(names(&found), vec!["acme", "alare"]);
+    }
+
+    #[test]
+    fn a_subdirectory_that_could_never_be_a_group_is_skipped() {
+        // an illegal name can never be passed back as --group, so listing it
+        // offers a room nothing can open
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("Not A Group"), "{}\n");
+        write_room(session.path(), Some("fine"), "{}\n");
+        let found = rooms(&Grouping::Inactive, &[], session.path(), &mut cache(no_org));
+        assert_eq!(names(&found), vec!["fine"]);
+    }
+
+    #[test]
+    fn a_room_lists_every_source_that_vouches_for_it() {
+        let r = Room {
+            name: Some("alare".into()),
+            agents: 2,
+            configured: true,
+            history: true,
+        };
+        assert_eq!(
+            r.sources(),
+            vec![Source::Agents, Source::Config, Source::History]
+        );
+    }
+
+    #[test]
+    fn the_primary_source_of_a_room_with_agents_is_its_agents() {
+        // the label and the sort must give one answer about the same room:
+        // `alare` sits in the config and holds a log, but agents are standing
+        // in it, which is why it sorts first — so it must not read as
+        // "known from the config"
+        let r = Room {
+            name: Some("alare".into()),
+            agents: 2,
+            configured: true,
+            history: true,
+        };
+        assert_eq!(r.sources().first(), Some(&Source::Agents));
+        assert_eq!(r.provenance_rank(), 0);
+    }
+
+    #[test]
+    fn every_rank_is_its_primary_sources_place_in_provenance_order() {
+        let room_with = |agents, configured, history| Room {
+            name: None,
+            agents,
+            configured,
+            history,
+        };
+        assert_eq!(room_with(1, false, false).provenance_rank(), 0);
+        assert_eq!(room_with(0, true, true).provenance_rank(), 1);
+        assert_eq!(room_with(0, false, true).provenance_rank(), 2);
+    }
+
+    #[test]
+    fn a_room_nothing_vouches_for_sorts_last_rather_than_first() {
+        // `rooms` never builds one, but `Room`'s fields are public and a
+        // default-ish room must not outrank a room with agents in it
+        let r = room_of_no_sources();
+        assert!(r.sources().is_empty());
+        assert!(r.provenance_rank() > room_of_history_only().provenance_rank());
+    }
+
+    fn room_of_no_sources() -> Room {
+        Room {
+            name: None,
+            agents: 0,
+            configured: false,
+            history: false,
+        }
+    }
+
+    fn room_of_history_only() -> Room {
+        Room {
+            name: None,
+            agents: 0,
+            configured: false,
+            history: true,
+        }
+    }
+
+    #[test]
+    fn the_order_of_a_rooms_sources_matches_the_order_rooms_are_sorted_in() {
+        // the invariant that keeps a label and a sort position honest: for
+        // any two rooms, the one whose primary source comes first in
+        // provenance order sorts first
+        let session = tempfile::tempdir().unwrap();
+        write_room(session.path(), Some("zeta"), "{}\n");
+        let g = Grouping::Active(rules(&[("busy", &["/w/busy"]), ("quiet", &["/w/quiet"])]));
+        let found = rooms(
+            &g,
+            &[agent_at("/w/busy/x")],
+            session.path(),
+            &mut cache(no_org),
+        );
+        let primaries: Vec<Source> = found
+            .iter()
+            .map(|r| *r.sources().first().unwrap())
+            .collect();
+        assert_eq!(
+            primaries,
+            vec![Source::Agents, Source::Config, Source::History]
+        );
+        let mut sorted = primaries.clone();
+        sorted.sort();
+        assert_eq!(primaries, sorted, "list order must follow primary source");
     }
 }
