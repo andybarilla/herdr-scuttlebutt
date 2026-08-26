@@ -343,12 +343,26 @@ pub struct Membership<'a> {
 /// and the two callers want it read differently, so the split stays with
 /// them.
 ///
+/// That makes the `None` key a real entry every caller must decide about,
+/// where `rooms` used to simply never construct one under an active config.
+/// Dropping it is now the caller's job, not this function's: `rooms` filters
+/// the entry out, the `groups` listing prints it as a diagnostic, and a third
+/// caller that forgets would offer a room whose members can never be reached
+/// in it.
+///
 /// `None` for the whole map under `Broken`, and the two callers lean on that
 /// differently. `rooms` has no other refusal: it returns on this `None`, and
 /// deleting the guard would carry it past the config into the disk sweep,
 /// which never reads the config and would list every company's room. The
 /// `groups` listing refuses `Broken` above with its own message, so the arm
 /// is unreachable from there and is belt and braces behind that early-out.
+///
+/// The two therefore differ on purpose rather than by accident: `rooms` must
+/// return, because falling through reaches a disk sweep that never reads the
+/// config and would list every company's room, while the listing's default
+/// only ever produces an empty section under a message that already said the
+/// config is unreadable. `rooms` fails open where the listing fails closed,
+/// which is why one gets a hard return and the other tolerates a default.
 pub fn memberships<'a>(
     grouping: &Grouping,
     agents: &'a [crate::herd::AgentInfo],

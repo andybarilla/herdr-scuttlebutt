@@ -826,6 +826,50 @@ mod tests {
         );
     }
 
+    /// The shape every other fixture hides. Both passes emit sorted names, so
+    /// a config naming `acme` and `alare` prints identically whether the
+    /// passes are separate or folded into one walk of the map — only a
+    /// configured name that sorts *after* an org-derived one can tell them
+    /// apart, and the real config has none.
+    #[test]
+    fn a_configured_group_prints_first_even_when_its_name_sorts_last() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("groups.toml"),
+            "[groups]\nzulu = [\"/w/zulu\"]\n",
+        )
+        .unwrap();
+        let g = crate::groups::load(dir.path());
+        std::mem::forget(dir);
+        let agents = vec![
+            AgentInfo {
+                name: "acme-1".into(),
+                pane_id: "w1:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/acme/web".into(),
+                focused: Some(false),
+                session: None,
+            },
+            AgentInfo {
+                name: "zulu-1".into(),
+                pane_id: "w2:p1".into(),
+                status: "idle".into(),
+                cwd: "/w/zulu/api".into(),
+                focused: Some(false),
+                session: None,
+            },
+        ];
+        let out = render_groups(&g, Ok(&agents), &mut orgs(fake_org));
+        assert_eq!(
+            out,
+            "groups.toml rules first, then each agent's repository origin\n\
+             zulu\t/w/zulu\n  \
+             zulu-1\tidle\t/w/zulu/api\n\
+             acme\t(from repo origin)\n  \
+             acme-1\tidle\t/w/acme/web\n"
+        );
+    }
+
     #[test]
     fn without_a_config_every_group_is_an_org_and_ungrouped_is_the_shared_room() {
         let out = render_groups(
