@@ -578,6 +578,17 @@ fn post(app: &mut App, dir: &Path, text: &str) {
 /// Separate from `tail` so that everything which can fail happens before a
 /// single message moves — the same order `switch_room` uses, and what lets a
 /// failed read leave the list exactly as it stands.
+///
+/// One way of losing the message list is not guarded anywhere, here or in
+/// `tail`, and #56 owns it: a `room.jsonl` deleted and left absent comes
+/// back through this door rather than the Err one — `last_id` reads 0,
+/// `should_reseed` fires against any non-zero cursor, and the pane is
+/// blanked with `last_error` never set. It is not a one-line check because
+/// #34's configured-but-quiet room is legitimately empty and has to keep
+/// rendering in silence, so the two are indistinguishable from the read
+/// alone. Forcing the state wants the directory present and the file
+/// deleted; a regular file where the directory belongs gives the Err door
+/// instead, and `chmod` gives neither under a CI running as root.
 fn read_tail(dir: &Path, cursor: u64) -> Result<(bool, Vec<Message>)> {
     let reseed = should_reseed(cursor, log_store::last_id(dir)?);
     let from = if reseed { 0 } else { cursor };
