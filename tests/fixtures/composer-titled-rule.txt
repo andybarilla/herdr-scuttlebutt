@@ -1,0 +1,60 @@
+  1. Not a one-line is_rule widening. Re-opening the region path re-exposes Some(false) — the only verdict that can drop a batch. herd.rs:168 already documents ❯ Press up to edit queued messages: five words, not our text, → Some(false) → batch dropped while unread. The fix is accepted only with
+     captured-pane evidence that an unsubmitted prompt never yields Some(false) on either kind.
+  2. The dead-sender correlation is a red herring. others filters only on m.from != a.name; liveness is never consulted. Both rooms just went quiet, so nothing landed to restart the streak. Told the IC not to chase it.
+
+  Two notes for you:
+
+  - This is degrading my own delivery channel — I'm at fail_counts: [4, 16], one tick from the skip. Expect gaps in what reaches me until it's fixed.
+  - The daemon runs the installed build, so the fix needs a release plus herdr plugin install andybarilla/herdr-scuttlebutt --ref <tag> from you before it does anything. I'll file the needs-andy line when the release is cut, not now.
+
+  Want me to dispatch ic-debugger on #36? Queue is then #36 in flight, #34 next, #35 gated behind it.
+
+✻ Sautéed for 4m 15s · done 12:44 PM
+
+❯ Reply only if you have information others don't — don't acknowledge or repeat. Under 80 words; longer belongs on the issue.
+  [scuttlebutt] New messages in the room:
+  [#15] ic-herdr-scuttlebutt-32: handoff ready: #32, PR #33. Version bump to 0.2.4 via scripts/release.sh — four files, CI green. Full report already sent to lead-herdr-scuttlebutt.
+
+  Searched for 2 patterns, ran 5 shell commands
+
+● Posted #17 to the room — the diagnosis is information nobody else had. Fifth replay of #15; my cursor is at 4/5, so the next tick force-skips it.
+
+✻ Baked for 34s · done 12:45 PM
+
+❯ yes dispatch that
+
+  Ran 1 shell command
+
+● Wrong repo — it resolved against alare, not mine. Cleaning that up before it confuses anyone.
+
+  Ran 4 shell commands
+
+● The stray .env differs from alare's root one (herdr generated per-worktree values), so I won't delete another project's credentials file myself. Handing that to you:
+
+  Read 1 file
+
+● Now the dispatch, pinned to my repo with --cwd:
+
+  Ran 4 shell commands
+
+● Dispatched.
+
+  - #36 → ic-herdr-scuttlebutt-36 (pane w9C:p1), worktree ~/.herdr/worktrees/herdr-scuttlebutt/issue-36, branch issue-36. Confirmed the brief landed and the pane is working.
+
+  The brief pins it to ic-debugger, hands it the issue, and carries three things the issue alone wouldn't enforce: re-scoping to a kind-aware locator is an acceptable outcome if bounding regions can't keep Some(false) unreachable for an unsubmitted prompt; Refs #36 only, with a git log
+  origin/main..HEAD check before the PR; and a note that the room channel is broken by this very bug, so it hands off via herdr agent prompt and reads its pane back to confirm.
+
+  Two things for you:
+
+  A stray directory needs your rm. My first herdr worktree create resolved against alare, not scuttlebutt, despite my cwd being the scuttlebutt repo — worth knowing as a herdr bug in its own right. I deleted the branch and git has released the worktree, but the directory remains at
+  /home/andy/.herdr/worktrees/alare/issue-36 with a generated .env that differs from alare's root one. I stopped rather than delete another project's credentials file. Logged to needs-andy.jsonl with the exact command; it self-clears once the path is gone. Passing --cwd explicitly worked.
+
+  Queue depth is 2 (#34, #35) against 1 concurrent IC — at target, so no grooming. But #35 is gated on #34, so only #34 is actually startable. If you want a second IC running in parallel, #34 is the one to take.
+
+✻ Cooked for 2m 34s · done 12:50 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── clear-conversation-state ─
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  andy@apbfw16 ~/dev/andybarilla/herdr-scuttlebutt main  [Opus 5 (1M context)] ctx:11%                                                                                                                                                                                                                  /rc
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents

@@ -28,11 +28,24 @@ pub trait HerdControl {
     fn prompt(&self, name: &str, text: &str) -> Result<Delivery>;
 }
 
-/// Prompt markers a composer opens with. Identification is by this set
-/// rather than "any punctuation": a marker we do not know is a composer we
-/// have not identified, which resolves to `Unconfirmed` and costs a repeat.
-/// Guessing instead resolves to `Submitted` and costs the batch.
+/// Prompt markers a rule-bounded composer opens with. Identification is by
+/// this set rather than "any punctuation": a marker we do not know is a
+/// composer we have not identified, which resolves to `Unconfirmed` and
+/// costs a repeat. Guessing instead resolves to `Submitted` and costs the
+/// batch. A gutter-bounded composer has no marker and is identified by
+/// `gutter_bounded` instead.
 const MARKERS: [&str; 3] = ["\u{276f}", ">", "\u{203a}"];
+
+/// Verticals an editor may draw down the left edge of its input box on
+/// every row, in place of a rule above it. OpenCode uses the heavy one.
+const GUTTERS: [char; 2] = ['\u{2503}', '\u{2502}'];
+
+/// Text a composer shows in place of its contents while a queue is holding
+/// messages. It is not ours and not a human's, and — this is the point —
+/// it hides the queue rather than describing it, so it cannot tell us
+/// whether our batch reached that queue or never left `herdr agent prompt`.
+/// Recognized so a word count cannot read it as a cleared composer.
+const QUEUE_HINTS: [&str; 1] = ["Press up to edit queued messages"];
 
 /// Words of the composer that must reappear, in order, in what we sent
 /// before the composer counts as holding our text. Three rather than a
@@ -55,27 +68,36 @@ fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether a line *is* a horizontal rule, which is how a composer box is
-/// drawn. Any of the box-drawing horizontals counts — heavy, double, dashed,
-/// block — since which one a terminal UI picks is its own business, and
-/// corners (square or rounded), tees and verticals may bracket the run.
-///
-/// The whole line has to be rule characters. A line that merely contains a
-/// run is content: a message body carrying box-drawn terminal output reaches
-/// the composer with its line breaks intact, and treating one of its lines as
-/// furniture would move a region boundary onto it.
-fn is_rule(line: &str) -> bool {
-    let line = line.trim();
-    let mut horizontals = 0;
-    for c in line.chars() {
-        match c {
-            // light, heavy, dashed and double horizontals; the horizontal
-            // bar and extension; the block halves a UI may rule with
-            '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
-            | '\u{254c}' | '\u{254d}' | '\u{2550}' | '\u{2015}' | '\u{23af}' | '\u{2580}'
-            | '\u{2581}' | '\u{2584}' | '\u{2594}' => horizontals += 1,
-            // corners, tees, verticals and half-lines may bracket or join it
-            '\u{2502}'
+/// The horizontals a rule is drawn from: light, heavy, dashed and double;
+/// the horizontal bar and extension; the block halves a UI may rule with.
+/// Which one a terminal UI picks is its own business.
+fn is_horizontal(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2500}'
+            | '\u{2501}'
+            | '\u{2504}'
+            | '\u{2505}'
+            | '\u{2508}'
+            | '\u{2509}'
+            | '\u{254c}'
+            | '\u{254d}'
+            | '\u{2550}'
+            | '\u{2015}'
+            | '\u{23af}'
+            | '\u{2580}'
+            | '\u{2581}'
+            | '\u{2584}'
+            | '\u{2594}'
+    )
+}
+
+/// Box-drawing furniture that may bracket or join a run: corners (square or
+/// rounded), tees, verticals and half-lines.
+fn is_joint(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2502}'
             | '\u{2503}'
             | '\u{2506}'
             | '\u{2507}'
@@ -84,15 +106,70 @@ fn is_rule(line: &str) -> bool {
             | '\u{250c}'..='\u{254b}'
             | '\u{254e}'
             | '\u{254f}'
-            | '\u{2551}'..='\u{257f}' => {}
-            _ => return false,
-        }
-    }
-    horizontals >= RULE_RUN
+            | '\u{2551}'..='\u{257f}'
+    )
 }
 
-/// The content of every rule-bounded region in `pane` that opens with a
-/// prompt marker, marker stripped and whitespace normalized.
+/// Whether a line *is* a horizontal rule, which is how a composer box is
+/// drawn.
+///
+/// The line has to open and close with box-drawing characters and carry a
+/// run of horizontals. Between them it may carry one label: Claude Code
+/// centres the session title in the top border of its composer
+/// (`\u{2500}\u{2500} clear-conversation-state \u{2500}\u{2500}`), which is #36 — requiring every
+/// character to be box-drawing rejected that border, left one rule in the
+/// pane, and identified no composer at all.
+///
+/// One label, not any number of them, and never at either end. That is what
+/// still separates furniture from content: a message body carrying
+/// box-drawn terminal output reaches the composer with its line breaks
+/// intact, and treating one of its lines as furniture would move a region
+/// boundary onto it. Such a line all but always has text outside the run —
+/// `like "\u{2500}\u{2500}\u{2500} Context \u{2500}\u{2500}\u{2500}", dashed variants` opens with a word.
+fn is_rule(line: &str) -> bool {
+    let line = line.trim();
+    let boxed = |c: char| is_horizontal(c) || is_joint(c);
+    if !line.starts_with(boxed) || !line.ends_with(boxed) {
+        return false;
+    }
+    let mut horizontals = 0;
+    let mut labels = 0;
+    let mut in_label = false;
+    for c in line.chars() {
+        if boxed(c) {
+            in_label = false;
+            horizontals += usize::from(is_horizontal(c));
+        } else if !in_label {
+            in_label = true;
+            labels += 1;
+        }
+    }
+    horizontals >= RULE_RUN && labels <= 1
+}
+
+/// Every composer identified in `pane`, each as its own lines, normalized
+/// and stripped of the marker or gutter that identified it.
+///
+/// Lines rather than one joined string because the two decisions want
+/// different views of a composer. Whether it holds our text reads best
+/// across the whole thing, since the composer wraps mid-sentence. Whether
+/// it is *clear* has to read line by line: a box that prints furniture of
+/// its own below the text — OpenCode's model footer — pads a two-word
+/// unsubmitted prompt past the word count that would otherwise call it too
+/// short to classify.
+///
+/// The two layouts here are the two this fleet runs, and neither is a
+/// guess: a rule-bounded box that opens with a known prompt marker, and a
+/// gutter-bounded box at the bottom edge of the pane. A layout matching
+/// neither identifies nothing, which costs a repeat delivery.
+fn composer_regions(pane: &str) -> Vec<Vec<String>> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let mut regions = rule_bounded(&lines);
+    regions.extend(gutter_bounded(&lines));
+    regions
+}
+
+/// Every rule-bounded region that opens with a prompt marker.
 ///
 /// Every such region is returned, not just the last one, and that is the
 /// point. A message body ending in a rule of its own, or a bordered box
@@ -101,8 +178,7 @@ fn is_rule(line: &str) -> bool {
 /// submitted that is sitting on a composer two lines up. A transcript echo
 /// of a submitted prompt cannot be mistaken for one of these, because the
 /// transcript draws no rules around it.
-fn composer_regions(pane: &str) -> Vec<String> {
-    let lines: Vec<&str> = pane.lines().collect();
+fn rule_bounded(lines: &[&str]) -> Vec<Vec<String>> {
     let rules: Vec<usize> = lines
         .iter()
         .enumerate()
@@ -112,11 +188,82 @@ fn composer_regions(pane: &str) -> Vec<String> {
     rules
         .windows(2)
         .filter_map(|w| {
-            let region = normalize(&lines[w[0] + 1..w[1]].join(" "));
-            let marker = MARKERS.iter().find(|m| region.starts_with(**m))?;
-            Some(region[marker.len()..].trim().to_string())
+            let mut region: Vec<String> = lines[w[0] + 1..w[1]]
+                .iter()
+                .map(|l| normalize(l))
+                .filter(|l| !l.is_empty())
+                .collect();
+            let first = region.first()?;
+            let marker = MARKERS.iter().find(|m| first.starts_with(**m))?.len();
+            region[0] = region[0][marker..].trim().to_string();
+            Some(region)
         })
         .collect()
+}
+
+/// One row of a gutter-bounded box, gutter stripped and normalized.
+///
+/// A pane may right-align furniture of its own across the box's rows —
+/// OpenCode wraps a long working directory up the right edge, over the
+/// composer — and a gap of several spaces is what separates the two. The
+/// row is cut at the first such gap.
+///
+/// A row whose *whole* content is right-aligned furniture keeps it instead
+/// of being cut to nothing, and that asymmetry is the safe direction: an
+/// empty row is evidence of a clear composer, and a cut must never
+/// manufacture that evidence out of a row that had something on it. Held
+/// text keeps matching either way, because `is_our_text` reads the region
+/// as one string and our text is what sits left of the gap.
+fn boxed_row(row: &str) -> String {
+    let row = row
+        .trim_start()
+        .trim_start_matches(|c| GUTTERS.contains(&c));
+    let left = normalize(row.split("   ").next().unwrap_or_default());
+    match left.is_empty() {
+        true => normalize(row),
+        false => left,
+    }
+}
+
+/// The composer of an editor that draws a vertical down every row of its
+/// input box instead of a rule above it. OpenCode draws one, and puts a
+/// single horizontal in the whole pane: the bottom edge of that box. One
+/// rule bounds no region, which is the other half of #36 — and no widening
+/// of `is_rule` can reach it, because the rules it would need are not
+/// drawn.
+///
+/// Identification is positional, and it has to be: this layout gives the
+/// composer no marker of its own, and it draws *submitted* messages in the
+/// transcript inside the same gutter. Sitting against the pane's bottom
+/// edge is what separates the composer from those echoes — an echo always
+/// has the rest of the transcript below it.
+fn gutter_bounded(lines: &[&str]) -> Option<Vec<String>> {
+    let gutter = |l: &&str| l.trim_start().starts_with(|c| GUTTERS.contains(&c));
+    let bottom = lines.iter().rposition(|l| is_rule(l))?;
+    let mut top = bottom;
+    while top > 0 && gutter(&lines[top - 1]) {
+        top -= 1;
+    }
+    // A box, not a single bordered line: one gutter line above the bottom
+    // edge is as easily a transcript echo that happens to end there.
+    if bottom - top < 2 {
+        return None;
+    }
+    let mut region: Vec<String> = lines[top..bottom].iter().map(|l| boxed_row(l)).collect();
+    // OpenCode prints the agent and model inside the box, below a blank row
+    // and under anything typed. That is furniture: left in, it pads an
+    // empty composer to three words, and a short unsubmitted prompt beside
+    // it would read as too long to be ours rather than too short to
+    // classify — `Some(false)`, and the batch gone. It is dropped only when
+    // that exact shape is present, because dropping a line that turned out
+    // to be ours is the one error here that could also lose a batch.
+    let footer = region.len() >= 2
+        && !region[region.len() - 1].is_empty()
+        && region[region.len() - 2].is_empty();
+    if footer {
+        region.pop();
+    }
+    Some(region)
 }
 
 /// Whether `content` is a run of `sent` rather than something else on the
@@ -146,8 +293,9 @@ fn is_our_text(content: &str, sent: &str) -> bool {
 /// path: at least one composer was identified, and every identified composer
 /// is either empty or holds text long enough to be recognized as not ours.
 /// Everything else is `None`, including cases that look like nothing at all:
-/// no rules, no marker, a marker we do not know, or content too short to
-/// classify either way.
+/// no composer identified in either layout, a marker we do not know, a
+/// queue hint standing in for the composer's contents, or content too short
+/// to classify either way.
 ///
 /// The caller resolves `None` toward "not submitted". A wrong `Submitted`
 /// drops the batch permanently; a wrong `Unconfirmed` costs a repeat
@@ -161,12 +309,20 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
         return None;
     }
     let sent = normalize(sent);
-    if regions.iter().any(|c| is_our_text(c, &sent)) {
+    if regions.iter().any(|c| is_our_text(&c.join(" "), &sent)) {
         return Some(true);
     }
+    let lines = || regions.iter().flatten();
+    // A composer showing a queue hint is showing neither our text nor a
+    // clear box: the queue it names may hold our batch or may not, and
+    // nothing in the pane says which.
+    if lines().any(|l| QUEUE_HINTS.contains(&l.as_str())) {
+        return None;
+    }
     // Non-empty but too short to tell ours from a placeholder or a menu.
-    // Idle composers really do carry text that is neither: `\u{276f} Press up to
-    // edit queued messages` is what Claude Code shows over a queue.
+    // Per line, because a composer that draws furniture of its own below
+    // the text would otherwise carry every short line past this on the
+    // strength of the furniture's word count.
     let classifiable = |c: &String| {
         let words = c
             .trim_end_matches(['\u{2026}', '.', ' '])
@@ -174,7 +330,7 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
             .count();
         words == 0 || words >= OVERLAP_WORDS
     };
-    match regions.iter().all(classifiable) {
+    match lines().all(classifiable) {
         true => Some(false),
         false => None,
     }
@@ -429,6 +585,37 @@ mod tests {
     const EMPTY: &str = include_str!("../tests/fixtures/composer-empty.txt");
     const PLACEHOLDER: &str = include_str!("../tests/fixtures/composer-placeholder.txt");
 
+    /// A Claude Code pane whose composer border carries the session title,
+    /// which is the shape #36 was filed on. Captured from a live lead pane
+    /// with a clear composer.
+    const TITLED: &str = include_str!("../tests/fixtures/composer-titled-rule.txt");
+
+    /// OpenCode panes, captured the same way. The composer is bounded by a
+    /// `\u{2503}` on every row and a single block rule along the bottom, and it
+    /// carries the agent and model on its last row.
+    ///
+    /// `opencode-holds-batch` and `opencode-empty` are one pane before and
+    /// after `\u{2503}`-drawn text was typed into it, and both keep the transcript
+    /// echo of an identical batch that *was* submitted — the echo is drawn
+    /// in the same gutter as the composer, so a locator that finds it
+    /// reports a cleared composer as holding us forever.
+    /// `opencode-wrapped`, `opencode-short` and `opencode-hint` are a
+    /// narrower pane holding a wrapped batch, holding two words, and clear
+    /// under OpenCode's own idle hint. `opencode-live-room` is a working
+    /// lead pane from another room with three echoes above a clear
+    /// composer.
+    const OC_HOLDS: &str = include_str!("../tests/fixtures/opencode-holds-batch.txt");
+    const OC_EMPTY: &str = include_str!("../tests/fixtures/opencode-empty.txt");
+    const OC_WRAPPED: &str = include_str!("../tests/fixtures/opencode-wrapped.txt");
+    const OC_SHORT: &str = include_str!("../tests/fixtures/opencode-short.txt");
+    const OC_HINT: &str = include_str!("../tests/fixtures/opencode-hint.txt");
+    const OC_LIVE: &str = include_str!("../tests/fixtures/opencode-live-room.txt");
+
+    /// What was typed into the OpenCode panes: `RULE` as a real delivery
+    /// carries it, with the sentence that follows it in the preamble.
+    const OC_SENT: &str = "Reply only if you have information others don't \u{2014} don't \
+         acknowledge or repeat. Under 80 words; longer belongs on the issue.";
+
     /// A pane rendered the way herdr's `visible` snapshot returns it: a
     /// transcript, the composer box, then the status footer.
     fn pane(composer: &[&str]) -> String {
@@ -478,12 +665,18 @@ mod tests {
     }
 
     #[test]
-    fn a_real_placeholder_composer_confirms_submission() {
-        // `\u{276f} Press up to edit queued messages` is the hint Claude Code shows
-        // over a queue. Requiring an empty composer would leave every agent
-        // in that state permanently unconfirmable, and the streak would then
-        // skip real batches.
-        assert_eq!(composer_holds(PLACEHOLDER, RULE), Some(false));
+    fn a_real_queue_hint_confirms_nothing() {
+        // `\u{276f} Press up to edit queued messages` is what Claude Code shows over
+        // a queue. This asserted `Some(false)` until #36: five words, none
+        // of them ours, read as a cleared composer. But the hint replaces
+        // the queue's contents rather than describing them, so it is
+        // equally the pane of a batch that never left `herdr agent prompt`
+        // — and `Some(false)` there advances the cursor over it.
+        //
+        // The cost is a repeat delivery per tick while a queue stands, and
+        // `MAX_BATCH_FAILURES` still force-advances after five of those
+        // (#39). That is a bounded, logged skip; this was a silent one.
+        assert_eq!(composer_holds(PLACEHOLDER, RULE), None);
     }
 
     #[test]
@@ -494,6 +687,126 @@ mod tests {
             .collect();
         assert!(!quoting.is_empty(), "fixture lost its rule-quoting line");
         assert_eq!(composer_holds(HOLDS_BATCH, RULE), Some(true));
+    }
+
+    // ---- the layouts this fleet runs ------------------------------------
+
+    #[test]
+    fn every_real_pane_identifies_a_composer() {
+        // #36 in one assertion: none of these identified anything, so every
+        // delivery to them was unconfirmable and the failure threshold
+        // skipped the batch after five tries.
+        for (name, pane) in [
+            ("claude code, titled border", TITLED),
+            ("claude code, plain border", EMPTY),
+            ("opencode, clear", OC_EMPTY),
+            ("opencode, holding a batch", OC_HOLDS),
+            ("opencode, a working lead", OC_LIVE),
+        ] {
+            assert!(
+                !composer_regions(pane).is_empty(),
+                "{name}: no composer identified"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_title_in_the_composer_border_is_still_a_rule() {
+        let titled = TITLED
+            .lines()
+            .find(|l| l.contains("clear-conversation-state"))
+            .expect("fixture lost its titled border");
+        assert!(is_rule(titled), "{titled:?} not recognized");
+        assert_eq!(composer_holds(TITLED, RULE), Some(false));
+    }
+
+    #[test]
+    fn a_titled_border_over_a_held_batch_is_not_a_confirmation() {
+        // The two halves put together: the real titled border from one pane
+        // above the real held batch of another. Live panes gave each shape
+        // separately, and it is their combination that would drop a batch.
+        let titled = TITLED
+            .lines()
+            .find(|l| l.contains("clear-conversation-state"))
+            .expect("fixture lost its titled border");
+        let mut lines: Vec<&str> = HOLDS_BATCH.lines().collect();
+        let top = lines
+            .iter()
+            .position(|l| is_rule(l))
+            .expect("fixture lost its composer border");
+        lines[top] = titled;
+        assert_eq!(composer_holds(&lines.join("\n"), RULE), Some(true));
+    }
+
+    #[test]
+    fn a_gutter_drawn_composer_holding_a_batch_is_not_confirmed() {
+        assert_eq!(composer_holds(OC_HOLDS, OC_SENT), Some(true));
+    }
+
+    #[test]
+    fn a_gutter_drawn_composer_wrapping_a_batch_still_matches() {
+        assert_eq!(composer_holds(OC_WRAPPED, OC_SENT), Some(true));
+    }
+
+    #[test]
+    fn a_gutter_drawn_composer_too_short_to_classify_is_not_a_confirmation() {
+        // Two words of ours on the composer, beside a model footer that is
+        // five. Counted together they are long enough to be called somebody
+        // else's; the footer is furniture and is not counted.
+        assert_eq!(composer_holds(OC_SHORT, OC_SENT), None);
+    }
+
+    #[test]
+    fn a_clear_gutter_drawn_composer_confirms_submission() {
+        // A working lead pane carrying three transcript echoes of batches
+        // it has already taken, each drawn in the same gutter as the
+        // composer. Confirming here is half the point of the fix: an echo
+        // read as a composer answers `Some(true)` on every tick, and the
+        // unconfirmed streak skips a batch just as surely as a failed
+        // delivery does. One region, and it is the composer.
+        assert_eq!(composer_regions(OC_LIVE).len(), 1);
+        assert_eq!(composer_holds(OC_LIVE, OC_SENT), Some(false));
+    }
+
+    #[test]
+    fn furniture_right_aligned_over_the_composer_costs_confirmation() {
+        // `opencode-empty` is the same clear composer, in a pane whose
+        // working directory is long enough that OpenCode wraps it up the
+        // right edge, across the composer's rows. Its rows are cut at the
+        // gap, but a row that is *only* furniture keeps it rather than
+        // reading as blank — so this costs a repeat delivery instead of
+        // confirming a composer nothing was read from.
+        assert_eq!(composer_regions(OC_EMPTY).len(), 1);
+        assert_eq!(composer_holds(OC_EMPTY, OC_SENT), None);
+    }
+
+    #[test]
+    fn an_idle_hint_over_a_clear_gutter_drawn_composer_confirms_submission() {
+        // OpenCode's own `Ask anything...` hint, unlike a queue hint, is
+        // shown *because* there is nothing to show: no queue stands behind
+        // it, so a batch that reached the pane is not in one.
+        assert_eq!(composer_holds(OC_HINT, OC_SENT), Some(false));
+    }
+
+    #[test]
+    fn no_real_pane_holding_a_batch_reports_it_submitted() {
+        // Requirement stated over the captures rather than over synthetic
+        // perturbations: for every real pane of either kind with our text
+        // unsubmitted on it, the one verdict that advances the cursor is
+        // unreachable. `Some(true)` and `None` both cost a repeat.
+        for (name, pane, sent) in [
+            ("claude code, wrapped", HOLDS_BATCH, RULE),
+            ("opencode", OC_HOLDS, OC_SENT),
+            ("opencode, wrapped", OC_WRAPPED, OC_SENT),
+            ("opencode, two words", OC_SHORT, OC_SENT),
+            ("claude code, queued", PLACEHOLDER, RULE),
+        ] {
+            assert_ne!(
+                composer_holds(pane, sent),
+                Some(false),
+                "{name}: a held batch reported submitted"
+            );
+        }
     }
 
     // ---- nothing identified is never a confirmation ---------------------
