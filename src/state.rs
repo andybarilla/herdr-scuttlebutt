@@ -61,6 +61,10 @@ pub struct DaemonState {
 /// when the pane proves it can receive again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stall {
+    /// Highest message id at the moment the stall opened. Never moves, so
+    /// the reports that say when the hold began stay true however long it
+    /// lasts; `batch` is the other half of that pair and moves.
+    pub held_since: u64,
     /// Highest message id in the batch being held, refreshed on every retry.
     /// Reported and shown by `daemon-status` so a human can see what is
     /// waiting; nothing gates on it, and a batch that grows past it neither
@@ -84,6 +88,7 @@ impl Stall {
     /// A stall as it opens: nothing waited, nothing retried yet.
     pub fn new(batch: u64, session: Option<String>) -> Self {
         Stall {
+            held_since: batch,
             batch,
             session,
             waited: 0,

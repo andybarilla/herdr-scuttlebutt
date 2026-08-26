@@ -1133,7 +1133,7 @@ pub fn tick(
                 (Some(_), None) | (None, None) => false,
             };
             if restarted {
-                let batch = stall.batch;
+                let batch = stall.held_since;
                 clear_stall(state, &a.name);
                 report(
                     dir,
@@ -1164,6 +1164,13 @@ pub fn tick(
         };
         let others: Vec<_> = pending.iter().filter(|m| m.from != a.name).collect();
         if others.is_empty() {
+            // Reachable for a stalled agent mid-retry, and safe only because
+            // `others` cannot shrink: the cursor did not move while the
+            // stall stood, and `log_store` appends and never prunes, so
+            // every message that made this batch worth holding is still in
+            // `pending`. A compaction pass that removed old messages would
+            // make this line drop a held batch — the emptiness would be the
+            // room forgetting them, not the agent having written them all.
             state.cursors.insert(a.name.clone(), max_id);
             continue;
         }
@@ -1181,16 +1188,17 @@ pub fn tick(
                         &format!(
                             "[scuttlebutt] {} took the batch held since #{}; \
                              delivery to it has resumed",
-                            a.name, stall.batch
+                            a.name, stall.held_since
                         ),
                     );
                 }
             }
-            Some(NotDelivered { why, unconfirmed }) if retrying => {
-                // The counters are left exactly as the stall found them:
-                // they already say this agent passed the threshold, and
-                // counting retries into them would print `batch 6/5` and
-                // make the numbers mean two different things.
+            Some(NotDelivered { why, .. }) if retrying => {
+                // The counters are left exactly as the stall found them,
+                // and `unconfirmed` goes unread for the same reason: they
+                // record how the threshold was reached, and counting
+                // retries into them would print `batch 6/5` and make the
+                // numbers mean two different things.
                 let stall = state
                     .stalled
                     .get_mut(&a.name)
@@ -1223,10 +1231,6 @@ pub fn tick(
                         a.name
                     ),
                 );
-                // `unconfirmed` is deliberately unused here for the same
-                // reason the counters are: the streak that led to the stall
-                // is the record, and a retry is not part of it.
-                let _ = unconfirmed;
             }
             Some(NotDelivered { why, unconfirmed }) => {
                 let entry = state
@@ -2197,6 +2201,129 @@ mod tests {
         }
         assert_eq!(herd.prompts.borrow().len(), sent);
         assert!(state.stalled.contains_key("reviewer"));
+    }
+
+    #[test]
+    fn the_backoff_widens_to_a_cap_and_never_reaches_zero() {
+        assert_eq!(retry_after(0), STALL_RETRY_TICKS);
+        assert_eq!(retry_after(1), STALL_RETRY_TICKS * 2);
+        // last shift before the cap bites
+        assert_eq!(retry_after(4), STALL_RETRY_TICKS * 16);
+        // the shift would give 960; the cap is what it lands on
+        assert_eq!(retry_after(5), MAX_STALL_RETRY_TICKS);
+        assert_eq!(retry_after(6), MAX_STALL_RETRY_TICKS);
+        // `retries` is unbounded in state, so the clamp has to hold at the
+        // top of the range: shifting by it would be undefined, and a wait of
+        // zero would retry every tick — the redelivery loop again.
+        assert_eq!(retry_after(u32::MAX), MAX_STALL_RETRY_TICKS);
+    }
+
+    #[test]
+    fn a_stalled_agents_own_posts_do_not_advance_its_cursor() {
+        // The `others.is_empty()` advance is reachable while a retry is in
+        // flight. It is safe only because a batch that had someone else's
+        // message in it still does — nothing prunes the room — and this is
+        // what would break first if anything ever did.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].held_since, 1);
+
+        // the stalled agent keeps posting: its batch grows with messages
+        // that are all its own
+        for i in 0..3 {
+            append(dir.path(), "reviewer", &format!("still working {i}")).unwrap();
+        }
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "the held batch was skipped past on the agent's own messages"
+        );
+        assert_eq!(state.stalled["reviewer"].held_since, 1, "the hold moved");
+        assert_eq!(
+            state.stalled["reviewer"].batch, 4,
+            "the retry saw a stale batch"
+        );
+    }
+
+    #[test]
+    fn the_hold_is_reported_from_when_it_began_not_from_the_last_retry() {
+        // `batch` moves with each retry so `daemon-status` names what is
+        // actually waiting. The sentence "held since #N" is about when the
+        // hold started, so it reads the half that does not move.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        // the room moves on, and a retry fails against the bigger batch
+        append(dir.path(), "human", "and another").unwrap();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].batch, 2,
+            "the retry saw a stale batch"
+        );
+        assert_eq!(state.stalled["reviewer"].held_since, 1, "the hold moved");
+
+        herd.unconfirmed.clear();
+        for _ in 0..retry_after(1) {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.is_empty(), "the second retry never came");
+        assert_eq!(state.cursors["reviewer"], 2);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer took the batch held since #1"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
+    fn the_restart_report_also_names_when_the_hold_began() {
+        // The other half of the pair: a stall lifted by a new session has
+        // usually seen the batch grow under it, and the sentence is still
+        // about when the hold started.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        append(dir.path(), "human", "and another").unwrap();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].batch, 2);
+
+        herd.set_session("reviewer", "session-b");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("reviewer is a new session; resuming delivery of the batch held since #1"),
+            "log was: {log}"
+        );
     }
 
     #[test]
