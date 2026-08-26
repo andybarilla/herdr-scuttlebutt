@@ -958,6 +958,19 @@ fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
 /// Drops every trace of a wedged delivery for one agent. The counters go
 /// with the stall: they are what would otherwise carry a resumed agent
 /// straight back to the threshold on its next failure.
+/// The session id to record for `a`: the one this listing carries, or the
+/// last one herdr reported for it. Both writers of `Stall::session` go
+/// through this, so neither can record the `None` of a listing that merely
+/// omitted the field — which `(None, Some(_))` would then read as a new
+/// session on the next tick, lifting the stall and returning the agent to
+/// full-rate prompting. `None` out of here means herdr has never reported
+/// an id for this agent, and that genuinely is unknowable.
+fn session_of(state: &DaemonState, a: &AgentInfo) -> Option<String> {
+    a.session
+        .clone()
+        .or_else(|| state.last_session.get(&a.name).cloned())
+}
+
 fn clear_stall(state: &mut DaemonState, name: &str) -> Option<crate::state::Stall> {
     state.fail_counts.remove(name);
     state.unconfirmed_streak.remove(name);
@@ -989,6 +1002,9 @@ pub fn tick(
     for a in &agents {
         state.cursors.entry(a.name.clone()).or_insert(tail);
         state.absences.remove(&a.name);
+        if let Some(id) = &a.session {
+            state.last_session.insert(a.name.clone(), id.clone());
+        }
         // Reported here, above the `introduced` early-continue, because the
         // steady state for every agent is introduced: a warning any lower
         // would never fire for the agents it is about.
@@ -1032,6 +1048,7 @@ pub fn tick(
         .chain(state.fail_counts.keys().cloned())
         .chain(state.unconfirmed_streak.keys().cloned())
         .chain(state.stalled.keys().cloned())
+        .chain(state.last_session.keys().cloned())
         .chain(state.absences.keys().cloned())
         .chain(state.deliverable_streak.keys().cloned())
         .chain(state.intro_fails.keys().cloned())
@@ -1049,6 +1066,7 @@ pub fn tick(
             state.fail_counts.remove(&name);
             state.unconfirmed_streak.remove(&name);
             state.stalled.remove(&name);
+            state.last_session.remove(&name);
             state.absences.remove(&name);
             state.deliverable_streak.remove(&name);
             state.intro_fails.remove(&name);
@@ -1164,13 +1182,17 @@ pub fn tick(
         };
         let others: Vec<_> = pending.iter().filter(|m| m.from != a.name).collect();
         if others.is_empty() {
-            // Reachable for a stalled agent mid-retry, and safe only because
-            // `others` cannot shrink: the cursor did not move while the
-            // stall stood, and `log_store` appends and never prunes, so
-            // every message that made this batch worth holding is still in
-            // `pending`. A compaction pass that removed old messages would
-            // make this line drop a held batch — the emptiness would be the
-            // room forgetting them, not the agent having written them all.
+            // Not reachable while a stall stands, and that is a conclusion
+            // rather than a coincidence: a stall only opens with someone
+            // else's message in the batch, the cursor does not move while
+            // it stands, and `log_store` only ever appends — so `others`
+            // cannot become empty again. The advance here is the ordinary
+            // case of an agent whose only unread messages are its own.
+            //
+            // A prune pass over the room is what would break that: `others`
+            // could then empty out under a held batch and this line would
+            // skip past it. The emptiness would mean the room had forgotten
+            // those messages, not that the agent had written them all.
             state.cursors.insert(a.name.clone(), max_id);
             continue;
         }
@@ -1199,6 +1221,7 @@ pub fn tick(
                 // record how the threshold was reached, and counting
                 // retries into them would print `batch 6/5` and make the
                 // numbers mean two different things.
+                let session = session_of(state, a);
                 let stall = state
                     .stalled
                     .get_mut(&a.name)
@@ -1210,16 +1233,7 @@ pub fn tick(
                 // a batch that grows neither lifts the stall nor shortens
                 // the wait.
                 stall.batch = max_id;
-                // Only ever upgraded, never downgraded. An id that has gone
-                // missing says nothing about the process at that pane —
-                // which is exactly what the `(Some(_), None)` arm above
-                // says — so writing the absence here would manufacture the
-                // `None` that `(None, Some(_))` then reads as a new session,
-                // and one listing that dropped the field would lift the
-                // stall and redeliver the batch.
-                if a.session.is_some() {
-                    stall.session = a.session.clone();
-                }
+                stall.session = session;
                 let retries = stall.retries;
                 let next = retry_after(retries);
                 report(
@@ -1273,7 +1287,7 @@ pub fn tick(
                     // `unconfirmed_streak` are left standing too — clearing
                     // them would make a stalled agent indistinguishable from
                     // a healthy one in the saved state.
-                    let stall = crate::state::Stall::new(max_id, a.session.clone());
+                    let stall = crate::state::Stall::new(max_id, session_of(state, a));
                     // Once per stall, not once per tick: a stalled agent
                     // is skipped above and never reaches this branch again,
                     // and the guard on the insert holds the guarantee even
@@ -2220,10 +2234,11 @@ mod tests {
 
     #[test]
     fn a_stalled_agents_own_posts_do_not_advance_its_cursor() {
-        // The `others.is_empty()` advance is reachable while a retry is in
-        // flight. It is safe only because a batch that had someone else's
-        // message in it still does — nothing prunes the room — and this is
-        // what would break first if anything ever did.
+        // This is the half of the `others.is_empty()` reasoning that can be
+        // tested: a stalled agent's own posts grow its batch without ever
+        // moving its cursor. That is also why that branch cannot be reached
+        // while a stall stands — someone else's message is still in there —
+        // so the branch itself is pinned by a comment, not by this test.
         let dir = tempfile::tempdir().unwrap();
         let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
@@ -2324,6 +2339,64 @@ mod tests {
             log.contains("reviewer is a new session; resuming delivery of the batch held since #1"),
             "log was: {log}"
         );
+    }
+
+    #[test]
+    fn a_stall_opened_without_the_field_records_the_last_known_id() {
+        // The sibling of the retry-path case: if herdr omits
+        // `agent_session` on exactly the tick that crosses the threshold,
+        // the stall is constructed with `None`, and the next listing with
+        // the field back reads as a new session — lifting the stall, which
+        // resets the counters and returns the agent to full-rate prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        // seen with an id, then the field goes missing across the threshold
+        for _ in 0..MAX_BATCH_FAILURES - 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        herd.drop_session("reviewer");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some("session-a"),
+            "the stall recorded the absence instead of the id it had already seen"
+        );
+        let sent = herd.prompts.borrow().len();
+
+        // the field comes back, same process
+        herd.set_session("reviewer", "session-a");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "a dropped field read as a restart"
+        );
+        assert_eq!(herd.prompts.borrow().len(), sent, "back to full rate");
+        assert_eq!(state.fail_counts["reviewer"].0, MAX_BATCH_FAILURES);
+    }
+
+    #[test]
+    fn an_agent_herdr_never_reports_an_id_for_records_none() {
+        // The fallback must not invent an id: with nothing ever seen there
+        // is nothing to remember, and `(None, None)` is what keeps such an
+        // agent on the backoff rather than lifting its stall every tick.
+        let dir = tempfile::tempdir().unwrap();
+        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "hello").unwrap();
+
+        for _ in 0..MAX_BATCH_FAILURES {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(state.stalled["reviewer"].session, None);
+        assert!(state.last_session.is_empty());
     }
 
     #[test]

@@ -50,6 +50,17 @@ pub struct DaemonState {
     /// message, which is the redelivery loop the threshold exists to stop.
     #[serde(default)]
     pub stalled: HashMap<String, Stall>,
+    /// The most recent `agent_session` id herdr reported for each agent.
+    /// The field is optional per *listing*, not per agent, so a tick that
+    /// omits it says nothing about the process at that pane — and an agent
+    /// seen before is one we already know the id of. Keeping it is what
+    /// lets a stall record a real id even when it opens on a listing that
+    /// dropped the field; without that, the stall records `None`, the next
+    /// listing looks like a new session, and delivery goes back to full
+    /// rate. Absent here means herdr has never reported one for that agent,
+    /// which is the case for the agent kinds that do not have them.
+    #[serde(default)]
+    pub last_session: HashMap<String, String>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
@@ -70,10 +81,12 @@ pub struct Stall {
     /// waiting; nothing gates on it, and a batch that grows past it neither
     /// clears the stall nor shortens the wait.
     pub batch: u64,
-    /// The agent's session id when it stalled, or when it last failed a
-    /// retry; `None` if herdr reported none. A different id means a
-    /// different process is at that pane, which lifts the stall at once
-    /// rather than waiting out the backoff.
+    /// The last id herdr reported for this agent as of the stall opening or
+    /// its last failed retry — not necessarily the one carried by that
+    /// particular listing, which may have omitted the field. `None` only
+    /// when herdr has never reported one. A different id means a different
+    /// process is at that pane, which lifts the stall at once rather than
+    /// waiting out the backoff.
     pub session: Option<String>,
     /// Delivery opportunities counted since the last retry — ticks where
     /// this agent was deliverable and unfocused, not wall-clock seconds. A
