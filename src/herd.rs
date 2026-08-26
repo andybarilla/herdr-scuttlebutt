@@ -370,8 +370,11 @@ fn rule_bounded(lines: &[&str]) -> Regions {
 /// composer is drawn on — and clipping to the box is what keeps that out of
 /// the composer's contents. Left in, it reads as text that is not ours: a
 /// two-word unsubmitted prompt with a fragment of a path beside it is three
-/// words, which is no longer too short to classify, which is `Some(false)`
-/// and the batch gone.
+/// words, which is no longer too short to classify. That was `Some(false)`
+/// and the batch gone, which is how every batch #36 lost was lost; since #47
+/// a row this clipped anything off may not cast that vote either way, so
+/// getting these columns wrong costs a repeat rather than the batch. The
+/// clip still has to be right — it is what the contents *are*.
 ///
 /// Columns are display cells rather than characters, because that is what
 /// the pane was drawn in. Counting characters clips a row carrying a
@@ -398,7 +401,9 @@ fn box_span(border: &str) -> (usize, usize) {
 /// so `\u{26a0}\u{fe0f}\u{fe0f}` measures three where a terminal draws two. Left alone
 /// deliberately: over-counting a row clips it early, which can only shorten
 /// what a composer is read as holding, and shortening is the direction that
-/// costs a repeat rather than a batch.
+/// costs a repeat rather than a batch. Since #47 it costs even less — a row
+/// the clip shortened is a row a measurement touched, so it may not say the
+/// composer is clear at all, whichever direction the error ran.
 fn cell_width(c: char, previous: usize) -> usize {
     match c {
         '\u{fe0f}' => usize::from(previous == 1),
@@ -418,7 +423,9 @@ fn display_width(s: &str) -> usize {
 }
 
 /// One row of a gutter-bounded box, clipped to the box's columns, gutter
-/// stripped and normalized.
+/// stripped and normalized. `bare_row` is the same row with the same
+/// furniture stripped and no clip, and the two differ exactly where a
+/// measurement had a hand in the row.
 fn boxed_row(row: &str, (start, end): (usize, usize)) -> String {
     let mut col = 0;
     let mut previous = 0;
@@ -528,8 +535,13 @@ fn is_our_text(content: &str, sent: &str) -> bool {
 ///
 /// `Some(false)` — submitted — is the only answer that advances a cursor and
 /// so the only one that can lose a batch, and it is reachable on exactly one
-/// path: at least one composer was identified, and every identified composer
-/// is either empty or holds text long enough to be recognized as not ours.
+/// path: at least one composer was identified, and every one of its rows says
+/// so on evidence no measurement produced. A row says so by being empty
+/// before any clip, span or width calculation ran, or by carrying enough
+/// words to be recognized as text that is not ours while the clip took
+/// nothing off it. That is #47: a clip, a span or a width calculation cannot
+/// manufacture the evidence of a clear composer, because neither thing a row
+/// may vote on is anything they had a hand in.
 /// Everything else is `None`, including cases that look like nothing at all:
 /// no composer identified in either layout, a marker we do not know, a
 /// queue hint standing in for the composer's contents, or content too short
@@ -541,6 +553,20 @@ fn is_our_text(content: &str, sent: &str) -> bool {
 /// three review rounds found layouts nobody anticipated, and each one was a
 /// case that failed to match and fell through to `Submitted`. There is no
 /// fall-through here — a layout this does not understand cannot reach it.
+///
+/// What #47 costs, measured rather than guessed: an OpenCode pane whose
+/// working directory wraps up the right margin across the box's rows can no
+/// longer confirm anything, because the clip takes that fragment off a row
+/// which then may not vote. Three captures are in that state
+/// (`opencode-empty`, `opencode-live-room`, `opencode-wrapped-cwd`) and no
+/// live pane was at the time of the change. Under #42 that holds the batch
+/// and re-prompts it rather than dropping it.
+///
+/// A composer carrying text that is merely *someone else's* — a human
+/// typing, OpenCode's `Ask anything...` hint — still confirms. #47 proposed
+/// closing that too; it was deliberately left open, because none of the four
+/// batches #36 lost went that way and closing it would stall every pane a
+/// human is typing in for no measured safety.
 fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     let Regions { composers, others } = composer_regions(pane);
     if composers.is_empty() {
@@ -553,9 +579,11 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    if composers.iter().chain(&others).any(|c| {
-        is_our_text(&joined(c), &sent)
-    }) {
+    if composers
+        .iter()
+        .chain(&others)
+        .any(|c| is_our_text(&joined(c), &sent))
+    {
         return Some(true);
     }
     // A region kept in `others` is a rule inside the box with content on
@@ -968,7 +996,10 @@ mod tests {
     fn every_real_pane_identifies_a_composer() {
         // #36 in one assertion: none of these identified anything, so every
         // delivery to them was unconfirmable and the failure threshold
-        // skipped the batch after five tries.
+        // skipped the batch after five tries. That was then — #42 replaced
+        // skipping with stall-and-hold, so an unconfirmable pane now holds
+        // its batch and re-prompts it on a widening wait (#39). Five is the
+        // historical number and stays five here whatever the constant does.
         for (name, pane) in [
             ("claude code, titled border", TITLED),
             ("claude code, plain border", EMPTY),
@@ -1129,6 +1160,13 @@ mod tests {
         // OpenCode's own `Ask anything...` hint, unlike a queue hint, is
         // shown *because* there is nothing to show: no queue stands behind
         // it, so a batch that reached the pane is not in one.
+        //
+        // This pane still confirms where the other three OpenCode captures
+        // no longer do, and the difference is not the hint: nothing on this
+        // box's rows is clipped, so every row still says what it says
+        // without a measurement. #47 proposed making a composer carrying
+        // someone else's text `None` as well; that half was deliberately
+        // not done, so the hint reads exactly as it did before.
         assert_eq!(composer_holds(OC_HINT, OC_SENT), Some(false));
     }
 
