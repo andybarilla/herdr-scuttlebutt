@@ -24,8 +24,8 @@ pub struct DaemonState {
     /// whenever the batch grows: in a room with traffic that streak never
     /// reaches the threshold, so an agent whose pane never submits would be
     /// re-prompted every tick forever. This one is batch-independent and
-    /// cleared only by a confirmed delivery, which is what makes it
-    /// converge. Outright prompt errors do not touch it — those keep
+    /// cleared only by a confirmed delivery or by the stall it leads to
+    /// being lifted, which is what makes it converge. Outright prompt errors do not touch it — those keep
     /// `fail_counts`' per-batch semantics, where a bigger batch is worth
     /// another try.
     #[serde(default)]
@@ -33,11 +33,37 @@ pub struct DaemonState {
     /// Consecutive intro prompt failures per agent.
     #[serde(default)]
     pub intro_fails: HashMap<String, u32>,
+    /// Agents whose batch reached `MAX_BATCH_FAILURES` with nothing ever
+    /// confirming a delivery. While an agent is in here the daemon leaves
+    /// its cursor alone and stops prompting it, so the batch survives until
+    /// its pane is fixed — the alternative, advancing the cursor, loses
+    /// those messages outright (#39).
+    ///
+    /// Keyed by agent and never by batch: an entry that re-armed when the
+    /// batch grew would restart the five-failure cycle on every new room
+    /// message, which is the redelivery loop the threshold exists to stop.
+    #[serde(default)]
+    pub stalled: HashMap<String, Stall>,
     /// Agents currently being reported without a `focused` field. The check
     /// runs every tick; the warning is once per outage, and the entry is
     /// dropped as soon as the field comes back so a later outage warns again.
     #[serde(default)]
     pub focus_unknown_warned: HashSet<String>,
+}
+
+/// One agent's held batch. Recorded when delivery is given up on, dropped
+/// when the pane proves it can receive again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stall {
+    /// Highest message id in the batch being held. Reported and shown by
+    /// `daemon-status` so a human can see what is waiting; nothing gates on
+    /// it, and a batch that grows past it does not clear the stall.
+    pub batch: u64,
+    /// The agent's session id when it stalled, or `None` if herdr reported
+    /// none. Compared against the live id to notice a restarted pane; two
+    /// `None`s are not a match, so an agent herdr reports no id for resumes
+    /// only on a confirming delivery.
+    pub session: Option<String>,
 }
 
 pub fn load(dir: &Path) -> DaemonState {
@@ -94,6 +120,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stall_survives_a_daemon_restart() {
+        // A held batch that did not outlive the daemon would be delivered
+        // again on the next tick, and the agent would work back through the
+        // same five failures to reach the same stall.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::default();
+        s.cursors.insert("reviewer".into(), 7);
+        s.stalled.insert(
+            "reviewer".into(),
+            Stall {
+                batch: 12,
+                session: Some("session-a".into()),
+            },
+        );
+        save(dir.path(), &s).unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.stalled["reviewer"].batch, 12);
+        assert_eq!(
+            loaded.stalled["reviewer"].session.as_deref(),
+            Some("session-a")
+        );
+    }
+
+    #[test]
     fn a_production_state_file_still_loads() {
         // Verbatim from a live room dir. Cursors are the only record of what
         // each agent has seen, so a shape change that reset them would lose
@@ -120,6 +170,7 @@ mod tests {
         // fields added after this file was written default rather than
         // failing the parse and resetting every cursor
         assert!(loaded.unconfirmed_streak.is_empty());
+        assert!(loaded.stalled.is_empty());
         assert!(
             !daemon_log(dir.path()).contains("delivery cursors reset"),
             "an existing state file was rejected"

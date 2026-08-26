@@ -458,6 +458,7 @@ mod tests {
             status: "idle".into(),
             cwd: cwd.into(),
             focused: Some(false),
+            session: None,
         }
     }
 
