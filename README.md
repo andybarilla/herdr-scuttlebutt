@@ -88,8 +88,17 @@ An agent whose pane stops accepting deliveries is stalled rather than skipped:
 its messages are held and delivery to everyone else continues. Delivery to that
 agent drops to a widening retry — about a minute, then doubling to half an hour
 — and resumes in full as soon as one is confirmed, or at once if a new session
-appears at that pane. `daemon-status` names who is stalled and what is being
-held for them.
+appears at a pane that never left the listing. `daemon-status` names who is
+stalled and what is being held for them.
+
+A name is not an identity here either. The retries go only to the session the
+batch was held for, and the lift is refused for a name that has been absent
+since it stalled, because a new session id at a pane the listing dropped is as
+consistent with a different agent taking the name as with that pane restarting.
+Either way the batch is still held and still listed; what a stall costs an
+agent that genuinely restarted in a listing gap is the wait, not the messages.
+An agent herdr reports no session id for cannot be matched at all, so its batch
+waits for you.
 
 If that pane goes away entirely — the usual way a human clears a wedge is to
 close it and open a new one — the batch is kept rather than expiring with the
