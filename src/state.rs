@@ -41,10 +41,13 @@ pub struct DaemonState {
     /// alternative, advancing the cursor, loses those messages outright
     /// (#39).
     ///
-    /// The backoff rather than silence is what makes the exits reachable: a
-    /// pane that recovers in place reports the same session id and would
-    /// never be seen to recover if nothing were ever sent to it again, and
-    /// an agent herdr reports no session id for has no other way out at all.
+    /// The backoff rather than silence is what makes the recover-in-place
+    /// exit reachable: such a pane reports the same session id throughout,
+    /// so a confirmed delivery is the only evidence it is well again, and
+    /// nothing is confirmed if nothing is ever sent. That retry is gated on
+    /// identity too (#58), so it is an exit only for a pane herdr still
+    /// reports the stall's own id at. An agent herdr reports no session id
+    /// for has no automatic exit at all: its batch waits for a human.
     ///
     /// Keyed by agent and never by batch: an entry that re-armed when the
     /// batch grew would restart the run-up to the cap on every new room
@@ -119,10 +122,47 @@ pub struct Stall {
     /// The last id herdr reported for this agent as of the stall opening or
     /// its last failed retry — not necessarily the one carried by that
     /// particular listing, which may have omitted the field. `None` only
-    /// when herdr has never reported one. A different id means a different
-    /// process is at that pane, which lifts the stall at once rather than
-    /// waiting out the backoff.
+    /// when herdr has never reported one.
+    ///
+    /// This gates both ways out of a stall that need no human, and it is
+    /// asked a different question on each (#58). The lift asks whether the
+    /// pane is demonstrably a *different* process: two ids that are `Some`
+    /// and unequal, and only while `presence_broken` is false. The retry
+    /// asks the opposite — whether it is demonstrably the *same* one, which
+    /// is two ids that are `Some` and equal. A `None` on either side answers
+    /// neither question, so it refuses both, and the batch waits for a human
+    /// rather than going to whoever answers to the name next.
     pub session: Option<String>,
+    /// Whether this name has gone missing from `herdr agent list` since the
+    /// stall was recorded. Set by the absence loop and never cleared while
+    /// the stall stands: one absence is enough to make a later id at that
+    /// pane equally consistent with a different agent having taken the name,
+    /// which is what the lift must not read as a restart (#58). It does not
+    /// gate the retry, which asks for sameness and gets it only from equal
+    /// ids.
+    ///
+    /// Defaults to false for a stall written before this field existed. Such
+    /// a stall records nothing about its presence either way, and the
+    /// permissive reading is only reachable for one that was recorded, went
+    /// absent, and was still inside the four-second window when the daemon
+    /// was replaced under it.
+    #[serde(default)]
+    pub presence_broken: bool,
+    /// Whether this stall's batch is here because a human released a hold
+    /// (`scuttlebutt held <agent> --deliver`) rather than because a
+    /// returning agent's id matched the one the hold recorded. It is the
+    /// human's answer to the question the ids could not settle, carried
+    /// forward so the retry gate does not immediately refuse the delivery
+    /// they just authorized — which it otherwise would for exactly the
+    /// pane the command exists for, one herdr reports no id at.
+    ///
+    /// Cleared the moment the name goes absent, alongside
+    /// `presence_broken`: the authorization was for the pane that was
+    /// there, and a name that has left the listing no longer names it. A
+    /// batch that goes back to `held` needs a fresh release, since
+    /// `Held.release` is not carried across the purge.
+    #[serde(default)]
+    pub human_released: bool,
     /// Delivery opportunities counted since the last retry — ticks where
     /// this agent was deliverable and unfocused, not wall-clock seconds. A
     /// pane nobody can be prompted at does not burn its backoff.
@@ -139,6 +179,8 @@ impl Stall {
             held_since: batch,
             batch,
             session,
+            presence_broken: false,
+            human_released: false,
             waited: 0,
             retries: 0,
         }

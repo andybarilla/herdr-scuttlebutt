@@ -46,10 +46,13 @@ const STALL_RETRY_TICKS: u32 = 30;
 const MAX_STALL_RETRY_TICKS: u32 = 900;
 
 /// How long a stalled agent waits before its next retry, doubling per retry
-/// to the ceiling. Retrying at all is what makes the exits reachable: a pane
-/// that recovers in place keeps its session id, so a confirmed delivery is
-/// the only evidence it is well again, and an agent herdr reports no session
-/// id for has no other exit whatsoever.
+/// to the ceiling. Retrying at all is what makes the recover-in-place exit
+/// reachable: such a pane keeps its session id, so a confirmed delivery is
+/// the only evidence it is well again and something has to be sent for one
+/// to exist. The retry is itself gated on that id matching (#58), so it is
+/// an exit only for the process the batch was held for; an agent herdr
+/// reports no session id for has no automatic exit at all, and waits for a
+/// human.
 fn retry_after(retries: u32) -> u32 {
     STALL_RETRY_TICKS
         .saturating_mul(1 << retries.min(5))
@@ -894,8 +897,10 @@ pub fn status(dir: &Path) {
         println!("stalled agents: none");
     } else {
         println!(
-            "stalled agents: {} (batch held, delivery slowed to a widening retry; \
-             resumes when a retry is confirmed or a new session appears)",
+            "stalled agents: {} (batch held, delivery slowed to a widening retry \
+             that goes only to the session it stalled as; resumes when one is \
+             confirmed, or at once if a new session appears at a pane that never \
+             left the listing)",
             holds.stalled.len()
         );
         for (room, name, batch) in holds.stalled {
@@ -1393,9 +1398,26 @@ fn resuming_stall(held: &crate::state::Held, a: &AgentInfo) -> crate::state::Sta
         // predecessor's identity — reachable through an unidentified
         // release, where the pane that takes the batch need not be the one
         // the hold recorded — and that stall would then hold an id no
-        // agent here ever reported. `None` is the honest record, and it is
-        // what the delivery loop's `(None, Some(_))` lift is written for.
+        // agent here ever reported. `None` is the honest record, and what
+        // it costs is named on `human_released` below.
         session: a.session.clone(),
+        // A fresh run of presence: this pane is in the listing now, and
+        // `may_resume` has already ruled on the identity of whoever is at
+        // it. Whatever absence carried the batch into the hold was spent
+        // getting here, and holding it against the new stall would refuse a
+        // lift for a pane that has not left the listing since (#58).
+        presence_broken: false,
+        // Every caller has just had `may_resume` say yes, so this asks
+        // which of its two answers it was. An id match needs nothing
+        // carried forward — the retry gate makes the same comparison and
+        // reaches the same yes. A resume that rests on a live release does:
+        // the case `--deliver` is typed for is a pane herdr reports no id
+        // at, and without this the retry gate would refuse the delivery the
+        // human just authorized and hold the batch for nobody (#58).
+        human_released: !matches!(
+            (&held.session, &a.session),
+            (Some(was), Some(now)) if was == now
+        ),
         waited: retry_after(0),
         retries: 0,
     }
@@ -1434,10 +1456,11 @@ fn undelivered(outcome: Result<Delivery>) -> Option<NotDelivered> {
 /// The id to record when a stall *opens*: the one this listing carries, or
 /// the newest herdr has reported for that agent. `agent_session` is
 /// optional per listing, so a threshold tick that omits it would otherwise
-/// record `None`, which `(None, Some(_))` reads as a new session on the
-/// next tick — lifting the stall and returning the agent to full rate.
-/// Newest-known is the right fallback here and only here: a stall that is
-/// opening has no id of its own to preserve yet.
+/// record `None` — and a stall that records `None` can never afterwards be
+/// matched to anything, so neither its lift nor its retries will deliver
+/// and its batch waits for a human (#58). Newest-known is the right
+/// fallback here and only here: a stall that is opening has no id of its
+/// own to preserve yet.
 ///
 /// The fallback is scoped to an unbroken presence, and that scoping lives
 /// in `last_session` itself, which is dropped on the agent's first absence.
@@ -1635,6 +1658,23 @@ pub fn tick(
         // mistake the merge makes, one tick earlier and with no merge in
         // it. After an absence the honest answer is that nothing here knows.
         state.last_session.remove(&name);
+        // The same reasoning one map over, and it has to be recorded here
+        // because nothing downstream can reconstruct it: `absences` is
+        // cleared the moment the name is listed again, so by the time the
+        // delivery loop sees a new id at that pane the gap it appeared
+        // through has already been forgotten (#58). A standing stall
+        // remembers it instead, and never unremembers it — a name that has
+        // been away once cannot afterwards prove that a new id is its own
+        // pane restarting rather than someone else's pane arriving.
+        if let Some(stall) = state.stalled.get_mut(&name) {
+            stall.presence_broken = true;
+            // The release that armed this delivery was an answer about the
+            // pane that was there, and this name no longer names it. A
+            // batch that reaches the purge is held again and needs a fresh
+            // one; a name that comes back inside the window is refused like
+            // any other pane nothing can identify.
+            stall.human_released = false;
+        }
         if *count >= MAX_ABSENCES {
             // The stall does not go with the presence state: its batch is
             // data, and data must not expire on the timer that keeps the
@@ -1714,25 +1754,33 @@ pub fn tick(
             // double-prompting the agent while it's still busy with intro.
             continue;
         }
-        // A stalled agent takes one of three routes: lift the stall because
+        // A stalled agent takes one of four routes: lift the stall because
         // the pane is demonstrably a different process, spend a delivery
-        // opportunity waiting, or fall through and be retried once.
+        // opportunity waiting, refuse a due retry to a pane that cannot be
+        // shown to be the one the batch is held for, or fall through and be
+        // retried once. Both identity routes read `stall.session`, and they
+        // ask it opposite questions: the lift needs proof of difference, the
+        // retry proof of sameness, and neither is satisfied by a `None`.
         let mut retrying = false;
         if let Some(stall) = state.stalled.get_mut(&a.name) {
-            let restarted = match (&stall.session, &a.session) {
-                // A different id is a different process at that pane, so
-                // whatever wedged the old one is gone with it.
-                (Some(was), Some(now)) => was != now,
-                // No id when it stalled and an id now. This is not evidence
-                // the process is the same one, and reading it as sameness is
-                // what left a stall recorded during a listing that dropped
-                // the field wedged for good.
-                (None, Some(_)) => true,
-                // An id that has gone missing says nothing either way, and
-                // lifting on it would clear every stall the moment herdr
-                // dropped the field. The backoff is that case's way out.
-                (Some(_), None) | (None, None) => false,
-            };
+            let restarted = !stall.presence_broken
+                && match (&stall.session, &a.session) {
+                    // A different id at a pane that never left the listing
+                    // can only be that pane restarting, so whatever wedged
+                    // the old process is gone with it. Once the name has
+                    // been absent, the same observation is equally
+                    // consistent with a different agent having taken it,
+                    // and lifting on that handed the batch to a stranger
+                    // (#58).
+                    (Some(was), Some(now)) => was != now,
+                    // Anything with a `None` in it is not an observation
+                    // about who is at that pane: an id that has gone
+                    // missing would otherwise clear every stall the moment
+                    // herdr dropped the field, and a stall that recorded no
+                    // id has nothing to compare a later one against. Both
+                    // stand until a delivery is confirmed or a human acts.
+                    _ => false,
+                };
             if restarted {
                 let batch = stall.held_since;
                 clear_stall(state, &a.name);
@@ -1755,6 +1803,62 @@ pub fn tick(
                 }
                 stall.waited = 0;
                 stall.retries += 1;
+                // The batch is held for one process, and a retry is a
+                // delivery like any other: it goes to whatever herdr has at
+                // that pane now. The lift is the fast way to the wrong
+                // process and this is the slow one, so closing only the
+                // lift leaves the same cross-delivery reachable half an
+                // hour later (#58).
+                //
+                // Sameness has to be shown, not assumed: only two `Some`
+                // ids that are equal are evidence of one process. A pane
+                // herdr reports no id for, and a stall that recorded none,
+                // both fail that and keep the batch — which is the whole
+                // exit for an agent kind herdr has no ids for, and is why
+                // `daemon-status` and the report below have to name it.
+                let same_process = matches!(
+                    (&stall.session, &a.session),
+                    (Some(was), Some(now)) if was == now
+                );
+                // A human's `held --deliver` stands where the ids cannot,
+                // and only for as long as the name stays listed: the
+                // absence loop clears it. Without it this gate would refuse
+                // the one delivery the command exists to authorize.
+                if !same_process && !stall.human_released {
+                    // The recorded id is deliberately left alone: writing
+                    // the pane's current id in here would make the next
+                    // retry find them equal and deliver the batch to
+                    // exactly the process this refused.
+                    let mismatch = match (&stall.session, &a.session) {
+                        (Some(was), Some(now)) => format!(
+                            "it is held for session {was} and herdr reports {now} \
+                             at that pane"
+                        ),
+                        (Some(was), None) => format!(
+                            "it is held for session {was} and herdr reports no \
+                             session id at that pane"
+                        ),
+                        // Both `None` cases: nothing was ever recorded to
+                        // compare against, so no listing can satisfy this.
+                        (None, _) => "herdr reported no session id for it when the \
+                                      stall opened, so no pane can be matched to it"
+                            .to_string(),
+                    };
+                    let (retries, batch) = (stall.retries, stall.batch);
+                    let next = retry_after(retries);
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] retry {retries} for {name} was not sent: \
+                             {mismatch}, and a name is not an identity. Still holding \
+                             the batch up to #{batch}; next attempt after {next} \
+                             delivery opportunities. `scuttlebutt daemon-status` \
+                             lists it.",
+                            name = a.name
+                        ),
+                    );
+                    continue;
+                }
                 retrying = true;
             }
         }
@@ -1816,31 +1920,26 @@ pub fn tick(
                 // a batch that grows neither lifts the stall nor shortens
                 // the wait.
                 stall.batch = max_id;
-                // A defensive no-op today, and worth saying so rather than
-                // implying it decides something. The reader ran earlier in
-                // this same iteration over this same listing and lifted the
-                // stall on every case where `a.session` differed from what
-                // the stall holds — so by here `a.session` is either equal
-                // to it or `None`, and both branches write back the value
-                // already there. Deleting the line passes every test.
+                // Nothing: this writes back the value already there, and it
+                // is worth saying so rather than implying it decides
+                // something. Reaching this arm at all means the retry gate
+                // earlier in this same iteration found `a.session` equal to
+                // what the stall holds, both `Some`, so neither branch of
+                // the `or_else` can change it. Deleting the line passes
+                // every test.
                 //
-                // It stays because the invariant is that this writer must
-                // not change the recorded id, and a line that preserves it
-                // reads better to whoever loosens one of the reader's lift
-                // conditions than an absence would. What it must never
-                // become is the newest id herdr has reported:
-                // `last_session` is written for every listed agent,
-                // including on the ticks this loop skips, so a pane that
-                // restarted while its agent was busy has a newer id there
-                // than the reader has ever compared against — writing that
-                // in would make the reader find them equal and hold a stall
-                // that should have lifted.
-                //
-                // This writer is the one identity site that is safe to
-                // preserve, and it is safe because it only runs for an
-                // agent in this tick's listing. The reader it feeds is not
-                // equally safe across an absence, which is #58 and not
-                // this line.
+                // It stays as a statement of the invariant — this writer
+                // must never move the recorded id — because that invariant
+                // is what the gate depends on and is not obvious from the
+                // gate alone. What the line must never become is the newest
+                // id herdr has reported: `last_session` is written for
+                // every listed agent, including on the ticks this loop
+                // skips, so a pane that restarted while its agent was busy
+                // has a newer id there than either gate has compared
+                // against. Writing that in would make the lift see them
+                // equal and hold a stall that should have lifted, and the
+                // retry gate see them equal and deliver the batch to the
+                // new process.
                 stall.session = a.session.clone().or_else(|| stall.session.clone());
                 let retries = stall.retries;
                 let next = retry_after(retries);
@@ -1909,8 +2008,10 @@ pub fn tick(
                                  {MAX_FAILURES_BEFORE_STALL} attempts. Holding the batch up to \
                                  #{max_id}; the room continues for everyone else. Delivery \
                                  to it drops to a widening retry and resumes on its own \
-                                 when one is confirmed or a new session appears at that \
-                                 pane. `scuttlebutt daemon-status` lists what is held.",
+                                 when one is confirmed, or at once if a new session \
+                                 appears at a pane that never left the listing. Retries \
+                                 go only to the session it stalled as. `scuttlebutt \
+                                 daemon-status` lists what is held.",
                                 a.name
                             ),
                         );
@@ -3641,9 +3742,17 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_recorded_with_no_session_id_lifts_when_one_appears() {
-        // The stall tick may be the one listing where herdr dropped the
-        // field. Reading that later id as sameness wedged the agent for good.
+    fn a_stall_recorded_with_no_session_id_refuses_both_paths() {
+        // A stall that recorded no id has nothing for either gate to compare
+        // against. The lift used to read the first id that appeared as a
+        // restart; that is the same reading as #58's, with the absence
+        // replaced by a missing record, and an id appearing at a pane is not
+        // evidence about who was at it when the batch was held. So neither
+        // the lift nor the retry that follows it delivers, and the batch
+        // waits for a human.
+        //
+        // The cost is real and is the trade #58 took: an agent kind herdr
+        // reports no id for now has no automatic way out of a stall at all.
         let dir = tempfile::tempdir().unwrap();
         let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
@@ -3657,11 +3766,58 @@ mod tests {
         assert_eq!(state.stalled["reviewer"].session, None);
         let sent = herd.prompts.borrow().len();
 
+        // An id appears, and the pane would take a delivery if it were sent
+        // one: nothing here is refusing because the prompt would fail.
         herd.set_session("reviewer", "session-a");
         herd.unconfirmed.clear();
         tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
-        assert!(state.stalled.is_empty(), "stall outlived its cause");
-        assert_eq!(herd.prompts.borrow().len(), sent + 1);
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "an id nothing can be compared to lifted the stall"
+        );
+        assert_eq!(herd.prompts.borrow().len(), sent, "the lift delivered");
+
+        // and the slow path refuses it too
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(herd.prompts.borrow().len(), sent, "the retry delivered");
+        assert_eq!(state.cursors["reviewer"], 0);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("herdr reported no session id for it when the stall opened"),
+            "the refusal is not in the log a human reads: {log}"
+        );
+    }
+
+    #[test]
+    fn the_process_the_batch_was_held_for_still_receives_it_after_an_absence() {
+        // The other half of the gate, and the one that keeps it from being
+        // "refuse everything that was ever away". The absence gates the
+        // lift, which asks for a difference; the retry asks for sameness,
+        // and an id equal to the one recorded is exactly that however long
+        // the name was missing. Deleting the absence gate leaves this test
+        // passing, and deleting the retry's equality check fails it.
+        let (dir, mut state, mut herd) = stalled_then_absent_under("sess-1");
+        let sent = herd.prompts.borrow().len();
+
+        // the original process, back with its own id and able to take it
+        herd.takes_the_name("reviewer", "idle", Some("sess-1"));
+        herd.unconfirmed.clear();
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        let prompts = herd.prompts.borrow();
+        assert_eq!(prompts.len(), sent + 1, "the batch never came back");
+        assert!(
+            prompts[sent].1.contains("A's batch"),
+            "the wrong messages were delivered: {:?}",
+            prompts[sent].1
+        );
+        assert!(
+            state.stalled.is_empty(),
+            "a confirmed delivery left a stall"
+        );
         assert_eq!(state.cursors["reviewer"], 1);
     }
 
@@ -3670,8 +3826,8 @@ mod tests {
         // herdr does not report `agent_session` for every agent kind. Absent
         // on both sides means unknown: treating it as a new id would clear
         // the stall on every tick, which is the redelivery loop all over
-        // again. Such an agent leaves by the backoff instead — see
-        // `an_agent_that_never_reports_a_session_id_still_gets_its_batch`.
+        // again. Such an agent has no automatic way out at all — see
+        // `an_agent_that_never_reports_a_session_id_waits_for_a_human`.
         let dir = tempfile::tempdir().unwrap();
         let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
@@ -3713,7 +3869,11 @@ mod tests {
         // while a stall stands — someone else's message is still in there —
         // so the branch itself is pinned by a comment, not by this test.
         let dir = tempfile::tempdir().unwrap();
-        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        // An id herdr keeps reporting throughout, so the retry this test
+        // needs is one the identity gate lets through: what is under test
+        // here is the batch, not who the pane belongs to.
+        herd.set_session("reviewer", "session-a");
         let mut state = DaemonState::default();
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
@@ -4015,9 +4175,14 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_that_never_reports_a_session_id_still_gets_its_batch() {
-        // herdr reports no `agent_session` for some agent kinds. Those have
-        // no restart signal at all, so the backoff is their only exit.
+    fn an_agent_that_never_reports_a_session_id_waits_for_a_human() {
+        // herdr reports no `agent_session` for some agent kinds, and the
+        // backoff used to be their exit: the retry went to whatever was at
+        // the pane, because nothing could say whether it was the same
+        // process. That is #58's cross-delivery on the slow path, so the
+        // retry now refuses it, and such an agent has no automatic exit
+        // left. The batch is held, the cursor stays put, `daemon-status`
+        // names it, and a human decides.
         let dir = tempfile::tempdir().unwrap();
         let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         let mut state = DaemonState::default();
@@ -4028,20 +4193,26 @@ mod tests {
         for _ in 0..MAX_FAILURES_BEFORE_STALL {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
+        let sent = herd.prompts.borrow().len();
+        // The pane would take a delivery now. Nothing is sent to it anyway.
         herd.unconfirmed.clear();
-        for _ in 0..STALL_RETRY_TICKS {
+        for _ in 0..STALL_RETRY_TICKS * 2 {
             tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
         }
-        assert!(state.stalled.is_empty(), "no way out without a session id");
-        assert_eq!(state.cursors["reviewer"], 1);
+        assert_eq!(herd.prompts.borrow().len(), sent, "a retry was sent blind");
+        assert!(state.stalled.contains_key("reviewer"));
+        assert_eq!(state.cursors["reviewer"], 0, "the batch was skipped past");
     }
 
     #[test]
     fn a_stalled_agent_is_retried_on_a_widening_backoff() {
         // Not every tick — that is the redelivery loop the threshold exists
-        // to stop — and not never, which is a dead agent.
+        // to stop — and not never, which is a dead agent. The id herdr keeps
+        // reporting is what makes these retries ones the identity gate lets
+        // through; what is under test is their spacing.
         let dir = tempfile::tempdir().unwrap();
-        let herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-a");
         let mut state = DaemonState::default();
         introduced(&mut state, &["reviewer"]);
         state.cursors.insert("reviewer".into(), 0);
