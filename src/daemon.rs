@@ -1844,14 +1844,18 @@ pub fn tick(
                                       stall opened, so no pane can be matched to it"
                             .to_string(),
                     };
-                    let (retries, batch) = (stall.retries, stall.batch);
+                    // `held_since` and not `batch`: nothing here has read
+                    // the room, so the batch may have grown since the last
+                    // attempt that did, and this line must not read as a
+                    // bound on what is waiting.
+                    let (retries, since) = (stall.retries, stall.held_since);
                     let next = retry_after(retries);
                     report(
                         dir,
                         &format!(
                             "[scuttlebutt] retry {retries} for {name} was not sent: \
                              {mismatch}, and a name is not an identity. Still holding \
-                             the batch up to #{batch}; next attempt after {next} \
+                             its batch, from #{since} on; next attempt after {next} \
                              delivery opportunities. `scuttlebutt daemon-status` \
                              lists it.",
                             name = a.name
@@ -3603,8 +3607,12 @@ mod tests {
 
     #[test]
     fn a_new_session_id_lifts_the_stall_at_once() {
-        // A different process at that pane cannot be the one that wedged, so
-        // this exit does not wait out the backoff.
+        // The behaviour #58 preserves: the name is listed on every tick
+        // here, and a different id at a pane that never left the listing
+        // cannot be the process that wedged, so this exit does not wait out
+        // the backoff. An absence anywhere in this sequence is what makes
+        // the same observation inconclusive — see
+        // `a_new_session_after_an_absence_does_not_lift_the_stall`.
         let dir = tempfile::tempdir().unwrap();
         let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         herd.set_session("reviewer", "session-a");
@@ -3819,6 +3827,75 @@ mod tests {
             "a confirmed delivery left a stall"
         );
         assert_eq!(state.cursors["reviewer"], 1);
+    }
+
+    #[test]
+    fn a_release_does_not_survive_the_name_going_absent_again() {
+        // `human_released` is what lets a released batch past the retry
+        // gate, and it exists for the one pane the gate cannot identify:
+        // `resuming_stall` records whatever id the returning pane reports,
+        // so a pane that has one is matched by equality and never consults
+        // the flag. That makes an id-less pane the only case where the flag
+        // decides anything — and the only case where a stale one would hand
+        // the batch to a stranger through #58's own window.
+        let (dir, state) = stalled_then_vanished(None);
+        crate::state::save(dir.path(), &state).unwrap();
+        held_action(dir.path(), "reviewer", true, None).unwrap();
+        let mut state = crate::state::load(dir.path());
+
+        // The pane comes back with no id. The release resumes the batch and
+        // authorises a delivery; that delivery fails, so the stall stands
+        // and still carries the authorisation.
+        let mut wedged = FakeHerd::new(vec![("reviewer", "idle")]);
+        wedged.fail_prompts = true;
+        for _ in 0..2 {
+            tick(
+                &mut state,
+                &wedged,
+                dir.path(),
+                &AgentFilter::default(),
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            state.held.is_empty(),
+            "the release did not resume the batch"
+        );
+        assert!(
+            state.stalled["reviewer"].human_released,
+            "the resumed stall did not carry the human's answer"
+        );
+
+        // the name goes away again, short of the purge
+        let gone = FakeHerd::new(vec![]);
+        for _ in 0..MAX_ABSENCES - 1 {
+            tick(&mut state, &gone, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert!(state.stalled.contains_key("reviewer"), "purged too early");
+
+        // and someone else answers to it, with nothing to identify them by
+        let stranger = FakeHerd::new(vec![("reviewer", "idle")]);
+        for _ in 0..STALL_RETRY_TICKS * 2 {
+            tick(
+                &mut state,
+                &stranger,
+                dir.path(),
+                &AgentFilter::default(),
+                None,
+            )
+            .unwrap();
+        }
+        // The stranger is enrolled and introduced like any new pane — that
+        // is the room working, and it starts at tail. What it must not
+        // receive is the batch, which is its predecessor's.
+        assert!(
+            !was_delivered(&stranger),
+            "a release given for the pane that was there delivered to the one \
+             that took the name: {:?}",
+            stranger.prompts.borrow()
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
     }
 
     #[test]
@@ -4089,10 +4166,11 @@ mod tests {
 
     #[test]
     fn a_dropped_session_field_does_not_lift_a_stall_through_the_retry_path() {
-        // The comparison treats "no id then, an id now" as a new session,
-        // which is right. The hazard is the retry writing that `None` in the
-        // first place: one listing without the field, and the next listing
-        // with it back looks like a restart that never happened.
+        // The hazard is the retry writing a `None` over the id the stall
+        // recorded: one listing without the field, and the stall no longer
+        // knows who its batch is for — which since #58 refuses every path
+        // out of it, so the agent would be wedged by a field that only went
+        // missing for a tick.
         let dir = tempfile::tempdir().unwrap();
         let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
         herd.set_session("reviewer", "session-a");
