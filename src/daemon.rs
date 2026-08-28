@@ -2019,6 +2019,22 @@ mod tests {
             }
         }
 
+        /// Takes a pane out of `herdr agent list` entirely. That is what an
+        /// absence is: a listed agent that cannot take a delivery is still
+        /// present, and never counts one.
+        fn leaves(&mut self, name: &str) {
+            self.agents.retain(|a| a.name != name);
+        }
+
+        /// A different agent taking a name its previous holder left,
+        /// reporting `session` — or nothing at all, for the agent kinds
+        /// herdr has no id for.
+        fn takes_the_name(&mut self, name: &str, status: &str, session: Option<&str>) {
+            let mut a = FakeHerd::new(vec![(name, status)]).agents.remove(0);
+            a.session = session.map(str::to_string);
+            self.agents.push(a);
+        }
+
         /// `new` with explicit per-agent focus. `None` models a herdr that
         /// does not emit the field at all.
         fn with_focus(agents: Vec<(&str, &str, Option<bool>)>) -> Self {
@@ -3523,6 +3539,104 @@ mod tests {
         assert!(
             log.contains("reviewer is a new session; resuming delivery of the batch held since #1"),
             "log was: {log}"
+        );
+    }
+
+    /// #58's four-step probe, up to the moment the impostor is listed:
+    /// `reviewer` stalls holding a batch as `sess-1`, its pane closes, and
+    /// two passes go by with the name absent — one short of `MAX_ABSENCES`,
+    /// so nothing is purged and the stall still stands.
+    fn stalled_then_absent_under(session: &str) -> (tempfile::TempDir, DaemonState, FakeHerd) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut herd = unconfirmed_for(&["reviewer"], vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", session);
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        append(dir.path(), "human", "A's batch").unwrap();
+
+        for _ in 0..MAX_FAILURES_BEFORE_STALL {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        assert_eq!(
+            state.stalled["reviewer"].session.as_deref(),
+            Some(session),
+            "the stall did not record the id the batch is held for"
+        );
+
+        herd.leaves("reviewer");
+        for _ in 0..MAX_ABSENCES - 1 {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+        // Both halves matter. A purged stall would take the batch to
+        // `state.held`, where `may_resume` already refuses a stranger — so
+        // the test would pass without saying anything about either path
+        // through `tick`.
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "the stall was purged; this setup proves nothing"
+        );
+        assert!(
+            state.held.is_empty(),
+            "the batch moved to the hold; that is may_resume's path, not this one"
+        );
+        (dir, state, herd)
+    }
+
+    #[test]
+    fn a_new_session_after_an_absence_does_not_lift_the_stall() {
+        // #58's probe. A different id at a stalled agent's pane means that
+        // pane restarted only while the name was continuously listed. Across
+        // an absence it is equally consistent with a different agent taking
+        // the name, and lifting on it handed that agent the batch held for
+        // its predecessor — no purge, no held batch, no human, in about four
+        // seconds.
+        let (dir, mut state, mut herd) = stalled_then_absent_under("sess-1");
+        let sent = herd.prompts.borrow().len();
+
+        herd.takes_the_name("reviewer", "idle", Some("sess-2"));
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "the batch held for sess-1 was delivered to sess-2: {:?}",
+            herd.prompts.borrow()
+        );
+        assert!(
+            state.stalled.contains_key("reviewer"),
+            "the stall lifted for a pane that left the listing"
+        );
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "the cursor advanced over a batch nobody confirmed"
+        );
+    }
+
+    #[test]
+    fn a_retry_does_not_deliver_to_a_pane_it_cannot_identify() {
+        // The same exposure on the slow path, and the reason gating the lift
+        // alone is not a fix: while a stall stands, every retry delivers to
+        // whatever process is at that pane. The impostor here reports no id
+        // at all, so the lift cannot fire on it under any rule — what
+        // delivers the batch is the backoff, thirty ticks later.
+        let (dir, mut state, mut herd) = stalled_then_absent_under("sess-1");
+        let sent = herd.prompts.borrow().len();
+
+        herd.takes_the_name("reviewer", "idle", None);
+        for _ in 0..STALL_RETRY_TICKS {
+            tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+        }
+
+        assert_eq!(
+            herd.prompts.borrow().len(),
+            sent,
+            "a retry delivered the batch held for sess-1 to an unidentified pane: {:?}",
+            herd.prompts.borrow()
+        );
+        assert_eq!(
+            state.cursors["reviewer"], 0,
+            "the cursor advanced over a batch nobody confirmed"
         );
     }
 
