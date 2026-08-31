@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -279,6 +280,20 @@ pub fn load(dir: &Path) -> DaemonState {
             DaemonState::default()
         }
     }
+}
+
+/// Serializes state writers for one room. The lock has its own stable inode:
+/// `save` atomically replaces `state.json`, so locking that file would leave a
+/// waiter holding the replaced inode instead of the current state file.
+pub fn lock_room(dir: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("state.lock"))?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(file)
 }
 
 fn reset_warning(path: &Path, cause: &str) -> String {
