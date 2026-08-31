@@ -900,7 +900,9 @@ pub fn status(dir: &Path) {
             "stalled agents: {} (batch held, delivery slowed to a widening retry \
              that goes only to the session it stalled as; resumes when one is \
              confirmed, or at once if a new session appears at a pane that never \
-             left the listing)",
+             left the listing; `scuttlebutt held <agent> --deliver` authorises the \
+             pane there now for {RELEASE_WINDOW_MINUTES} minutes, `--drop` discards \
+             undelivered messages and advances its cursor)",
             holds.stalled.len()
         );
         for (room, name, batch) in holds.stalled {
@@ -945,29 +947,34 @@ pub fn status(dir: &Path) {
     }
 }
 
-/// `scuttlebutt held <agent> --deliver|--drop`. A held batch is cleared by
-/// delivery or by a human, never by a timer, and this is the human half.
+/// `scuttlebutt held <agent> --deliver|--drop`. A held or stalled batch is
+/// cleared by delivery or by a human, never by a timer, and this is the
+/// human half.
 ///
 /// `--deliver` records a `Release`, which is an authorization and not a
 /// standing arrangement. `at_pane` is the session id herdr reports for that
 /// name *now*, captured by the caller at the moment the human answers: with
 /// one, only that process may take the batch; without one, any agent under
 /// that name may, for `RELEASE_WINDOW_MINUTES`. The window is what stops an
-/// unclaimed release — on a hold in a room its agent has left, say — from
-/// arming a delivery for whoever answers to that name days later.
+/// unclaimed release from arming a delivery for whoever answers to that
+/// name days later. A stalled release also makes its next delivery
+/// opportunity due immediately rather than waiting out the standing
+/// backoff.
 ///
 /// `--drop` discards the batch, and also clears an eviction note for that
 /// name, which is the only way one leaves short of another eviction pushing
-/// it out.
+/// it out. Dropping a stalled batch advances its cursor over messages nobody
+/// received; the command output and daemon log both state that exception.
 ///
 /// Acts in every room holding that name, since a name is only unique within
 /// a room.
 ///
 /// Reads and rewrites `state.json` directly. The daemon reloads state from
-/// disk every pass, so the only window where this can be clobbered is the
-/// sub-millisecond gap between one pass's load and its save; losing this
-/// costs a retype, and a durable request queue would be a second
-/// concurrency design to review inside a data-loss fix.
+/// disk every pass, but one pass can still clobber an action typed after its
+/// load and before its save. A lost release needs retyping; a lost stalled
+/// drop can leave its batch eligible for a later retry despite the command's
+/// success. Closing that race needs a shared lock or durable request queue,
+/// a separate concurrency design from these state transitions (#63).
 pub fn held_action(
     session: &Path,
     agent: &str,
@@ -995,6 +1002,53 @@ pub fn held_action(
                 crate::state::save(&path, &st)?;
                 acted = true;
                 println!("{agent} in {room}: cleared a note about a dropped batch");
+            }
+        }
+        if st.stalled.contains_key(agent) {
+            if deliver {
+                let stall = st.stalled.get_mut(agent).expect("just checked");
+                stall.release = Some(crate::state::Release {
+                    session: at_pane.clone(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+                // A human asked for delivery now. Preserve the widening
+                // retry count, but make its next opportunity due at once.
+                stall.waited = retry_after(stall.retries);
+                let (batch, since) = (stall.batch, stall.held_since);
+                crate::state::save(&path, &st)?;
+                acted = true;
+                let target = match &at_pane {
+                    Some(id) => format!("session {id}"),
+                    None => format!(
+                        "the pane now at that name at its next opportunity within \
+                         {RELEASE_WINDOW_MINUTES} minutes — herdr reports no session id, \
+                         so the window is the only identity bound"
+                    ),
+                };
+                println!(
+                    "{agent} in {room}: the stalled batch up to #{batch} (held since #{since}) \
+                     will be delivered to {target}"
+                );
+            } else {
+                let stall = clear_stall(&mut st, agent).expect("just checked");
+                let cursor = st.cursors.entry(agent.to_string()).or_default();
+                *cursor = (*cursor).max(stall.batch);
+                let cursor = *cursor;
+                crate::state::save(&path, &st)?;
+                acted = true;
+                println!(
+                    "{agent} in {room}: discarded the stalled batch up to #{} without \
+                     delivery and advanced its cursor from the held position to #{}",
+                    stall.batch, cursor
+                );
+                report(
+                    &path,
+                    &format!(
+                        "[scuttlebutt] a human discarded undelivered messages for {agent} \
+                         in the stalled batch up to #{} and advanced {agent}'s cursor to #{}",
+                        stall.batch, cursor
+                    ),
+                );
             }
         }
         let Some(held) = st.held.get_mut(agent) else {
@@ -1160,6 +1214,17 @@ fn release_live(r: &crate::state::Release) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Applies one release's time and identity bounds. Shared by held resume and
+/// stalled retry so the same human command cannot mean two different things.
+fn release_allows(r: &crate::state::Release, session: &Option<String>) -> bool {
+    release_live(r)
+        && match (&r.session, session) {
+            (Some(was), Some(now)) => was == now,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
 }
 
 /// Moves a stalled agent's batch out of presence state as the purge takes
@@ -1355,21 +1420,7 @@ fn may_resume(held: &crate::state::Held, a: &AgentInfo) -> bool {
         }
     }
     if let Some(r) = &held.release {
-        if release_live(r) {
-            return match (&r.session, &a.session) {
-                // Released for a named process: the same comparison the
-                // automatic path makes, with a human's answer standing
-                // where that path would have refused a mismatch.
-                (Some(was), Some(now)) => was == now,
-                // Released for a named process and this one reports none:
-                // nothing to check against, so it is not that process as
-                // far as anything here can tell.
-                (Some(_), None) => false,
-                // Nothing to compare, which is the case the release was
-                // typed for. The window is the bound.
-                (None, _) => true,
-            };
-        }
+        return release_allows(r, &a.session);
     }
     // Nothing else can say yes. The only automatic yes is the equality
     // above, and every other shape — a different id, an id missing on
@@ -1399,7 +1450,7 @@ fn resuming_stall(held: &crate::state::Held, a: &AgentInfo) -> crate::state::Sta
         // release, where the pane that takes the batch need not be the one
         // the hold recorded — and that stall would then hold an id no
         // agent here ever reported. `None` is the honest record, and what
-        // it costs is named on `human_released` below.
+        // it costs is named on `release` below.
         session: a.session.clone(),
         // A fresh run of presence: this pane is in the listing now, and
         // `may_resume` has already ruled on the identity of whoever is at
@@ -1414,10 +1465,7 @@ fn resuming_stall(held: &crate::state::Held, a: &AgentInfo) -> crate::state::Sta
         // the case `--deliver` is typed for is a pane herdr reports no id
         // at, and without this the retry gate would refuse the delivery the
         // human just authorized and hold the batch for nobody (#58).
-        human_released: !matches!(
-            (&held.session, &a.session),
-            (Some(was), Some(now)) if was == now
-        ),
+        release: held.release.clone(),
         waited: retry_after(0),
         retries: 0,
     }
@@ -1673,7 +1721,7 @@ pub fn tick(
             // batch that reaches the purge is held again and needs a fresh
             // one; a name that comes back inside the window is refused like
             // any other pane nothing can identify.
-            stall.human_released = false;
+            stall.release = None;
         }
         if *count >= MAX_ABSENCES {
             // The stall does not go with the presence state: its batch is
@@ -1820,11 +1868,27 @@ pub fn tick(
                     (&stall.session, &a.session),
                     (Some(was), Some(now)) if was == now
                 );
+                if stall.release.as_ref().is_some_and(|r| !release_live(r)) {
+                    stall.release = None;
+                    report(
+                        dir,
+                        &format!(
+                            "[scuttlebutt] the release on the stalled batch for {} \
+                             lapsed after {RELEASE_WINDOW_MINUTES} minutes without a \
+                             delivery. The batch is still held; `scuttlebutt held {} \
+                             --deliver` again to send it, `--drop` to discard it.",
+                            a.name, a.name
+                        ),
+                    );
+                }
                 // A human's `held --deliver` stands where the ids cannot,
-                // and only for as long as the name stays listed: the
-                // absence loop clears it. Without it this gate would refuse
-                // the one delivery the command exists to authorize.
-                if !same_process && !stall.human_released {
+                // bounded to the pane and time it authorized. The absence
+                // loop clears it as soon as that pane's presence breaks.
+                let released_to_pane = stall
+                    .release
+                    .as_ref()
+                    .is_some_and(|r| release_allows(r, &a.session));
+                if !same_process && !released_to_pane {
                     // The recorded id is deliberately left alone: writing
                     // the pane's current id in here would make the next
                     // retry find them equal and deliver the batch to
@@ -2904,6 +2968,111 @@ mod tests {
     }
 
     #[test]
+    fn a_human_can_release_a_stalled_batch_to_the_pane_now_at_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        state
+            .stalled
+            .insert("reviewer".into(), crate::state::Stall::new(1, None));
+        append(dir.path(), "human", "hello").unwrap();
+        crate::state::save(dir.path(), &state).unwrap();
+
+        held_action(dir.path(), "reviewer", true, Some("session-now".into())).unwrap();
+        let mut state = crate::state::load(dir.path());
+        let mut herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        herd.set_session("reviewer", "session-now");
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+
+        assert!(
+            herd.prompts
+                .borrow()
+                .iter()
+                .any(|(_, text)| text.contains("hello")),
+            "the released batch was not delivered"
+        );
+        assert!(state.stalled.is_empty());
+        assert_eq!(state.cursors["reviewer"], 1);
+    }
+
+    #[test]
+    fn a_stalled_release_does_not_authorize_a_different_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        let mut stall = crate::state::Stall::new(1, Some("session-old".into()));
+        // A brief listing gap means a changed id cannot independently lift
+        // the stall; only the human's authorization can allow delivery.
+        stall.presence_broken = true;
+        state.stalled.insert("reviewer".into(), stall);
+        append(dir.path(), "human", "private batch").unwrap();
+        crate::state::save(dir.path(), &state).unwrap();
+        held_action(
+            dir.path(),
+            "reviewer",
+            true,
+            Some("session-authorized".into()),
+        )
+        .unwrap();
+        let mut state = crate::state::load(dir.path());
+
+        let mut stranger = FakeHerd::new(vec![("reviewer", "idle")]);
+        stranger.set_session("reviewer", "session-stranger");
+        tick(
+            &mut state,
+            &stranger,
+            dir.path(),
+            &AgentFilter::default(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            stranger.prompts.borrow().is_empty(),
+            "a release delivered to a different session"
+        );
+        assert!(state.stalled.contains_key("reviewer"));
+        assert_eq!(state.cursors["reviewer"], 0);
+    }
+
+    #[test]
+    fn a_stalled_release_lapses_before_its_next_delivery_opportunity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["reviewer"]);
+        state.cursors.insert("reviewer".into(), 0);
+        state
+            .stalled
+            .insert("reviewer".into(), crate::state::Stall::new(1, None));
+        append(dir.path(), "human", "private batch").unwrap();
+        crate::state::save(dir.path(), &state).unwrap();
+        held_action(dir.path(), "reviewer", true, None).unwrap();
+        let mut state = crate::state::load(dir.path());
+        state.stalled.get_mut("reviewer").unwrap().release =
+            Some(release_aged(None, RELEASE_WINDOW_MINUTES + 1));
+
+        let herd = FakeHerd::new(vec![("reviewer", "idle")]);
+        tick(&mut state, &herd, dir.path(), &AgentFilter::default(), None).unwrap();
+
+        assert!(
+            herd.prompts.borrow().is_empty(),
+            "a lapsed release delivered"
+        );
+        assert!(
+            state.stalled["reviewer"].release.is_none(),
+            "the lapsed authorization was left standing"
+        );
+        assert_eq!(state.cursors["reviewer"], 0);
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("release on the stalled batch") && log.contains("lapsed after 30 minutes"),
+            "log was: {log}"
+        );
+    }
+
+    #[test]
     fn a_human_can_drop_a_held_batch() {
         let (dir, state) = stalled_then_vanished(None);
         crate::state::save(dir.path(), &state).unwrap();
@@ -2912,6 +3081,37 @@ mod tests {
         // and saying so about a name holding nothing is an error, not a
         // silent success that reads as "done".
         assert!(held_action(dir.path(), "reviewer", false, None).is_err());
+    }
+
+    #[test]
+    fn dropping_a_stalled_batch_discards_undelivered_messages_and_advances_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::default();
+        state.cursors.insert("reviewer".into(), 0);
+        state
+            .fail_counts
+            .insert("reviewer".into(), (MAX_FAILURES_BEFORE_STALL, 3));
+        state
+            .unconfirmed_streak
+            .insert("reviewer".into(), MAX_FAILURES_BEFORE_STALL);
+        state
+            .stalled
+            .insert("reviewer".into(), crate::state::Stall::new(3, None));
+        crate::state::save(dir.path(), &state).unwrap();
+
+        held_action(dir.path(), "reviewer", false, None).unwrap();
+
+        let state = crate::state::load(dir.path());
+        assert!(state.stalled.is_empty());
+        assert_eq!(state.cursors["reviewer"], 3);
+        assert!(!state.fail_counts.contains_key("reviewer"));
+        assert!(!state.unconfirmed_streak.contains_key("reviewer"));
+        let log = daemon_log(dir.path());
+        assert!(
+            log.contains("human discarded undelivered messages")
+                && log.contains("advanced reviewer's cursor to #3"),
+            "log was: {log}"
+        );
     }
 
     #[test]
@@ -3831,13 +4031,13 @@ mod tests {
 
     #[test]
     fn a_release_does_not_survive_the_name_going_absent_again() {
-        // `human_released` is what lets a released batch past the retry
-        // gate, and it exists for the one pane the gate cannot identify:
+        // The release is what lets a released batch past the retry gate,
+        // and it matters for the one pane the gate cannot identify:
         // `resuming_stall` records whatever id the returning pane reports,
         // so a pane that has one is matched by equality and never consults
-        // the flag. That makes an id-less pane the only case where the flag
-        // decides anything — and the only case where a stale one would hand
-        // the batch to a stranger through #58's own window.
+        // the release. That makes an id-less pane the only case where the
+        // authorization decides anything — and the only case where a stale
+        // one would hand the batch to a stranger through #58's own window.
         let (dir, state) = stalled_then_vanished(None);
         crate::state::save(dir.path(), &state).unwrap();
         held_action(dir.path(), "reviewer", true, None).unwrap();
@@ -3863,7 +4063,7 @@ mod tests {
             "the release did not resume the batch"
         );
         assert!(
-            state.stalled["reviewer"].human_released,
+            state.stalled["reviewer"].release.is_some(),
             "the resumed stall did not carry the human's answer"
         );
 

@@ -116,8 +116,9 @@ pub struct Stall {
     pub held_since: u64,
     /// Highest message id in the batch being held, refreshed on every retry.
     /// Reported and shown by `daemon-status` so a human can see what is
-    /// waiting; nothing gates on it, and a batch that grows past it neither
-    /// clears the stall nor shortens the wait.
+    /// waiting. Normal delivery does not gate on it, and a batch that grows
+    /// past it neither clears the stall nor shortens the wait. A human
+    /// `held --drop` advances the cursor through this id.
     pub batch: u64,
     /// The last id herdr reported for this agent as of the stall opening or
     /// its last failed retry — not necessarily the one carried by that
@@ -148,21 +149,16 @@ pub struct Stall {
     /// was replaced under it.
     #[serde(default)]
     pub presence_broken: bool,
-    /// Whether this stall's batch is here because a human released a hold
-    /// (`scuttlebutt held <agent> --deliver`) rather than because a
-    /// returning agent's id matched the one the hold recorded. It is the
-    /// human's answer to the question the ids could not settle, carried
-    /// forward so the retry gate does not immediately refuse the delivery
-    /// they just authorized — which it otherwise would for exactly the
-    /// pane the command exists for, one herdr reports no id at.
+    /// A human's authorization to deliver this stalled batch to the pane at
+    /// this name now. It carries the same identity and 30-minute wall-clock
+    /// bound as a held batch's release; a bare flag would arm delivery to a
+    /// different process that later took the name.
     ///
-    /// Cleared the moment the name goes absent, alongside
-    /// `presence_broken`: the authorization was for the pane that was
-    /// there, and a name that has left the listing no longer names it. A
-    /// batch that goes back to `held` needs a fresh release, since
-    /// `Held.release` is not carried across the purge.
+    /// Cleared the moment the name goes absent: the authorization was for
+    /// the pane that was there, and a name that has left the listing no
+    /// longer names it.
     #[serde(default)]
-    pub human_released: bool,
+    pub release: Option<Release>,
     /// Delivery opportunities counted since the last retry — ticks where
     /// this agent was deliverable and unfocused, not wall-clock seconds. A
     /// pane nobody can be prompted at does not burn its backoff.
@@ -180,7 +176,7 @@ impl Stall {
             batch,
             session,
             presence_broken: false,
-            human_released: false,
+            release: None,
             waited: 0,
             retries: 0,
         }
