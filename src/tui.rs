@@ -6,7 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
@@ -901,8 +901,9 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
         })
         .collect();
     let title = format!(" rooms · filter: {}_ ", picker.filter);
+    let mut state = ListState::default().with_selected(Some(picker.cursor));
     f.render_widget(Clear, rect);
-    f.render_widget(
+    f.render_stateful_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -910,6 +911,7 @@ fn draw_picker(f: &mut ratatui::Frame, picker: &PickerState) {
                 .title(title),
         ),
         rect,
+        &mut state,
     );
 }
 
@@ -1435,6 +1437,54 @@ mod tests {
             handle_key(&mut a, KeyCode::Up, KeyModifiers::NONE);
         }
         assert_eq!(a.picker.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn moving_to_the_last_room_keeps_it_visible_in_a_long_picker() {
+        let names: Vec<String> = (0..20).map(|i| format!("room-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app();
+        a.picker = Some(picker_of(&refs));
+        for _ in 0..19 {
+            handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        }
+
+        let screen = render(&a, 90, 20);
+        assert_eq!(columns_of(&a, 90, 20, "room-19"), vec![16]);
+        assert!(screen[16].contains("room-19"), "last room is off-screen");
+    }
+
+    #[test]
+    fn filtering_after_scrolling_shows_the_first_match_at_the_top() {
+        let mut names: Vec<String> = (0..19).map(|i| format!("room-{i:02}")).collect();
+        names.push("far-target-room".into());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app();
+        a.picker = Some(picker_of(&refs));
+        for _ in 0..19 {
+            handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        }
+        for c in "target".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let screen = render(&a, 90, 20);
+        assert_eq!(columns_of(&a, 90, 20, "far-target-room"), vec![16]);
+        assert!(screen[3].contains("far-target-room"), "match is not at top");
+    }
+
+    #[test]
+    fn a_short_picker_keeps_every_room_in_its_original_row() {
+        let mut a = app();
+        a.picker = Some(picker_of(&["room-one", "room-two", "room-three"]));
+        handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+
+        let screen = render(&a, 90, 20);
+        for (row, room) in [(3, "room-one"), (4, "room-two"), (5, "room-three")] {
+            assert_eq!(columns_of(&a, 90, 20, room), vec![16]);
+            assert!(screen[row].contains(room), "{room} moved from row {row}");
+        }
     }
 
     #[test]
