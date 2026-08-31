@@ -579,20 +579,26 @@ fn post(app: &mut App, dir: &Path, text: &str) {
 /// single message moves — the same order `switch_room` uses, and what lets a
 /// failed read leave the list exactly as it stands.
 ///
-/// One way of losing the message list is not guarded anywhere, here or in
-/// `tail`, and #56 owns it: a `room.jsonl` deleted and left absent comes
-/// back through this door rather than the Err one — `last_id` reads 0,
-/// `should_reseed` fires against any non-zero cursor, and the pane is
-/// blanked with `last_error` never set. It is not a one-line check because
-/// #34's configured-but-quiet room is legitimately empty and has to keep
-/// rendering in silence, so the two are indistinguishable from the read
-/// alone. Forcing the state wants the directory present and the file
-/// deleted; a regular file where the directory belongs gives the Err door
-/// instead, and `chmod` gives neither under a CI running as root.
+/// An absent file is silent only before this pane has read any history. Once
+/// `cursor` is non-zero, absence is a failed read rather than an empty log:
+/// the latter exists and deliberately re-seeds to an empty pane, while the
+/// former preserves the visible messages until a rotation finishes putting
+/// the file back. Reading presence and contents in one operation avoids a
+/// deletion between a separate existence check and the read.
 fn read_tail(dir: &Path, cursor: u64) -> Result<(bool, Vec<Message>)> {
-    let reseed = should_reseed(cursor, log_store::last_id(dir)?);
+    let Some(messages) = log_store::read_since_if_present(dir, 0)? else {
+        if cursor == 0 {
+            return Ok((false, Vec::new()));
+        }
+        anyhow::bail!("room log is missing");
+    };
+    let file_last_id = messages.last().map(|m| m.id).unwrap_or(0);
+    let reseed = should_reseed(cursor, file_last_id);
     let from = if reseed { 0 } else { cursor };
-    Ok((reseed, log_store::read_since(dir, from)?))
+    Ok((
+        reseed,
+        messages.into_iter().filter(|m| m.id > from).collect(),
+    ))
 }
 
 /// Reads whatever has arrived in the room on screen since the last loop,
@@ -1801,8 +1807,8 @@ mod tests {
         // A regular file where the room directory belongs is the honest way
         // into the Err branch: it is ENOTDIR for any uid, root included,
         // where `chmod 000` stops failing under a CI running as root and
-        // leaves a green no-op. A *missing* directory reads as `Ok(vec![])`,
-        // so there is no other route.
+        // leaves a green no-op. A missing log now has its own guarded error
+        // path, so it would not prove that other filesystem errors survive.
         let (_d, _env, session) = scratch();
         let mut a = app();
         a.messages = vec![msg("bob", "already on screen")];
@@ -1837,6 +1843,89 @@ mod tests {
         let mut stashed: Vec<&str> = a.drafts.values().map(String::as_str).collect();
         stashed.sort();
         assert_eq!(stashed, vec!["unsent to acme", "unsent to alare"]);
+    }
+
+    #[test]
+    fn a_deleted_room_log_keeps_its_history_visible_and_reports_the_read_failure() {
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        log_store::append(&dir, "bob", "already on screen").unwrap();
+        let mut a = app();
+        tail(&mut a, &dir);
+        std::fs::remove_file(dir.join("room.jsonl")).unwrap();
+
+        tail(&mut a, &dir);
+
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["already on screen"]
+        );
+        assert_eq!(
+            a.last_error.as_deref(),
+            Some("could not read this room: room log is missing"),
+            "the missing room log was silent"
+        );
+    }
+
+    #[test]
+    fn a_room_log_that_has_never_existed_is_silently_empty() {
+        let (_d, _env, session) = scratch();
+        let dir = session.join("quiet");
+        std::fs::create_dir(&dir).unwrap();
+        let mut a = app();
+
+        tail(&mut a, &dir);
+
+        assert!(a.messages.is_empty());
+        assert_eq!(a.last_error, None);
+    }
+
+    #[test]
+    fn an_existing_empty_room_log_is_empty_without_an_error() {
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        log_store::append(&dir, "bob", "old history").unwrap();
+        let mut a = app();
+        tail(&mut a, &dir);
+        std::fs::write(dir.join("room.jsonl"), b"").unwrap();
+
+        tail(&mut a, &dir);
+
+        assert!(a.messages.is_empty());
+        assert_eq!(a.last_error, None);
+    }
+
+    #[test]
+    fn a_room_log_restored_after_transient_absence_clears_the_error_and_resumes_tailing() {
+        let (_d, _env, session) = scratch();
+        let dir = session.join("acme");
+        std::fs::create_dir(&dir).unwrap();
+        log_store::append(&dir, "bob", "before rotation").unwrap();
+        let mut a = app();
+        tail(&mut a, &dir);
+        let log = dir.join("room.jsonl");
+        let held = dir.join("room.jsonl.held");
+        std::fs::rename(&log, &held).unwrap();
+        tail(&mut a, &dir);
+        assert!(a.last_error.is_some());
+
+        std::fs::rename(&held, &log).unwrap();
+        log_store::append(&dir, "bob", "after rotation").unwrap();
+        tail(&mut a, &dir);
+
+        assert_eq!(a.last_error, None);
+        assert_eq!(
+            a.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before rotation", "after rotation"]
+        );
     }
 
     #[test]

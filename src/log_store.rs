@@ -51,16 +51,22 @@ pub fn append(dir: &Path, from: &str, text: &str) -> Result<Message> {
 }
 
 pub fn read_since(dir: &Path, since_id: u64) -> Result<Vec<Message>> {
+    Ok(read_since_if_present(dir, since_id)?.unwrap_or_default())
+}
+
+pub(crate) fn read_since_if_present(dir: &Path, since_id: u64) -> Result<Option<Vec<Message>>> {
     let bytes = match std::fs::read(room_file(dir)) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(parse_lines(&content)
-        .into_iter()
-        .filter(|m| m.id > since_id)
-        .collect())
+    Ok(Some(
+        parse_lines(&content)
+            .into_iter()
+            .filter(|m| m.id > since_id)
+            .collect(),
+    ))
 }
 
 pub fn last_id(dir: &Path) -> Result<u64> {
