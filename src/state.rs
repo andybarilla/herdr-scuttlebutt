@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -278,6 +279,62 @@ pub fn load(dir: &Path) -> DaemonState {
             crate::daemon::report(dir, &reset_warning(&path, &e.to_string()));
             DaemonState::default()
         }
+    }
+}
+
+/// Serializes state writers for one room. The lock has its own stable inode:
+/// `save` atomically replaces `state.json`, so locking that file would leave a
+/// waiter holding the replaced inode instead of the current state file.
+pub fn lock_room(dir: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("state.lock"))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(file),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            #[cfg(test)]
+            notify_lock_contention(dir);
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+type LockContentionObserver = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn lock_contention_observers(
+) -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, LockContentionObserver>> {
+    static OBSERVERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<std::path::PathBuf, LockContentionObserver>>,
+    > = std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn observe_next_lock_contention(dir: &Path, observer: impl FnOnce() + Send + 'static) {
+    // Called only after try_lock_exclusive reports contention, so observation
+    // proves the competing writer reached this room's acquisition seam.
+    let previous = lock_contention_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), Box::new(observer));
+    assert!(previous.is_none(), "room already has a lock observer");
+}
+
+#[cfg(test)]
+fn notify_lock_contention(dir: &Path) {
+    let observer = lock_contention_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(dir);
+    if let Some(observer) = observer {
+        observer();
     }
 }
 

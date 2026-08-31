@@ -643,6 +643,16 @@ fn run_once(
                 continue;
             }
         };
+        // Locked through reload, tick and save so an admin action cannot be
+        // overwritten by this pass's stale state. The lock is per room: one
+        // room never owns another room's state transaction.
+        let _state_lock = match crate::state::lock_room(&dir) {
+            Ok(lock) => lock,
+            Err(e) => {
+                report(session, &format!("state lock error: {e}"));
+                continue;
+            }
+        };
         // Reloaded every pass because the live group set changes between
         // passes: a bucket can appear, vanish and reappear as agents move, so
         // there is no single in-memory state to carry. Consequence: while
@@ -969,12 +979,9 @@ pub fn status(dir: &Path) {
 /// Acts in every room holding that name, since a name is only unique within
 /// a room.
 ///
-/// Reads and rewrites `state.json` directly. The daemon reloads state from
-/// disk every pass, but one pass can still clobber an action typed after its
-/// load and before its save. A lost release needs retyping; a lost stalled
-/// drop can leave its batch eligible for a later retry despite the command's
-/// success. Closing that race needs a shared lock or durable request queue,
-/// a separate concurrency design from these state transitions (#63).
+/// Each room's read and rewrite shares the daemon tick's room lock. An action
+/// waits for an in-flight tick to save, then applies to that latest state; the
+/// lock remains held through this action's atomic state-file replacement.
 pub fn held_action(
     session: &Path,
     agent: &str,
@@ -983,6 +990,7 @@ pub fn held_action(
 ) -> Result<()> {
     let mut acted = false;
     for (room, path) in rooms_under(session) {
+        let _state_lock = crate::state::lock_room(&path)?;
         let Ok(text) = std::fs::read_to_string(path.join("state.json")) else {
             continue;
         };
@@ -4992,6 +5000,124 @@ mod tests {
         let mut state = DaemonState::default();
         tick_and_save(&mut state, &herd, dir.path(), &AgentFilter::default(), None);
         assert!(dir.path().join("state.json").exists());
+    }
+
+    struct PausingHerd {
+        entered_prompt: std::sync::mpsc::SyncSender<()>,
+        resume_prompt: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl HerdControl for PausingHerd {
+        fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+            Ok(vec![agent_at("worker", "/tmp", "idle")])
+        }
+
+        fn prompt(&self, _name: &str, _text: &str) -> Result<Delivery> {
+            self.entered_prompt.send(()).unwrap();
+            self.resume_prompt.lock().unwrap().recv().unwrap();
+            Ok(Delivery::Submitted)
+        }
+    }
+
+    fn while_tick_owns_room(
+        setup: impl FnOnce(&mut DaemonState),
+        action: impl FnOnce(&Path) + Send + 'static,
+    ) -> DaemonState {
+        #[derive(Debug, PartialEq)]
+        enum AdminProgress {
+            Contended,
+            Completed,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let room = dir.path().to_path_buf();
+        let mut state = DaemonState::default();
+        introduced(&mut state, &["worker"]);
+        state.cursors.insert("worker".into(), 0);
+        setup(&mut state);
+        append(&room, "human", "pause this tick in delivery").unwrap();
+        crate::state::save(&room, &state).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let tick_room = room.clone();
+        let tick = std::thread::spawn(move || {
+            let herd = PausingHerd {
+                entered_prompt: entered_tx,
+                resume_prompt: std::sync::Mutex::new(resume_rx),
+            };
+            run_once(
+                &herd,
+                &|| Grouping::Inactive,
+                &AgentFilter::default(),
+                &tick_room,
+                &mut Announced::default(),
+                &|_| Ok(tick_room.clone()),
+                &mut orgs(no_org),
+            );
+        });
+        entered_rx.recv().unwrap();
+
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+        let contended_tx = progress_tx.clone();
+        crate::state::observe_next_lock_contention(&room, move || {
+            contended_tx.send(AdminProgress::Contended).unwrap();
+        });
+        let action_room = room.clone();
+        let admin = std::thread::spawn(move || {
+            action(&action_room);
+            progress_tx.send(AdminProgress::Completed).unwrap();
+        });
+        // This follows a contended try_lock_exclusive from the admin, rather
+        // than inferring the attempt from thread timing.
+        assert_eq!(progress_rx.recv().unwrap(), AdminProgress::Contended);
+        assert_eq!(
+            progress_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "the admin action passed the contended lock before the tick released it"
+        );
+
+        resume_tx.send(()).unwrap();
+        tick.join().unwrap();
+        assert_eq!(progress_rx.recv().unwrap(), AdminProgress::Completed);
+        admin.join().unwrap();
+        crate::state::load(&room)
+    }
+
+    #[test]
+    fn held_deliver_waits_for_an_in_flight_tick_and_survives() {
+        let state = while_tick_owns_room(
+            |state| {
+                state.held.insert(
+                    "reviewer".into(),
+                    crate::state::Held {
+                        cursor: 0,
+                        held_since: 1,
+                        batch: 1,
+                        session: None,
+                        warned: false,
+                        release: None,
+                    },
+                );
+            },
+            |room| held_action(room, "reviewer", true, None).unwrap(),
+        );
+        assert!(state.held["reviewer"].release.is_some());
+    }
+
+    #[test]
+    fn held_drop_waits_for_an_in_flight_tick_and_survives() {
+        let state = while_tick_owns_room(
+            |state| {
+                state.cursors.insert("reviewer".into(), 0);
+                state
+                    .stalled
+                    .insert("reviewer".into(), crate::state::Stall::new(1, None));
+            },
+            |room| held_action(room, "reviewer", false, None).unwrap(),
+        );
+        assert!(!state.stalled.contains_key("reviewer"));
+        assert_eq!(state.cursors["reviewer"], 1);
     }
 
     fn agent_at(name: &str, cwd: &str, status: &str) -> AgentInfo {
