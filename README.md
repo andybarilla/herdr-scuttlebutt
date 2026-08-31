@@ -25,6 +25,19 @@ cargo build --release
 herdr plugin link .
 ```
 
+### Update
+
+Herdr plugin v1 has no separate update command. To update a GitHub-managed
+install, rerun this command with the desired release tag:
+
+```sh
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.6
+```
+
+Reinstalling replaces the managed checkout while preserving existing plugin
+config and state. Update a locally linked development checkout through Git and
+rebuild it instead; `plugin install` refuses to replace a local link.
+
 The plugin exposes actions for opening the chat pane and controlling the
 daemon; `Open chat` starts the daemon if it isn't running.
 
