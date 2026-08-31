@@ -5023,6 +5023,12 @@ mod tests {
         setup: impl FnOnce(&mut DaemonState),
         action: impl FnOnce(&Path) + Send + 'static,
     ) -> DaemonState {
+        #[derive(Debug, PartialEq)]
+        enum AdminProgress {
+            Contended,
+            Completed,
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let room = dir.path().to_path_buf();
         let mut state = DaemonState::default();
@@ -5052,25 +5058,28 @@ mod tests {
         });
         entered_rx.recv().unwrap();
 
-        let (action_started_tx, action_started_rx) = std::sync::mpsc::sync_channel(0);
-        let (action_done_tx, action_done_rx) = std::sync::mpsc::sync_channel(0);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+        let contended_tx = progress_tx.clone();
+        crate::state::observe_next_lock_contention(&room, move || {
+            contended_tx.send(AdminProgress::Contended).unwrap();
+        });
         let action_room = room.clone();
         let admin = std::thread::spawn(move || {
-            action_started_tx.send(()).unwrap();
             action(&action_room);
-            action_done_tx.send(()).unwrap();
+            progress_tx.send(AdminProgress::Completed).unwrap();
         });
-        action_started_rx.recv().unwrap();
-        assert!(
-            action_done_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "the admin action completed while the tick still owned the room"
+        // This follows a contended try_lock_exclusive from the admin, rather
+        // than inferring the attempt from thread timing.
+        assert_eq!(progress_rx.recv().unwrap(), AdminProgress::Contended);
+        assert_eq!(
+            progress_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "the admin action passed the contended lock before the tick released it"
         );
 
         resume_tx.send(()).unwrap();
         tick.join().unwrap();
-        action_done_rx.recv().unwrap();
+        assert_eq!(progress_rx.recv().unwrap(), AdminProgress::Completed);
         admin.join().unwrap();
         crate::state::load(&room)
     }
