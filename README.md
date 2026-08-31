@@ -98,7 +98,7 @@ consistent with a different agent taking the name as with that pane restarting.
 Either way the batch is still held and still listed; what a stall costs an
 agent that genuinely restarted in a listing gap is the wait, not the messages.
 An agent herdr reports no session id for cannot be matched at all, so its batch
-waits for you.
+waits for you. The commands below act on the stalled batch directly too.
 
 If that pane goes away entirely — the usual way a human clears a wedge is to
 close it and open a new one — the batch is kept rather than expiring with the
@@ -111,6 +111,9 @@ any other case waits for you:
 scuttlebutt held <agent> --deliver   # authorise delivery to the agent at that name
 scuttlebutt held <agent> --drop      # discard it, or clear a dropped-batch note
 ```
+
+Dropping a stalled batch advances its cursor over messages nobody received;
+both the command and daemon log say that it did so.
 
 `--deliver` authorises one delivery rather than arming the name forever: if
 herdr reports a session id for that pane it is recorded and checked, and either
