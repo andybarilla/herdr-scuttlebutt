@@ -504,36 +504,38 @@ pub struct Announced {
 /// room used when grouping is inactive.
 type Buckets = Vec<(Option<String>, Vec<AgentInfo>)>;
 
-/// Splits agents into one bucket per group, plus the agents that belong to no
-/// group. Membership comes from `groups::resolve`, so an agent whose cwd no
-/// prefix claims still lands in its repository's org room. `Broken` yields no
-/// buckets at all: a config we cannot parse must never fall back to a room,
-/// because that would merge groups.
+/// Adapts `groups::memberships` into owned delivery buckets plus the borrowed
+/// agents that receive nothing. `ScopedHerd` needs owned `AgentInfo` values,
+/// while skipped-agent reporting only reads the original roster.
 ///
 /// The `None` bucket is a real room only while grouping is `Inactive` — that
 /// is v1's single room, and an agent outside any repo must not go dark just
 /// because someone else's repo created an org room. Under an `Active` config
-/// an unresolvable agent is skipped, as before.
+/// an unresolvable agent is skipped. Configured rooms with no live agents are
+/// omitted because there is no delivery pass to run for them. `Broken` yields
+/// no memberships, so every agent is skipped and no room can receive a post.
 pub fn partition<'a>(
     agents: &'a [AgentInfo],
     grouping: &Grouping,
     orgs: &mut crate::git_org::OrgCache,
 ) -> (Buckets, Vec<&'a AgentInfo>) {
-    if let Grouping::Broken(_) = grouping {
-        return (Vec::new(), agents.iter().collect());
-    }
-    let shared_room = matches!(grouping, Grouping::Inactive);
-    let mut buckets: std::collections::BTreeMap<Option<String>, Vec<AgentInfo>> =
-        std::collections::BTreeMap::new();
+    let memberships = match groups::memberships(grouping, agents, orgs) {
+        Some(memberships) => memberships,
+        None => return (Vec::new(), agents.iter().collect()),
+    };
+    let mut buckets = Vec::new();
     let mut skipped = Vec::new();
-    for a in agents {
-        match groups::resolve(Path::new(&a.cwd), grouping, orgs) {
-            Some(g) => buckets.entry(Some(g)).or_default().push(a.clone()),
-            None if shared_room => buckets.entry(None).or_default().push(a.clone()),
-            None => skipped.push(a),
+    for (group, membership) in memberships {
+        if membership.agents.is_empty() {
+            continue;
+        }
+        if group.is_none() && matches!(grouping, Grouping::Active(_)) {
+            skipped.extend(membership.agents);
+        } else {
+            buckets.push((group, membership.agents.into_iter().cloned().collect()));
         }
     }
-    (buckets.into_iter().collect(), skipped)
+    (buckets, skipped)
 }
 
 /// Presents one group's members to the unchanged `tick`, so `tick` needs no
@@ -5165,6 +5167,110 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    fn membership_names(
+        memberships: Option<
+            std::collections::BTreeMap<Option<String>, crate::groups::Membership<'_>>,
+        >,
+    ) -> Option<Vec<(Option<String>, Vec<String>)>> {
+        memberships.map(|memberships| {
+            memberships
+                .into_iter()
+                .map(|(group, membership)| {
+                    (
+                        group,
+                        membership
+                            .agents
+                            .into_iter()
+                            .map(|agent| agent.name.clone())
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn partition_delivery_matches_memberships_in_every_grouping_state() {
+        let agents = vec![
+            agent_at("grouped", "/w/alare/api", "idle"),
+            agent_at("fallback", "/w/beta/web", "idle"),
+            agent_at("stray", "/tmp/scratch", "idle"),
+        ];
+
+        let inactive = crate::groups::Grouping::Inactive;
+        assert_eq!(
+            membership_names(crate::groups::memberships(
+                &inactive,
+                &agents,
+                &mut orgs(fake_org),
+            )),
+            Some(vec![
+                (None, vec!["stray".to_string()]),
+                (Some("alare".into()), vec!["grouped".into()]),
+                (Some("beta".into()), vec!["fallback".into()]),
+            ])
+        );
+        let (buckets, skipped) = partition(&agents, &inactive, &mut orgs(fake_org));
+        assert_eq!(
+            bucket_names(buckets),
+            vec![
+                (None, vec!["stray".to_string()]),
+                (Some("alare".into()), vec!["grouped".into()]),
+                (Some("beta".into()), vec!["fallback".into()]),
+            ]
+        );
+        assert!(skipped.is_empty());
+
+        let active = two_group_rules();
+        assert_eq!(
+            membership_names(crate::groups::memberships(
+                &active,
+                &agents,
+                &mut orgs(fake_org),
+            )),
+            Some(vec![
+                (None, vec!["stray".to_string()]),
+                (Some("acme".into()), vec![]),
+                (Some("alare".into()), vec!["grouped".into()]),
+                (Some("beta".into()), vec!["fallback".into()]),
+            ])
+        );
+        let (buckets, skipped) = partition(&agents, &active, &mut orgs(fake_org));
+        assert_eq!(
+            bucket_names(buckets),
+            vec![
+                (Some("alare".into()), vec!["grouped".into()]),
+                (Some("beta".into()), vec!["fallback".into()]),
+            ]
+        );
+        assert_eq!(
+            skipped
+                .into_iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stray"]
+        );
+
+        let broken = crate::groups::Grouping::Broken("bad".into());
+        assert_eq!(
+            membership_names(crate::groups::memberships(
+                &broken,
+                &agents,
+                &mut orgs(fake_org),
+            )),
+            None
+        );
+        let (buckets, skipped) = partition(&agents, &broken, &mut orgs(fake_org));
+        assert!(buckets.is_empty());
+        assert_eq!(
+            skipped
+                .into_iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grouped", "fallback", "stray"]
+        );
     }
 
     #[test]

@@ -321,12 +321,11 @@ fn entry_for(found: &mut BTreeMap<Option<String>, Room>, name: Option<String>) -
 }
 
 /// One room's membership as the config and the live roster see it. These are
-/// the two sources `rooms` and the `groups` listing both derive from, and
-/// deriving them twice is what let the two commands disagree about which
-/// rooms exist. The session-directory sweep is `rooms`' third source and is
+/// the shared sources for room discovery, the `groups` listing, and daemon
+/// delivery. The session-directory sweep is `rooms`' third source and is
 /// deliberately not here: a room surviving only as history has no membership
-/// to hold, and sweeping the disk on the `groups` path would mean listing
-/// rooms the config never named.
+/// to hold, and sweeping the disk on the other paths would invent live
+/// membership from history.
 #[derive(Debug, Default)]
 pub struct Membership<'a> {
     /// Named by `groups.toml`.
@@ -340,29 +339,29 @@ pub struct Membership<'a> {
 /// with `None` for the ungrouped room. The `None` key holds agents that
 /// resolve nowhere under *any* grouping — that bucket means "receiving
 /// nothing" under an active config and "the single shared room" without one,
-/// and the two callers want it read differently, so the split stays with
-/// them.
+/// and callers need to read it differently, so the split stays with them.
 ///
 /// That makes the `None` key a real entry every caller must decide about,
 /// where `rooms` used to simply never construct one under an active config.
-/// Dropping it is now the caller's job, not this function's: `rooms` filters
-/// the entry out, the `groups` listing prints it as a diagnostic, and a third
-/// caller that forgets would offer a room whose members can never be reached
-/// in it.
+/// Dropping it is the caller's job, not this function's: `rooms` filters the
+/// entry out, the `groups` listing prints it as a diagnostic, and daemon
+/// partitioning turns its agents into the skipped list. Any other treatment
+/// would offer a room whose members can never be reached in it.
 ///
-/// `None` for the whole map under `Broken`, and the two callers lean on that
+/// `None` for the whole map under `Broken`, and callers lean on that
 /// differently. `rooms` has no other refusal: it returns on this `None`, and
 /// deleting the guard would carry it past the config into the disk sweep,
 /// which never reads the config and would list every company's room. The
 /// `groups` listing refuses `Broken` above with its own message, so the arm
 /// is unreachable from there and is belt and braces behind that early-out.
+/// Daemon partitioning converts it to no buckets with the whole roster
+/// skipped, preserving fail-closed delivery while retaining diagnostics.
 ///
-/// The two therefore differ on purpose rather than by accident: `rooms` must
-/// return, because falling through reaches a disk sweep that never reads the
-/// config and would list every company's room, while the listing's default
+/// `rooms` and the listing therefore use different guards on purpose: `rooms`
+/// must return, because falling through reaches a disk sweep that never reads
+/// the config and would list every company's room, while the listing's default
 /// only ever produces an empty section under a message that already said the
-/// config is unreadable. `rooms` fails open where the listing fails closed,
-/// which is why one gets a hard return and the other tolerates a default.
+/// config is unreadable. Both remain fail-closed for room membership.
 pub fn memberships<'a>(
     grouping: &Grouping,
     agents: &'a [crate::herd::AgentInfo],
