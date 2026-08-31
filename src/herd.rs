@@ -66,21 +66,6 @@ const MARKERS: [&str; 2] = ["\u{276f}", "\u{203a}"];
 /// nothing here, which costs a repeat.
 const GUTTERS: [char; 1] = ['\u{2503}'];
 
-/// Fragments of what a composer shows in place of its contents while a
-/// queue is holding messages — Claude Code shows `\u{276f} Press up to edit queued
-/// messages`. Such a hint is not ours and not a human's, and — this is the
-/// point — it hides the queue rather than describing it, so it cannot tell
-/// us whether our batch reached that queue or never left `herdr agent
-/// prompt`. Recognized so a word count cannot read it as a cleared
-/// composer.
-///
-/// A fragment rather than the whole line, because the whole line is the
-/// part that moves: a count, a plural, or an appended key hint would stop
-/// an exact match firing, and the pane would fall back to `Some(false)` —
-/// silently, since nothing in the delivery path can tell a hint it failed
-/// to recognize from a composer that is genuinely clear.
-const QUEUE_HINTS: [&str; 1] = ["queued messages"];
-
 /// Words of the composer that must reappear, in order, in what we sent
 /// before the composer counts as holding our text. Three rather than a
 /// character-count fingerprint because the composer clips, wraps mid-token
@@ -247,6 +232,9 @@ struct Composer {
     /// composer is clear; a partial one can still say our text is on it,
     /// since what it does hold is what it holds either way.
     whole: bool,
+    /// OpenCode's gutter-bounded layout reserves its final row for a model
+    /// footer. Rule-bounded composers do not.
+    gutter_bounded: bool,
 }
 
 /// One row of an identified region, in the two forms the verdict needs.
@@ -259,7 +247,7 @@ struct Composer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Row {
     /// The row clipped to its box, its gutter or marker stripped, and
-    /// normalized. What `is_our_text` reads and what a word count measures.
+    /// normalized. What `is_our_text` and clear-row classification read.
     text: String,
     /// The same row with only its indent and its gutter or marker removed,
     /// and no column arithmetic anywhere. Equal to `text` when the clip
@@ -375,6 +363,7 @@ fn rule_bounded(lines: &[&str]) -> Regions {
             Some((true, lines)) => regions.composers.push(Composer {
                 rows: lines.clone(),
                 whole: true,
+                gutter_bounded: false,
             }),
             Some((false, lines)) if composer_at(i + 1) || (i > 0 && composer_at(i - 1)) => {
                 regions.others.push(lines.clone())
@@ -581,6 +570,7 @@ fn gutter_bounded(lines: &[&str]) -> Vec<Composer> {
                 let above_clear = top.checked_sub(2).is_some_and(|a| !gutter(&lines[a]));
                 blank && above_clear
             },
+            gutter_bounded: true,
         });
     }
     boxes
@@ -606,18 +596,32 @@ fn is_our_text(content: &str, sent: &str) -> bool {
         .any(|w| sent.contains(&w.join(" ")))
 }
 
+/// Whether a row has the shape OpenCode draws in the composer's reserved
+/// footer: the active agent, a middle dot, then the model and provider.
+///
+/// The provider is deliberately pinned to the captures and current fleet.
+/// A new footer shape becomes unconfirmable until captured; accepting a
+/// foreign input row as furniture can drop the batch.
+fn is_opencode_footer(content: &str) -> bool {
+    let Some((agent, model)) = content.split_once(" · ") else {
+        return false;
+    };
+    !agent.trim().is_empty()
+        && model
+            .strip_suffix(" OpenAI")
+            .is_some_and(|model| !model.trim().is_empty())
+}
+
 /// Whether `sent` is sitting unsubmitted on `pane`'s composer.
 ///
 /// `Some(false)` — submitted — is the only answer that advances a cursor and
 /// so the only one that can lose a batch, and it is reachable on exactly one
 /// path: at least one composer was identified, every one of them was read
-/// whole, and every one of their rows says so on evidence no measurement
-/// produced. A row says so by being empty
-/// before any clip, span or width calculation ran, or by carrying enough
-/// words to be recognized as text that is not ours while the clip took
-/// nothing off it. That is #47: a clip, a span or a width calculation cannot
-/// manufacture the evidence of a clear composer, because neither thing a row
-/// may vote on is anything they had a hand in.
+/// whole, and every input row was empty before a measurement ran. OpenCode's
+/// final model-footer row is the sole nonempty exception, identified by its
+/// layout, position and captured shape; a row the clip changed cannot qualify.
+/// That is #47's boundary: a clip, span or width calculation cannot manufacture
+/// the evidence of a clear composer.
 ///
 /// Reading the box whole is #51, and it is a condition of its own rather
 /// than a third thing a row may vote on, because no row can carry it: the
@@ -643,11 +647,10 @@ fn is_our_text(content: &str, sent: &str) -> bool {
 /// live pane was at the time of the change. Under #42 that holds the batch
 /// and re-prompts it rather than dropping it.
 ///
-/// A composer carrying text that is merely *someone else's* — a human
-/// typing, OpenCode's `Ask anything...` hint — still confirms. #47 proposed
-/// closing that too; it was deliberately left open, because none of the four
-/// batches #36 lost went that way and closing it would stall every pane a
-/// human is typing in for no measured safety.
+/// Text in an input row that is not ours is not evidence ours left. It may be
+/// OpenCode's idle hint, a human typing, or the unchanged pane after an
+/// accepted paste failed to land. Such a row resolves toward a repeat rather
+/// than advancing the cursor.
 fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     let Regions { composers, others } = composer_regions(pane);
     if composers.is_empty() {
@@ -689,36 +692,23 @@ fn composer_holds(pane: &str, sent: &str) -> Option<bool> {
     if composers.iter().any(|c| !c.whole) {
         return None;
     }
-    // Only a region something identified as a composer can say a composer
-    // is clear. `others` has already had its say above.
-    let rows = || composers.iter().flat_map(|c| &c.rows);
-    // A composer showing a queue hint is showing neither our text nor a
-    // clear box: the queue it names may hold our batch or may not, and
-    // nothing in the pane says which.
-    if rows().any(|r| QUEUE_HINTS.iter().any(|h| r.text.contains(h))) {
-        return None;
-    }
-    // A row may say a composer is clear only on evidence no measurement
-    // could have manufactured. Either it is empty before any clip, span or
-    // width calculation ran, or it carries enough words to be recognized as
-    // text that is not ours *and* the clip took nothing off it, so no width
-    // calculation contributed one of those words.
-    //
-    // Per row, because a composer that draws furniture of its own below the
-    // text — OpenCode's model footer — would otherwise carry every short
-    // row past this on the strength of the furniture's word count.
-    let says_clear = |r: &Row| {
+    // A row may say a composer is clear only when it was empty before any
+    // measurement, or when its layout and position identify it as the model
+    // footer OpenCode reserves below the input. Any other text could be a
+    // human's or an accepted batch that never reached the pane.
+    let says_clear = |c: &Composer, index: usize, r: &Row| {
         if r.bare.is_empty() {
             return true;
         }
-        let words = r
-            .text
-            .trim_end_matches(['\u{2026}', '.', ' '])
-            .split_whitespace()
-            .count();
-        words >= OVERLAP_WORDS && r.bare == r.text
+        c.gutter_bounded
+            && index + 1 == c.rows.len()
+            && r.bare == r.text
+            && is_opencode_footer(&r.text)
     };
-    match rows().all(says_clear) {
+    match composers
+        .iter()
+        .all(|c| c.rows.iter().enumerate().all(|(i, r)| says_clear(c, i, r)))
+    {
         true => Some(false),
         false => None,
     }
@@ -989,8 +979,8 @@ mod tests {
     /// in the same gutter as the composer, so a locator that finds it
     /// reports a cleared composer as holding us forever.
     /// `opencode-wrapped`, `opencode-short` and `opencode-hint` are a
-    /// narrower pane holding a wrapped batch, holding two words, and clear
-    /// under OpenCode's own idle hint. `opencode-live-room` is a working
+    /// narrower pane holding a wrapped batch, holding two words, and showing
+    /// OpenCode's own idle hint. `opencode-live-room` is a working
     /// lead pane from another room with three echoes above a clear
     /// composer.
     const OC_HOLDS: &str = include_str!("../tests/fixtures/opencode-holds-batch.txt");
@@ -1151,9 +1141,9 @@ mod tests {
     #[test]
     fn a_queue_hint_that_has_moved_still_confirms_nothing() {
         // Synthetic, and that is the point: the hint's wording is the part
-        // most likely to change under us, and an exact match failing to
-        // fire fails toward `Some(false)`, which is the verdict that loses
-        // the batch. Pinned so that shape cannot come back.
+        // most likely to change under us. Any nonempty input row that is not
+        // ours stays uncertain, so wording drift cannot turn it into the
+        // verdict that advances the cursor.
         for hint in [
             "Press up to edit 3 queued messages",
             "Press up to edit queued messages (esc to clear)",
@@ -1251,18 +1241,51 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_hint_over_a_clear_gutter_drawn_composer_confirms_submission() {
-        // OpenCode's own `Ask anything...` hint, unlike a queue hint, is
-        // shown *because* there is nothing to show: no queue stands behind
-        // it, so a batch that reached the pane is not in one.
-        //
-        // This pane still confirms where the other three OpenCode captures
-        // no longer do, and the difference is not the hint: nothing on this
-        // box's rows is clipped, so every row still says what it says
-        // without a measurement. #47 proposed making a composer carrying
-        // someone else's text `None` as well; that half was deliberately
-        // not done, so the hint reads exactly as it did before.
-        assert_eq!(composer_holds(OC_HINT, OC_SENT), Some(false));
+    fn an_idle_hint_cannot_report_an_unrelated_batch_submitted() {
+        // A real fresh OpenCode pane. `herdr agent prompt` reports acceptance
+        // before the text is known to have reached the composer, so this is
+        // also the pane after an accepted paste that never landed. The hint
+        // is genuinely in the box's columns and is genuinely not our text;
+        // neither fact is evidence that our batch left.
+        assert_eq!(composer_holds(OC_HINT, OC_SENT), None);
+
+        let typing = OC_HINT.replace(
+            "Ask anything... \"Fix broken tests\"",
+            "review this unrelated draft please",
+        );
+        assert_eq!(composer_holds(&typing, OC_SENT), None);
+
+        let footer_shaped_input = OC_HINT.replace(
+            "Ask anything... \"Fix broken tests\"",
+            "Build · GPT-5.6 Sol OpenAI",
+        );
+        assert_eq!(composer_holds(&footer_shaped_input, OC_SENT), None);
+
+        let clear = OC_HINT.replace("Ask anything... \"Fix broken tests\"", "");
+        assert_eq!(composer_holds(&clear, OC_SENT), Some(false));
+        assert_eq!(
+            composer_holds(&clear.replace("OpenAI", "Unknown"), OC_SENT),
+            None
+        );
+    }
+
+    #[test]
+    fn an_idle_hint_cannot_advance_delivery() {
+        fn idle_hint(_: &str) -> Result<String> {
+            Ok(OC_HINT.into())
+        }
+        fn clear(_: &str) -> Result<String> {
+            Ok(OC_HINT.replace("Ask anything... \"Fix broken tests\"", ""))
+        }
+
+        assert!(matches!(
+            Confirmer::with_read(idle_hint).confirm("reviewer", OC_SENT),
+            Delivery::Unconfirmed(_)
+        ));
+        assert_eq!(
+            Confirmer::with_read(clear).confirm("reviewer", OC_SENT),
+            Delivery::Submitted
+        );
     }
 
     #[test]
@@ -1966,13 +1989,10 @@ mod tests {
 
     #[test]
     fn a_row_the_clip_touched_cannot_say_a_composer_is_clear() {
-        // The measurement layer's actual mechanism, from #36: the clip kept
-        // a fragment of the right margin, which padded a row up to a word
-        // count that reads as text long enough to be recognized as not
-        // ours — and a composer holding only text that is not ours is a
-        // composer we call clear. Whether the clip got those columns right
-        // or wrong, a row it took something off is a row whose word count
-        // a width calculation had a hand in, so it may not cast that vote.
+        // The model footer is the only nonempty row allowed to say a gutter
+        // composer is clear. Whether the clip got its columns right or
+        // wrong, a footer it took something off is no longer direct evidence
+        // of the captured shape and may not cast that vote.
         let footer = "Build \u{b7} GPT-5.6 Sol OpenAI";
         let clean = gutter_box(&[
             gutter_row("", ""),
@@ -2144,11 +2164,12 @@ mod tests {
     }
 
     #[test]
-    fn someone_elses_text_on_the_composer_confirms_submission() {
-        // A human typing at the pane did not stop our delivery landing, and
-        // telling their text from a tool's is #24, which stays out of scope.
+    fn someone_elses_text_on_the_composer_confirms_nothing() {
+        // The prompt command being accepted does not prove its paste landed.
+        // This could be the composer before that attempt as readily as after
+        // it, so advancing the delivery cursor would drop the batch.
         let composer = ["\u{276f} stop posting to the room and stand down".to_string()];
-        assert_eq!(holds(&composer, RULE), Some(false));
+        assert_eq!(holds(&composer, RULE), None);
     }
 
     #[test]
