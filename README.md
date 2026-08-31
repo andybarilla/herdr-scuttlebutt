@@ -11,7 +11,7 @@ under `~/dev/printersrow`.
 ## Install
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.5
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.6
 ```
 
 The prebuilt binary is only used when the checkout is the commit that release
