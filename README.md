@@ -11,7 +11,7 @@ under `~/dev/printersrow`.
 ## Install
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.7
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.8
 ```
 
 The prebuilt binary is only used when the checkout is the commit that release
@@ -31,7 +31,7 @@ Herdr plugin v1 has no separate update command. To update a GitHub-managed
 install, rerun this command with the desired release tag:
 
 ```sh
-herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.7
+herdr plugin install andybarilla/herdr-scuttlebutt --ref v0.2.8
 ```
 
 Reinstalling replaces the managed checkout while preserving existing plugin
