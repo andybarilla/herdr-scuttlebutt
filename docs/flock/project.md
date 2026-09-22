@@ -89,11 +89,13 @@ scripts/check-versions.sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+sh scripts/test-install-link.sh
 ```
 
 Notes:
 - CI runs these checks on pull requests.
 - CI test coverage runs `cargo test --locked` on Ubuntu and macOS; local workers usually run on the current platform only.
+- CI runs `sh scripts/test-install-link.sh` on Ubuntu and macOS; it is hermetic (temp HOME, file:// fixture release) and needs no Rust toolchain.
 - Release builds are covered separately by `.github/workflows/release.yml` for tag/workflow-dispatch releases.
 - `README.md` also documents `cargo test` and `cargo clippy --all-targets`; prefer the locked CI variants for Flock gates.
 

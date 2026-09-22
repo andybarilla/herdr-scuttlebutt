@@ -38,3 +38,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  install-link:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # Hermetic POSIX-sh smoke test for the ~/.local/bin/herdr-scuttlebutt
+      # entrypoint behavior in scripts/fetch-or-build.sh (no Rust toolchain).
+      - run: sh scripts/test-install-link.sh
