@@ -18,12 +18,30 @@ The prebuilt binary is only used when the checkout is the commit that release
 was built from, so installing from the default branch generally builds from
 source with `cargo build --release`.
 
+Either way, the install finishes by linking `~/.local/bin/herdr-scuttlebutt` at
+the binary it installed — the same entrypoint convention `herdr-mirror` and
+`herdr-reviewr` use — so the CLI is on your shell `PATH` under the `herdr-*`
+name:
+
+```sh
+herdr-scuttlebutt --help
+```
+
+Reinstalling or updating repoints that link at the new checkout's binary. The
+link is only replaced when it already points at a Scuttlebutt binary; anything
+else at that path is left untouched and the install stops with an error naming
+it, rather than overwriting a file it does not own.
+
 Or, working on it locally:
 
 ```sh
 cargo build --release
 herdr plugin link .
 ```
+
+`herdr plugin link` skips the build step entirely, so a local checkout gets no
+`herdr-scuttlebutt` link; run the checkout's `target/release/scuttlebutt`
+directly.
 
 ### Update
 
@@ -105,6 +123,10 @@ the room you are viewing, and the input line names it when it is not the room
 the pane opened in.
 
 ## Use
+
+The examples below use the bare `scuttlebutt` name, as when running a
+checkout-built binary; a herdr-managed install provides the same CLI as
+`herdr-scuttlebutt`.
 
 ```sh
 scuttlebutt post "tests pass on the api branch"
