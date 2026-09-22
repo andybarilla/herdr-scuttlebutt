@@ -6,6 +6,8 @@
 # any other commit gets built from source instead of handed an older binary.
 # Anything that misses (unmapped platform, no release for this version, commit
 # mismatch, download or checksum failure) falls back to `cargo build --release`.
+# Either way, it finishes by linking ~/.local/bin/herdr-scuttlebutt at the
+# installed binary, the same entrypoint convention herdr-mirror/reviewr use.
 set -u
 
 repo="andybarilla/herdr-scuttlebutt"
@@ -26,13 +28,15 @@ build_from_source() {
     exit 1
   }
   cd "$repo_root" || exit 1
-  exec cargo build --release
+  cargo build --release || exit 1
+  link_entrypoint
 }
 
 fallback() {
   echo "scuttlebutt: $1 — building from source instead." >&2
   rm -rf "${tmpdir:-}"
   build_from_source
+  exit
 }
 
 download() {
@@ -47,6 +51,26 @@ sha256_of() {
   elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
   else return 127
   fi
+}
+
+# ~/.local/bin/herdr-scuttlebutt is the user-facing entrypoint (the convention
+# herdr-mirror and herdr-reviewr follow): a symlink at the real binary, so a
+# reinstall into a fresh checkout just repoints it. An existing symlink is
+# replaced; a real file we did not create is left alone with an error rather
+# than silently overwritten.
+link_entrypoint() {
+  bin_dir="$HOME/.local/bin"
+  link="$bin_dir/herdr-scuttlebutt"
+  mkdir -p "$bin_dir" || {
+    echo "scuttlebutt: could not create $bin_dir — create it and re-run the install to get the herdr-scuttlebutt entrypoint." >&2
+    exit 1
+  }
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    echo "scuttlebutt: $link already exists and is not a symlink; not overwriting it. Move it aside and re-run the install to create the entrypoint." >&2
+    exit 1
+  fi
+  ln -sfn "$out" "$link" || exit 1
+  echo "scuttlebutt: entrypoint $link -> $out"
 }
 
 case "$(uname -s 2>/dev/null)/$(uname -m 2>/dev/null)" in
@@ -94,3 +118,4 @@ tar -xzf "$tmpdir/$asset" -C "$tmpdir" scuttlebutt || fallback "could not unpack
 mkdir -p "$(dirname "$out")"
 install -m 755 "$tmpdir/scuttlebutt" "$out" || fallback "could not install the binary to $out"
 echo "scuttlebutt: installed prebuilt v$version ($triple), verified SHA-256."
+link_entrypoint
