@@ -29,6 +29,12 @@ build_from_source() {
   }
   cd "$repo_root" || exit 1
   cargo build --release || exit 1
+  # A CARGO_TARGET_DIR override puts the binary somewhere other than $out;
+  # fail loudly here rather than linking the entrypoint at a missing file.
+  [ -x "$out" ] || {
+    echo "scuttlebutt: cargo build succeeded but $out is missing or not executable (CARGO_TARGET_DIR set?) — unset it and re-run the install." >&2
+    exit 1
+  }
   link_entrypoint
 }
 
@@ -55,9 +61,11 @@ sha256_of() {
 
 # ~/.local/bin/herdr-scuttlebutt is the user-facing entrypoint (the convention
 # herdr-mirror and herdr-reviewr follow): a symlink at the real binary, so a
-# reinstall into a fresh checkout just repoints it. An existing symlink is
-# replaced; a real file we did not create is left alone with an error rather
-# than silently overwritten.
+# reinstall into a fresh checkout just repoints it. Ownership rule: a symlink
+# counts as Scuttlebutt-managed only when its target's basename is `scuttlebutt`
+# (this covers repoints from older checkouts and dangling links left by deleted
+# ones). Anything else at that path — a regular file, or a symlink pointing at
+# an unrelated target — is refused with an error rather than silently replaced.
 link_entrypoint() {
   bin_dir="$HOME/.local/bin"
   link="$bin_dir/herdr-scuttlebutt"
@@ -65,7 +73,16 @@ link_entrypoint() {
     echo "scuttlebutt: could not create $bin_dir — create it and re-run the install to get the herdr-scuttlebutt entrypoint." >&2
     exit 1
   }
-  if [ -e "$link" ] && [ ! -L "$link" ]; then
+  if [ -L "$link" ]; then
+    target=$(readlink "$link") || exit 1
+    case ${target##*/} in
+      scuttlebutt) ;; # managed by us — safe to repoint below
+      *)
+        echo "scuttlebutt: $link already exists and points at $target, which is not a Scuttlebutt binary; not repointing it. Move it aside and re-run the install to create the entrypoint." >&2
+        exit 1
+        ;;
+    esac
+  elif [ -e "$link" ]; then
     echo "scuttlebutt: $link already exists and is not a symlink; not overwriting it. Move it aside and re-run the install to create the entrypoint." >&2
     exit 1
   fi
