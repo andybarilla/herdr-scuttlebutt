@@ -3,6 +3,7 @@ mod daemon;
 mod git_org;
 mod groups;
 mod herd;
+mod integration;
 mod log_store;
 mod paths;
 mod state;
@@ -64,6 +65,11 @@ enum Cmd {
     DaemonStatus,
     /// Stop the daemon
     DaemonStop,
+    /// Install model-visible client integrations
+    Integration {
+        #[command(subcommand)]
+        cmd: IntegrationCmd,
+    },
     /// Deliver or discard a batch held for an agent that is no longer present
     Held {
         /// The agent name the batch is held for
@@ -83,6 +89,31 @@ enum Cmd {
         /// Target this group instead of resolving from the calling cwd
         #[arg(long)]
         group: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntegrationCmd {
+    /// Symlink integrations into global agent locations
+    Install {
+        /// all, pi, or opencode
+        #[arg(default_value = "all")]
+        target: String,
+        /// Replace an existing symlink or file at the destination
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show whether integrations are installed
+    Status {
+        /// all, pi, or opencode
+        #[arg(default_value = "all")]
+        target: String,
+    },
+    /// Remove scuttlebutt-owned symlinks
+    Uninstall {
+        /// all, pi, or opencode
+        #[arg(default_value = "all")]
+        target: String,
     },
 }
 
@@ -117,6 +148,17 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::DaemonStop => daemon::stop(&paths::session_dir()?),
+        Cmd::Integration { cmd } => match cmd {
+            IntegrationCmd::Install { target, force } => {
+                integration::install(&integration::parse_targets(&target)?, force)
+            }
+            IntegrationCmd::Status { target } => {
+                integration::status(&integration::parse_targets(&target)?)
+            }
+            IntegrationCmd::Uninstall { target } => {
+                integration::uninstall(&integration::parse_targets(&target)?)
+            }
+        },
         Cmd::Held {
             agent,
             deliver,

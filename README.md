@@ -59,15 +59,18 @@ running under herdr (`HERDR_SOCKET_PATH`/`HERDR_PANE_ID`) or when
 binary is not on `PATH`.
 
 For this checkout, pi and OpenCode auto-discover those files after trusting the
-project. To use them for every repo, copy or symlink them into the global agent
-locations:
+project. To use them for every repo, install the global integrations:
 
 ```sh
-mkdir -p ~/.pi/agent/extensions ~/.config/opencode/plugins/scuttlebutt ~/.config/opencode/tools
-ln -sf "$PWD/.pi/extensions/scuttlebutt.ts" ~/.pi/agent/extensions/scuttlebutt.ts
-ln -sf "$PWD/.opencode/plugins/scuttlebutt/index.ts" ~/.config/opencode/plugins/scuttlebutt/index.ts
-ln -sf "$PWD/.opencode/tools/scuttlebutt.ts" ~/.config/opencode/tools/scuttlebutt.ts
+scuttlebutt integration install          # pi + OpenCode
+scuttlebutt integration status
 ```
+
+You can also target one client with `scuttlebutt integration install pi` or
+`scuttlebutt integration install opencode`. The installer creates symlinks back
+to this plugin checkout, so updating the plugin updates the integrations too.
+Use `--force` if an existing file is in the way, and
+`scuttlebutt integration uninstall` to remove scuttlebutt-owned symlinks.
 
 ## Keybindings
 
