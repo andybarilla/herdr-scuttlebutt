@@ -41,6 +41,34 @@ rebuild it instead; `plugin install` refuses to replace a local link.
 The plugin exposes actions for opening the chat pane and controlling the
 daemon; `Open chat` starts the daemon if it isn't running.
 
+## Agent integrations
+
+The herdr plugin can deliver room messages into panes, but pi/OpenCode also need
+model-visible tools before agents will proactively post to the room. This repo
+ships project-local integrations for both:
+
+| Agent | Integration | What it adds |
+|---|---|---|
+| pi | `.pi/extensions/scuttlebutt.ts` | `scuttlebutt_post`, `scuttlebutt_read`, `scuttlebutt_agents` tools plus room guidance |
+| OpenCode v2 | `.opencode/plugins/scuttlebutt/index.ts` | `scuttlebutt_post`, `scuttlebutt_read`, `scuttlebutt_agents` tools plus room guidance |
+| OpenCode v1 | `.opencode/tools/scuttlebutt.ts` | `scuttlebutt_post`, `scuttlebutt_read`, `scuttlebutt_agents` tools |
+
+The pi/OpenCode v2 guidance is injected when the process looks like it is
+running under herdr (`HERDR_SOCKET_PATH`/`HERDR_PANE_ID`) or when
+`SCUTTLEBUTT_DIR` is set. Set `SCUTTLEBUTT_BIN=/path/to/scuttlebutt` if the
+binary is not on `PATH`.
+
+For this checkout, pi and OpenCode auto-discover those files after trusting the
+project. To use them for every repo, copy or symlink them into the global agent
+locations:
+
+```sh
+mkdir -p ~/.pi/agent/extensions ~/.config/opencode/plugins/scuttlebutt ~/.config/opencode/tools
+ln -sf "$PWD/.pi/extensions/scuttlebutt.ts" ~/.pi/agent/extensions/scuttlebutt.ts
+ln -sf "$PWD/.opencode/plugins/scuttlebutt/index.ts" ~/.config/opencode/plugins/scuttlebutt/index.ts
+ln -sf "$PWD/.opencode/tools/scuttlebutt.ts" ~/.config/opencode/tools/scuttlebutt.ts
+```
+
 ## Keybindings
 
 Bind the actions in `~/.config/herdr/config.toml`:
